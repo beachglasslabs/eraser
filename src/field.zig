@@ -1,3 +1,4 @@
+// based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
 
 pub const Self = @This();
@@ -103,4 +104,47 @@ pub fn invert(self: *const Self, a: usize) ValueError!u8 {
 
 pub fn div(self: *const Self, a: usize, b: usize) ValueError!u8 {
     return try self.mul(a, try self.invert(b));
+}
+
+pub fn toVector(self: *const Self, allocator: std.mem.Allocator, a: u8) ![]u8 {
+    var list = try std.ArrayList(u8).initCapacity(allocator, self.exp);
+    defer list.deinit();
+    for (0..self.exp) |i| {
+        var n = (a >> @intCast(i)) & 1;
+        list.appendAssumeCapacity(n);
+    }
+    return list.toOwnedSlice();
+}
+
+// n x n binary matrix representation
+pub fn toColMat(self: *const Self, allocator: std.mem.Allocator, a: usize) ![][]u8 {
+    var list = try std.ArrayList([]u8).initCapacity(allocator, self.exp);
+    defer list.deinit();
+    var basis: u8 = 1;
+    for (0..self.exp) |_| {
+        var p = try self.mul(a, basis);
+        basis <<= 1;
+        list.appendAssumeCapacity(try self.toVector(allocator, p));
+    }
+    return list.toOwnedSlice();
+}
+
+// n x n binary matrix representation
+pub fn toMatrix(self: *const Self, allocator: std.mem.Allocator, a: usize) ![][]u8 {
+    var list = try std.ArrayList([]u8).initCapacity(allocator, self.exp);
+    defer list.deinit();
+    var m = try self.toColMat(allocator, a);
+    return transpose(m);
+}
+
+fn transpose(m: [][]u8) [][]u8 {
+    for (0..m.len) |r| {
+        for (0..m.len) |c| {
+            if (r == c) break;
+            var t = m[r][c];
+            m[r][c] = m[c][r];
+            m[c][r] = t;
+        }
+    }
+    return m;
 }

@@ -93,3 +93,61 @@ test "basic divide functionality" {
         }
     }
 }
+
+test "convert to matrix" {
+    const f2 = try Field.init(2);
+    const f3 = try Field.init(3);
+    const m2 = try f2.toMatrix(testing.allocator, 2);
+    defer {
+        for (0..m2.len) |r| {
+            defer testing.allocator.free(m2[r]);
+        }
+        testing.allocator.free(m2);
+    }
+    // std.debug.print("\nmatrix(2x2) of 01\n", .{});
+    // for (0..f2.exp) |r| {
+    //     for (0..f2.exp) |c| {
+    //         std.debug.print("{b} ", .{m2[r][c]});
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
+    try testing.expectEqualSlices(u8, m2[0], &[_]u8{ 0, 1 });
+    try testing.expectEqualSlices(u8, m2[1], &[_]u8{ 1, 1 });
+    const m3 = try f3.toMatrix(testing.allocator, 2);
+    defer {
+        for (0..m3.len) |r| {
+            defer testing.allocator.free(m3[r]);
+        }
+        testing.allocator.free(m3);
+    }
+    // std.debug.print("\nmatrix(3x3) of 010\n", .{});
+    // for (0..f3.exp) |r| {
+    //     for (0..f3.exp) |c| {
+    //         std.debug.print("{b} ", .{m3[r][c]});
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
+    try testing.expectEqualSlices(u8, m3[0], &[_]u8{ 0, 0, 1 });
+    try testing.expectEqualSlices(u8, m3[1], &[_]u8{ 1, 0, 1 });
+    try testing.expectEqualSlices(u8, m3[2], &[_]u8{ 0, 1, 0 });
+    const m5 = try f3.toMatrix(testing.allocator, 5);
+    defer {
+        for (0..m5.len) |r| {
+            defer testing.allocator.free(m5[r]);
+        }
+        testing.allocator.free(m5);
+    }
+    try testing.expectEqualSlices(u8, m5[0], &[_]u8{ 1, 1, 0 });
+    try testing.expectEqualSlices(u8, m5[1], &[_]u8{ 0, 0, 1 });
+    try testing.expectEqualSlices(u8, m5[2], &[_]u8{ 1, 0, 0 });
+    const m6 = try f3.toMatrix(testing.allocator, 6);
+    defer {
+        for (0..m6.len) |r| {
+            defer testing.allocator.free(m6[r]);
+        }
+        testing.allocator.free(m6);
+    }
+    try testing.expectEqualSlices(u8, m6[0], &[_]u8{ 0, 1, 1 });
+    try testing.expectEqualSlices(u8, m6[1], &[_]u8{ 1, 1, 0 });
+    try testing.expectEqualSlices(u8, m6[2], &[_]u8{ 1, 1, 1 });
+}
