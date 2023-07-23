@@ -1,21 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
-const Field = @import("field.zig");
-
-fn initTest(allocator: std.mem.Allocator) !std.ArrayList(Field) {
-    var fields = try std.ArrayList(Field).initCapacity(allocator, 7);
-
-    for (1..8) |n| {
-        try fields.append(try Field.init(n));
-    }
-
-    return fields;
-}
+const bff = @import("field.zig");
 
 test "basic add functionality" {
-    const fields = try initTest(testing.allocator);
-    defer fields.deinit();
-    for (fields.items) |field| {
+    inline for (comptime 1..8) |i| {
+        const field = try bff.BinaryFiniteField(i).init();
         var negatives = std.AutoHashMap(usize, usize).init(testing.allocator);
         defer negatives.deinit();
         for (0..field.order) |a| {
@@ -34,9 +23,8 @@ test "basic add functionality" {
 }
 
 test "basic subtract functionality" {
-    const fields = try initTest(testing.allocator);
-    defer fields.deinit();
-    for (fields.items) |field| {
+    inline for (comptime 1..8) |i| {
+        const field = try bff.BinaryFiniteField(i).init();
         for (0..field.order) |a| {
             for (0..field.order) |b| {
                 var result = try field.sub(a, b);
@@ -52,9 +40,8 @@ test "basic subtract functionality" {
 }
 
 test "basic multiply functionality" {
-    const fields = try initTest(testing.allocator);
-    defer fields.deinit();
-    for (fields.items) |field| {
+    inline for (comptime 1..8) |i| {
+        const field = try bff.BinaryFiniteField(i).init();
         var reciprocals = std.AutoHashMap(usize, usize).init(testing.allocator);
         defer reciprocals.deinit();
         for (0..field.order) |a| {
@@ -76,9 +63,8 @@ test "basic multiply functionality" {
 }
 
 test "basic divide functionality" {
-    const fields = try initTest(testing.allocator);
-    defer fields.deinit();
-    for (fields.items) |field| {
+    inline for (comptime 1..8) |i| {
+        const field = try bff.BinaryFiniteField(i).init();
         for (0..field.order) |a| {
             for (0..field.order) |b| {
                 if (b == 0) continue;
@@ -95,8 +81,8 @@ test "basic divide functionality" {
 }
 
 test "convert to matrix" {
-    const f2 = try Field.init(2);
-    const f3 = try Field.init(3);
+    const f2 = try bff.BinaryFiniteField(2).init();
+    const f3 = try bff.BinaryFiniteField(3).init();
     const m2 = try f2.toMatrix(testing.allocator, 2);
     defer {
         for (0..m2.len) |r| {
