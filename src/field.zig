@@ -135,8 +135,6 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
 
         // n x n binary matrix representation
         pub fn toMatrix(self: *const Self, allocator: std.mem.Allocator, a: usize) ![][]u8 {
-            var list = try std.ArrayList([]u8).initCapacity(allocator, self.exp);
-            defer list.deinit();
             var m = try self.toColMat(allocator, a);
             return transpose(m);
         }
@@ -151,6 +149,44 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
                 }
             }
             return m;
+        }
+
+        pub fn simdVector(self: *const Self, allocator: std.mem.Allocator, a: u8) !Vec {
+            var list = try std.ArrayList(u8).initCapacity(allocator, self.exp);
+            defer list.deinit();
+            inline for (0..n) |i| {
+                var j = (a >> @intCast(i)) & 1;
+                list.appendAssumeCapacity(j);
+            }
+            return list.items[0..n].*;
+        }
+
+        pub fn simdColMat(self: *const Self, allocator: std.mem.Allocator, a: usize) ![]Vec {
+            var list = try std.ArrayList(Vec).initCapacity(allocator, self.exp);
+            defer list.deinit();
+            var basis: u8 = 1;
+            for (0..self.exp) |_| {
+                var p = try self.mul(a, basis);
+                basis <<= 1;
+                list.appendAssumeCapacity(try self.simdVector(allocator, p));
+            }
+            return list.toOwnedSlice();
+        }
+
+        pub fn simdMatrix(self: *const Self, allocator: std.mem.Allocator, a: usize) ![]Vec {
+            var m = try self.toMatrix(allocator, a);
+            defer {
+                for (0..m.len) |r| {
+                    defer allocator.free(m[r]);
+                }
+                allocator.free(m);
+            }
+            var list = try std.ArrayList(Vec).initCapacity(allocator, self.exp);
+            defer list.deinit();
+            for (0..m.len) |r| {
+                list.appendAssumeCapacity(m[r][0..n].*);
+            }
+            return list.toOwnedSlice();
         }
     };
 }

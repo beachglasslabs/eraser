@@ -136,4 +136,20 @@ test "convert to matrix" {
     try testing.expectEqualSlices(u8, m6[0], &[_]u8{ 0, 1, 1 });
     try testing.expectEqualSlices(u8, m6[1], &[_]u8{ 1, 1, 0 });
     try testing.expectEqualSlices(u8, m6[2], &[_]u8{ 1, 1, 1 });
+    const c6 = try f3.simdColMat(testing.allocator, 6);
+    defer testing.allocator.free(c6);
+    // for (0..c6.len) |c| {
+    //     std.debug.print("simd.col[{d}]: {}\n", .{ c, c6[c] });
+    // }
+    try testing.expectEqual(c6[0], @Vector(3, u8){ 0, 1, 1 });
+    try testing.expectEqual(c6[1], @Vector(3, u8){ 1, 1, 1 });
+    try testing.expectEqual(c6[2], @Vector(3, u8){ 1, 0, 1 });
+    const r6 = try f3.simdMatrix(testing.allocator, 6);
+    defer testing.allocator.free(r6);
+    // for (0..r6.len) |r| {
+    //     std.debug.print("simd.row[{d}]: {}\n", .{ r, r6[r] });
+    // }
+    try testing.expectEqual(r6[0], @Vector(3, u8){ 0, 1, 1 });
+    try testing.expectEqual(r6[1], @Vector(3, u8){ 1, 1, 0 });
+    try testing.expectEqual(r6[2], @Vector(3, u8){ 1, 1, 1 });
 }
