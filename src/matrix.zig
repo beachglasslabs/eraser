@@ -42,7 +42,16 @@ pub fn deinit(self: *Self) void {
     defer self.mdata.deinit(self.allocator);
 }
 
-pub fn get(self: *Self, row: usize, col: usize) u8 {
+pub fn numRows(self: *const Self) u8 {
+    return self.num_rows;
+}
+
+pub fn numCols(self: *const Self) u8 {
+    return self.num_Cols;
+}
+
+pub fn get(self: *const Self, row: usize, col: usize) u8 {
+    std.debug.assert(row < self.num_rows and col < self.num_cols);
     switch (self.mtype) {
         .row => {
             return self.mdata.get(row * self.num_cols + col).row;
@@ -53,43 +62,8 @@ pub fn get(self: *Self, row: usize, col: usize) u8 {
     }
 }
 
-pub fn getRow(self: *Self, row: usize) ![]u8 {
-    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_cols);
-    defer list.deinit();
-    switch (self.mtype) {
-        .row => {
-            for (0..self.num_cols) |c| {
-                list.appendAssumeCapacity(self.mdata.items(.data)[row * self.num_cols + c].row);
-            }
-        },
-        .col => {
-            for (0..self.num_cols) |c| {
-                list.appendAssumeCapacity(self.get(row, c));
-            }
-        },
-    }
-    return list.toOwnedSlice();
-}
-
-pub fn getCol(self: *Self, col: usize) ![]u8 {
-    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_rows);
-    defer list.deinit();
-    switch (self.mtype) {
-        .row => {
-            for (0..self.num_rows) |r| {
-                list.appendAssumeCapacity(self.get(r, col));
-            }
-        },
-        .col => {
-            for (0..self.num_rows) |r| {
-                list.appendAssumeCapacity(self.mdata.items(.data)[col * self.num_rows + r].col);
-            }
-        },
-    }
-    return list.toOwnedSlice();
-}
-
 pub fn set(self: *Self, row: usize, col: usize, value: u8) void {
+    std.debug.assert(row < self.num_rows and col < self.num_cols);
     switch (self.mtype) {
         .row => {
             const i = row * self.num_cols + col;
@@ -102,7 +76,39 @@ pub fn set(self: *Self, row: usize, col: usize, value: u8) void {
     }
 }
 
-pub fn print(self: *Self) void {
+pub fn transpose(self: *Self) void {
+    std.debug.assert(self.num_rows == self.num_cols);
+    for (0..self.num_rows) |r| {
+        for (0..self.num_cols) |c| {
+            if (r == c) break;
+            var t = self.get(r, c);
+            self.set(r, c, self.get(c, r));
+            self.set(c, r, t);
+        }
+    }
+}
+
+pub fn getRow(self: *const Self, row: usize) ![]u8 {
+    std.debug.assert(row < self.num_rows);
+    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_cols);
+    defer list.deinit();
+    for (0..self.num_cols) |c| {
+        list.appendAssumeCapacity(self.get(row, c));
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn getCol(self: *const Self, col: usize) ![]u8 {
+    std.debug.assert(col < self.num_cols);
+    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_rows);
+    defer list.deinit();
+    for (0..self.num_rows) |r| {
+        list.appendAssumeCapacity(self.get(r, col));
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn print(self: *const Self) void {
     return switch (self.mtype) {
         .row => {
             std.debug.print("{d}x{d} row ->\n", .{ self.num_rows, self.num_cols });
@@ -123,4 +129,102 @@ pub fn print(self: *Self) void {
             }
         },
     };
+}
+
+test "basic matrix" {
+    var m = try Self.init(std.testing.allocator, DataOrder.row, 3, 2);
+    defer m.deinit();
+    m.set(0, 0, 1);
+    m.set(0, 1, 2);
+    m.set(1, 1, 4);
+    m.set(2, 0, 5);
+    m.print();
+    var col0 = try m.getCol(0);
+    var col1 = try m.getCol(1);
+    defer {
+        std.testing.allocator.free(col0);
+        std.testing.allocator.free(col1);
+    }
+    try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 0, 5 });
+    try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 2, 4, 0 });
+}
+
+test "square matrix" {
+    var m = try Self.init(std.testing.allocator, DataOrder.col, 3, 3);
+    defer m.deinit();
+    m.set(0, 0, 1);
+    m.set(1, 0, 2);
+    m.set(2, 0, 3);
+    m.set(0, 1, 4);
+    m.set(1, 1, 5);
+    m.set(2, 1, 6);
+    m.set(0, 2, 7);
+    m.set(1, 2, 8);
+    m.set(2, 2, 9);
+    m.print();
+
+    var row0 = try m.getRow(0);
+    var row1 = try m.getRow(1);
+    var row2 = try m.getRow(2);
+    defer {
+        std.testing.allocator.free(row0);
+        std.testing.allocator.free(row1);
+        std.testing.allocator.free(row2);
+    }
+    try std.testing.expectEqualSlices(u8, row0, &[_]u8{ 1, 4, 7 });
+    try std.testing.expectEqualSlices(u8, row1, &[_]u8{ 2, 5, 8 });
+    try std.testing.expectEqualSlices(u8, row2, &[_]u8{ 3, 6, 9 });
+
+    var col0 = try m.getCol(0);
+    var col1 = try m.getCol(1);
+    var col2 = try m.getCol(2);
+    defer {
+        std.testing.allocator.free(col0);
+        std.testing.allocator.free(col1);
+        std.testing.allocator.free(col2);
+    }
+    try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 2, 3 });
+    try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 4, 5, 6 });
+    try std.testing.expectEqualSlices(u8, col2, &[_]u8{ 7, 8, 9 });
+}
+
+test "matrix transposition" {
+    var m = try Self.init(std.testing.allocator, DataOrder.col, 3, 3);
+    defer m.deinit();
+    m.set(0, 0, 1);
+    m.set(1, 0, 2);
+    m.set(2, 0, 3);
+    m.set(0, 1, 4);
+    m.set(1, 1, 5);
+    m.set(2, 1, 6);
+    m.set(0, 2, 7);
+    m.set(1, 2, 8);
+    m.set(2, 2, 9);
+
+    m.transpose();
+    m.print();
+
+    var row0 = try m.getRow(0);
+    var row1 = try m.getRow(1);
+    var row2 = try m.getRow(2);
+    defer {
+        std.testing.allocator.free(row0);
+        std.testing.allocator.free(row1);
+        std.testing.allocator.free(row2);
+    }
+    try std.testing.expectEqualSlices(u8, row0, &[_]u8{ 1, 2, 3 });
+    try std.testing.expectEqualSlices(u8, row1, &[_]u8{ 4, 5, 6 });
+    try std.testing.expectEqualSlices(u8, row2, &[_]u8{ 7, 8, 9 });
+
+    var col0 = try m.getCol(0);
+    var col1 = try m.getCol(1);
+    var col2 = try m.getCol(2);
+    defer {
+        std.testing.allocator.free(col0);
+        std.testing.allocator.free(col1);
+        std.testing.allocator.free(col2);
+    }
+    try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 4, 7 });
+    try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 2, 5, 8 });
+    try std.testing.expectEqualSlices(u8, col2, &[_]u8{ 3, 6, 9 });
 }
