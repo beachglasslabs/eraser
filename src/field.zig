@@ -190,3 +190,81 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
         }
     };
 }
+
+test "basic add functionality" {
+    inline for (comptime 1..8) |i| {
+        const field = try BinaryFiniteField(i).init();
+        var negatives = std.AutoHashMap(usize, usize).init(std.testing.allocator);
+        defer negatives.deinit();
+        for (0..field.order) |a| {
+            for (0..field.order) |b| {
+                var result = try field.add(a, b);
+                try std.testing.expect(result < field.order);
+                try std.testing.expectEqual(result, try field.add(b, a));
+                if (result == 0) {
+                    try negatives.put(a, b);
+                    try negatives.put(b, a);
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(u32, field.order), negatives.count());
+    }
+}
+
+test "basic subtract functionality" {
+    inline for (comptime 1..8) |i| {
+        const field = try BinaryFiniteField(i).init();
+        for (0..field.order) |a| {
+            for (0..field.order) |b| {
+                var result = try field.sub(a, b);
+                try std.testing.expect(result < field.order);
+                if (a == b) {
+                    try std.testing.expectEqual(result, 0);
+                } else {
+                    try std.testing.expect(result > 0);
+                }
+            }
+        }
+    }
+}
+
+test "basic multiply functionality" {
+    inline for (comptime 1..8) |i| {
+        const field = try BinaryFiniteField(i).init();
+        var reciprocals = std.AutoHashMap(usize, usize).init(std.testing.allocator);
+        defer reciprocals.deinit();
+        for (0..field.order) |a| {
+            for (0..field.order) |b| {
+                var result = try field.mul(a, b);
+                try std.testing.expectEqual(result, try field.mul(b, a));
+                if (result == 0) {
+                    try std.testing.expect(a == 0 or b == 0);
+                }
+                if (result == 1) {
+                    try std.testing.expect(a != 0 and b != 0);
+                    try reciprocals.put(a, b);
+                    try reciprocals.put(b, a);
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(u32, field.order - 1), reciprocals.count());
+    }
+}
+
+test "basic divide functionality" {
+    inline for (comptime 1..8) |i| {
+        const field = try BinaryFiniteField(i).init();
+        for (0..field.order) |a| {
+            for (0..field.order) |b| {
+                if (b == 0) continue;
+                var result = try field.div(a, b);
+                try std.testing.expect(result < field.order);
+                if (a == b) {
+                    try std.testing.expectEqual(result, 1);
+                } else {
+                    try std.testing.expect(result != 1);
+                }
+            }
+        }
+    }
+}
