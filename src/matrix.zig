@@ -53,6 +53,42 @@ pub fn get(self: *Self, row: usize, col: usize) u8 {
     }
 }
 
+pub fn getRow(self: *Self, row: usize) ![]u8 {
+    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_cols);
+    defer list.deinit();
+    switch (self.mtype) {
+        .row => {
+            for (0..self.num_cols) |c| {
+                list.appendAssumeCapacity(self.mdata.items(.data)[row * self.num_cols + c].row);
+            }
+        },
+        .col => {
+            for (0..self.num_cols) |c| {
+                list.appendAssumeCapacity(self.get(row, c));
+            }
+        },
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn getCol(self: *Self, col: usize) ![]u8 {
+    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_rows);
+    defer list.deinit();
+    switch (self.mtype) {
+        .row => {
+            for (0..self.num_rows) |r| {
+                list.appendAssumeCapacity(self.get(r, col));
+            }
+        },
+        .col => {
+            for (0..self.num_rows) |r| {
+                list.appendAssumeCapacity(self.mdata.items(.data)[col * self.num_rows + r].col);
+            }
+        },
+    }
+    return list.toOwnedSlice();
+}
+
 pub fn set(self: *Self, row: usize, col: usize, value: u8) void {
     switch (self.mtype) {
         .row => {
@@ -69,6 +105,7 @@ pub fn set(self: *Self, row: usize, col: usize, value: u8) void {
 pub fn print(self: *Self) void {
     return switch (self.mtype) {
         .row => {
+            std.debug.print("{d}x{d} row ->\n", .{ self.num_rows, self.num_cols });
             for (0..self.num_rows) |r| {
                 for (0..self.num_cols) |c| {
                     std.debug.print("{d} ", .{self.get(r, c)});
@@ -77,6 +114,7 @@ pub fn print(self: *Self) void {
             }
         },
         .col => {
+            std.debug.print("{d}x{d} col ->\n", .{ self.num_cols, self.num_rows });
             for (0..self.num_cols) |c| {
                 for (0..self.num_rows) |r| {
                     std.debug.print("{d} ", .{self.get(r, c)});

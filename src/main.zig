@@ -85,4 +85,33 @@ test "matrix" {
     m.set(1, 1, 4);
     m.set(2, 0, 5);
     m.print();
+    for (0..m.num_cols) |c| {
+        const col = try m.getCol(c);
+        defer testing.allocator.free(col);
+        std.debug.print("col[{d}]={any}\n", .{ c + 1, col });
+    }
+
+    var m2 = try Matrix.init(testing.allocator, Matrix.DataOrder.col, 3, 3);
+    defer m2.deinit();
+    m2.set(0, 0, 1);
+    m2.set(1, 0, 2);
+    m2.set(2, 0, 3);
+    m2.set(0, 1, 4);
+    m2.set(1, 1, 5);
+    m2.set(2, 1, 6);
+    m2.set(0, 2, 7);
+    m2.set(1, 2, 8);
+    m2.set(2, 2, 9);
+    m2.print();
+
+    for (0..m2.num_rows) |r| {
+        const row = try m2.getRow(r);
+        defer testing.allocator.free(row);
+        std.debug.print("row[{d}]={any}\n", .{ r + 1, row });
+    }
+    for (0..m2.num_cols) |c| {
+        const col = try m2.getCol(c);
+        defer testing.allocator.free(col);
+        std.debug.print("col[{d}]={any}\n", .{ c + 1, col });
+    }
 }
