@@ -1,6 +1,6 @@
 // based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
-const bff = @import("field.zig");
+const bff = @import("bf_field.zig");
 const Matrix = @import("matrix.zig");
 
 // matrix with elements in a 2^n finite field

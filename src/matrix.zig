@@ -111,7 +111,7 @@ pub fn getCol(self: *const Self, col: usize) ![]u8 {
 pub fn print(self: *const Self) void {
     return switch (self.mtype) {
         .row => {
-            std.debug.print("{d}x{d} row ->\n", .{ self.num_rows, self.num_cols });
+            std.debug.print("\n{d}x{d} row ->\n", .{ self.num_rows, self.num_cols });
             for (0..self.num_rows) |r| {
                 for (0..self.num_cols) |c| {
                     std.debug.print("{d} ", .{self.get(r, c)});
@@ -120,7 +120,7 @@ pub fn print(self: *const Self) void {
             }
         },
         .col => {
-            std.debug.print("{d}x{d} col ->\n", .{ self.num_cols, self.num_rows });
+            std.debug.print("\n{d}x{d} col ->\n", .{ self.num_cols, self.num_rows });
             for (0..self.num_cols) |c| {
                 for (0..self.num_rows) |r| {
                     std.debug.print("{d} ", .{self.get(r, c)});
