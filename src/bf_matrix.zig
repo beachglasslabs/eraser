@@ -1,7 +1,7 @@
 // based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
 const bff = @import("bf_field.zig");
-const Matrix = @import("matrix.zig");
+const mat = @import("matrix.zig");
 
 // matrix with elements in a 2^n finite field
 pub fn BinaryFiniteMatrix(comptime n: comptime_int) type {
@@ -23,14 +23,14 @@ pub fn BinaryFiniteMatrix(comptime n: comptime_int) type {
             };
         }
 
-        fn setCol(m: *Matrix, c: usize, a: u8) void {
+        fn setCol(m: *mat.Matrix(n, n), c: usize, a: u8) void {
             for (0..n) |r| {
                 var v = (a >> @intCast(r)) & 1;
                 m.set(r, c, v);
             }
         }
 
-        fn setAllCols(self: *const Self, m: *Matrix, a: usize) !void {
+        fn setAllCols(self: *const Self, m: *mat.Matrix(n, n), a: usize) !void {
             var basis: u8 = 1;
             for (0..n) |c| {
                 var p = try self.field.mul(a, basis);
@@ -40,15 +40,15 @@ pub fn BinaryFiniteMatrix(comptime n: comptime_int) type {
         }
 
         // n x n binary matrix representation
-        pub fn toColMat(self: *const Self, a: usize) !Matrix {
-            var m = try Matrix.init(self.allocator, Matrix.DataOrder.col, n, n);
+        pub fn toColMat(self: *const Self, a: usize) !mat.Matrix(n, n) {
+            var m = try mat.Matrix(n, n).init(self.allocator, mat.DataOrder.col);
             try self.setAllCols(&m, a);
             return m;
         }
 
         // n x n binary matrix representation
-        pub fn toMatrix(self: *const Self, a: usize) !Matrix {
-            var m = try Matrix.init(self.allocator, Matrix.DataOrder.row, n, n);
+        pub fn toMatrix(self: *const Self, a: usize) !mat.Matrix(n, n) {
+            var m = try mat.Matrix(n, n).init(self.allocator, mat.DataOrder.row);
             try self.setAllCols(&m, a);
             return m;
         }
@@ -81,8 +81,7 @@ pub fn BinaryFiniteMatrix(comptime n: comptime_int) type {
             var list = try std.ArrayList(Vec).initCapacity(self.allocator, n);
             defer list.deinit();
             for (0..n) |r| {
-                var row = try m.getRow(r);
-                defer self.allocator.free(row);
+                var row = m.getSlice(r);
                 list.appendAssumeCapacity(row[0..n].*);
             }
             return list.toOwnedSlice();
