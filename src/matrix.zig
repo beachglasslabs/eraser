@@ -5,27 +5,21 @@ pub const DataOrder = enum {
     col,
 };
 
-const MatrixData = union(DataOrder) {
-    row: u8,
-    col: u8,
-};
-
 allocator: std.mem.Allocator,
 num_rows: u8 = undefined,
 num_cols: u8 = undefined,
-mdata: std.MultiArrayList(MatrixData) = undefined,
+mdata: std.ArrayList(u8) = undefined,
 mtype: DataOrder = undefined,
 
 const Self = @This();
 
 // 2^n field
 pub fn init(allocator: std.mem.Allocator, data_order: DataOrder, num_rows: usize, num_cols: usize) !Self {
-    var list = std.MultiArrayList(MatrixData){};
-    try list.ensureTotalCapacity(allocator, num_rows * num_cols);
+    var list = try std.ArrayList(u8).initCapacity(allocator, num_rows * num_cols);
     for (0..num_rows * num_cols) |_| {
         switch (data_order) {
-            .row => list.appendAssumeCapacity(.{ .row = 0 }),
-            .col => list.appendAssumeCapacity(.{ .col = 0 }),
+            .row => list.appendAssumeCapacity(0),
+            .col => list.appendAssumeCapacity(0),
         }
     }
 
@@ -39,7 +33,7 @@ pub fn init(allocator: std.mem.Allocator, data_order: DataOrder, num_rows: usize
 }
 
 pub fn deinit(self: *Self) void {
-    defer self.mdata.deinit(self.allocator);
+    defer self.mdata.deinit();
 }
 
 pub fn numRows(self: *const Self) u8 {
@@ -54,10 +48,12 @@ pub fn get(self: *const Self, row: usize, col: usize) u8 {
     std.debug.assert(row < self.num_rows and col < self.num_cols);
     switch (self.mtype) {
         .row => {
-            return self.mdata.get(row * self.num_cols + col).row;
+            const i = row * self.num_cols + col;
+            return self.mdata.items[i];
         },
         .col => {
-            return self.mdata.get(col * self.num_rows + row).col;
+            const i = col * self.num_rows + row;
+            return self.mdata.items[i];
         },
     }
 }
@@ -67,11 +63,11 @@ pub fn set(self: *Self, row: usize, col: usize, value: u8) void {
     switch (self.mtype) {
         .row => {
             const i = row * self.num_cols + col;
-            self.mdata.set(i, .{ .row = value });
+            self.mdata.items[i] = value;
         },
         .col => {
             const i = col * self.num_rows + row;
-            self.mdata.set(i, .{ .col = value });
+            self.mdata.items[i] = value;
         },
     }
 }
@@ -88,24 +84,45 @@ pub fn transpose(self: *Self) void {
     }
 }
 
-pub fn getRow(self: *const Self, row: usize) ![]u8 {
-    std.debug.assert(row < self.num_rows);
-    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_cols);
-    defer list.deinit();
-    for (0..self.num_cols) |c| {
-        list.appendAssumeCapacity(self.get(row, c));
+fn getSlice(self: *const Self, rc: usize) []u8 {
+    switch (self.mtype) {
+        .row => {
+            std.debug.assert(rc < self.num_rows);
+            const i = rc * self.num_cols;
+            return self.mdata.items[i .. i + self.num_cols];
+        },
+        .col => {
+            std.debug.assert(rc < self.num_cols);
+            const i = rc * self.num_rows;
+            return self.mdata.items[i .. i + self.num_rows];
+        },
     }
-    return list.toOwnedSlice();
 }
 
-pub fn getCol(self: *const Self, col: usize) ![]u8 {
-    std.debug.assert(col < self.num_cols);
-    var list = try std.ArrayList(u8).initCapacity(self.allocator, self.num_rows);
-    defer list.deinit();
-    for (0..self.num_rows) |r| {
-        list.appendAssumeCapacity(self.get(r, col));
+pub fn getRow(self: *const Self, row: usize) []u8 {
+    std.debug.print("mtype={}\n", .{self.mtype});
+    switch (self.mtype) {
+        .row => {
+            return self.getSlice(row);
+        },
+        .col => {
+            std.debug.print("matrix data is columnn based, use get() or getCol() instead.\n", .{});
+            return self.getSlice(row);
+        },
     }
-    return list.toOwnedSlice();
+}
+
+pub fn getCol(self: *const Self, col: usize) []u8 {
+    std.debug.print("mtype={}\n", .{self.mtype});
+    switch (self.mtype) {
+        .col => {
+            return self.getSlice(col);
+        },
+        .row => {
+            std.debug.print("matrix data is row based, use get() or getRow() instead.\n", .{});
+            return self.getSlice(col);
+        },
+    }
 }
 
 pub fn print(self: *const Self) void {
@@ -132,19 +149,15 @@ pub fn print(self: *const Self) void {
 }
 
 test "basic matrix" {
-    var m = try Self.init(std.testing.allocator, DataOrder.row, 3, 2);
+    var m = try Self.init(std.testing.allocator, DataOrder.col, 3, 2);
     defer m.deinit();
     m.set(0, 0, 1);
     m.set(0, 1, 2);
     m.set(1, 1, 4);
     m.set(2, 0, 5);
     m.print();
-    var col0 = try m.getCol(0);
-    var col1 = try m.getCol(1);
-    defer {
-        std.testing.allocator.free(col0);
-        std.testing.allocator.free(col1);
-    }
+    var col0 = m.getCol(0);
+    var col1 = m.getCol(1);
     try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 0, 5 });
     try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 2, 4, 0 });
 }
@@ -163,33 +176,16 @@ test "square matrix" {
     m.set(2, 2, 9);
     m.print();
 
-    var row0 = try m.getRow(0);
-    var row1 = try m.getRow(1);
-    var row2 = try m.getRow(2);
-    defer {
-        std.testing.allocator.free(row0);
-        std.testing.allocator.free(row1);
-        std.testing.allocator.free(row2);
-    }
-    try std.testing.expectEqualSlices(u8, row0, &[_]u8{ 1, 4, 7 });
-    try std.testing.expectEqualSlices(u8, row1, &[_]u8{ 2, 5, 8 });
-    try std.testing.expectEqualSlices(u8, row2, &[_]u8{ 3, 6, 9 });
-
-    var col0 = try m.getCol(0);
-    var col1 = try m.getCol(1);
-    var col2 = try m.getCol(2);
-    defer {
-        std.testing.allocator.free(col0);
-        std.testing.allocator.free(col1);
-        std.testing.allocator.free(col2);
-    }
+    var col0 = m.getCol(0);
+    var col1 = m.getCol(1);
+    var col2 = m.getCol(2);
     try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 4, 5, 6 });
     try std.testing.expectEqualSlices(u8, col2, &[_]u8{ 7, 8, 9 });
 }
 
 test "matrix transposition" {
-    var m = try Self.init(std.testing.allocator, DataOrder.col, 3, 3);
+    var m = try Self.init(std.testing.allocator, DataOrder.row, 3, 3);
     defer m.deinit();
     m.set(0, 0, 1);
     m.set(1, 0, 2);
@@ -204,27 +200,10 @@ test "matrix transposition" {
     m.transpose();
     m.print();
 
-    var row0 = try m.getRow(0);
-    var row1 = try m.getRow(1);
-    var row2 = try m.getRow(2);
-    defer {
-        std.testing.allocator.free(row0);
-        std.testing.allocator.free(row1);
-        std.testing.allocator.free(row2);
-    }
+    var row0 = m.getRow(0);
+    var row1 = m.getRow(1);
+    var row2 = m.getRow(2);
     try std.testing.expectEqualSlices(u8, row0, &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, row1, &[_]u8{ 4, 5, 6 });
     try std.testing.expectEqualSlices(u8, row2, &[_]u8{ 7, 8, 9 });
-
-    var col0 = try m.getCol(0);
-    var col1 = try m.getCol(1);
-    var col2 = try m.getCol(2);
-    defer {
-        std.testing.allocator.free(col0);
-        std.testing.allocator.free(col1);
-        std.testing.allocator.free(col2);
-    }
-    try std.testing.expectEqualSlices(u8, col0, &[_]u8{ 1, 4, 7 });
-    try std.testing.expectEqualSlices(u8, col1, &[_]u8{ 2, 5, 8 });
-    try std.testing.expectEqualSlices(u8, col2, &[_]u8{ 3, 6, 9 });
 }
