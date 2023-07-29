@@ -1,6 +1,6 @@
 // based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
-const Matrix = @import("matrix.zig");
+const mat = @import("matrix.zig");
 
 pub fn BinaryFiniteField(comptime n: comptime_int) type {
     return struct {
@@ -39,6 +39,10 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
                 .divisor = d,
                 .order = @as(u8, 1) << @intCast(n),
             };
+        }
+
+        pub fn order(self: *const Self) u8 {
+            return self.order;
         }
 
         pub fn validated(self: *const Self, a: usize) ValueError!u8 {
@@ -110,5 +114,37 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
         pub fn div(self: *const Self, a: usize, b: usize) ValueError!u8 {
             return try self.mul(a, try self.invert(b));
         }
+
+        fn setCol(m: *mat.Matrix(n, n), c: usize, a: u8) void {
+            for (0..n) |r| {
+                var v = (a >> @intCast(r)) & 1;
+                m.set(r, c, v);
+            }
+        }
+
+        fn setAllCols(self: *const Self, m: *mat.Matrix(n, n), a: usize) !void {
+            var basis: u8 = 1;
+            for (0..n) |c| {
+                var p = try self.mul(a, basis);
+                basis <<= 1;
+                setCol(m, c, p);
+            }
+        }
+
+        // n x n binary matrix representation
+        pub fn toMatrix(self: *const Self, allocator: std.mem.Allocator, a: usize) !mat.Matrix(n, n) {
+            var m = try mat.Matrix(n, n).init(allocator, mat.DataOrder.row);
+            try self.setAllCols(&m, a);
+            return m;
+        }
     };
+}
+
+test "convert to matrix" {
+    const bff = try BinaryFiniteField(3).init();
+    var bfm = try bff.toMatrix(std.testing.allocator, 6);
+    defer bfm.deinit();
+    try std.testing.expectEqualSlices(u8, bfm.getSlice(0), &[_]u8{ 0, 1, 1 });
+    try std.testing.expectEqualSlices(u8, bfm.getSlice(1), &[_]u8{ 1, 1, 0 });
+    try std.testing.expectEqualSlices(u8, bfm.getSlice(2), &[_]u8{ 1, 1, 1 });
 }
