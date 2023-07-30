@@ -4,11 +4,11 @@ const bff = @import("bf_field.zig");
 const mat = @import("matrix.zig");
 
 // matrix with elements in a 2^n finite field
-pub fn BinaryFieldMatrix(comptime r: comptime_int, comptime c: comptime_int, comptime n: comptime_int) type {
+pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, comptime b: comptime_int) type {
     return struct {
         allocator: std.mem.Allocator,
-        field: bff.BinaryFiniteField(n) = undefined,
-        matrix: mat.Matrix(r, c) = undefined,
+        field: bff.BinaryFiniteField(b) = undefined,
+        matrix: mat.Matrix(m, n) = undefined,
 
         const Self = @This();
 
@@ -18,15 +18,15 @@ pub fn BinaryFieldMatrix(comptime r: comptime_int, comptime c: comptime_int, com
         ) !Self {
             return .{
                 .allocator = allocator,
-                .field = try bff.BinaryFiniteField(n).init(),
-                .matrix = try mat.Matrix(r, c).init(allocator, mat.DataOrder.row),
+                .field = try bff.BinaryFiniteField(b).init(),
+                .matrix = try mat.Matrix(m, n).init(allocator, mat.DataOrder.row),
             };
         }
 
         pub fn initCauchy(
             allocator: std.mem.Allocator,
         ) !Self {
-            var field = try bff.BinaryFiniteField(n).init();
+            var field = try bff.BinaryFiniteField(b).init();
             var matrix = try toCauchy(allocator, field);
 
             return .{
@@ -38,11 +38,11 @@ pub fn BinaryFieldMatrix(comptime r: comptime_int, comptime c: comptime_int, com
 
         pub fn initMatrix(
             allocator: std.mem.Allocator,
-            matrix: mat.Matrix(r, c),
+            matrix: mat.Matrix(m, n),
         ) !Self {
             return .{
                 .allocator = allocator,
-                .field = try bff.BinaryFiniteField(n).init(),
+                .field = try bff.BinaryFiniteField(b).init(),
                 .matrix = matrix,
             };
         }
@@ -59,18 +59,22 @@ pub fn BinaryFieldMatrix(comptime r: comptime_int, comptime c: comptime_int, com
             return self.matrix.numCols();
         }
 
-        pub fn det(self: *const Self) !u8 {
-            std.debug.assert(r == c);
+        pub fn get(self: *const Self, r: usize, c: usize) u8 {
+            return self.matrix.get(r, c);
+        }
 
-            if (r == 1) {
+        pub fn det(self: *const Self) !u8 {
+            std.debug.assert(m == n);
+
+            if (m == 1) {
                 return self.matrix.get(0, 0);
             }
 
             var result: u8 = 0;
-            inline for (0..c) |i| {
-                var sub = try self.subMatrix(&[_]u8{0}, &[_]u8{i});
+            inline for (0..n) |c| {
+                var sub = try self.subMatrix(&[_]usize{0}, &[_]usize{c});
                 defer sub.deinit();
-                var x = try self.field.mul(self.matrix.get(0, i), try sub.det());
+                var x = try self.field.mul(self.matrix.get(0, c), try sub.det());
                 if (c % 2 == 1) {
                     x = try self.field.neg(x);
                 }
@@ -79,45 +83,95 @@ pub fn BinaryFieldMatrix(comptime r: comptime_int, comptime c: comptime_int, com
             return result;
         }
 
-        fn toCauchy(allocator: std.mem.Allocator, field: bff.BinaryFiniteField(n)) !mat.Matrix(r, c) {
-            std.debug.assert(field.order >= r + c);
-            var m = try mat.Matrix(r, c).init(allocator, mat.DataOrder.row);
-            for (0..r) |i| {
-                for (0..c) |j| {
-                    m.set(i, j, try field.invert(try field.sub(i + c, j)));
+        fn toCauchy(allocator: std.mem.Allocator, field: bff.BinaryFiniteField(b)) !mat.Matrix(m, n) {
+            std.debug.assert(field.order >= m + n);
+
+            var cauchy = try mat.Matrix(m, n).init(allocator, mat.DataOrder.row);
+            for (0..n) |r| {
+                for (0..n) |c| {
+                    cauchy.set(r, c, try field.invert(try field.sub(r + n, c)));
                 }
             }
-            return m;
+            return cauchy;
         }
 
         pub fn print(self: *const Self) void {
             self.matrix.print();
         }
 
-        pub fn subMatrix(self: *const Self, comptime excluded_rows: []const u8, comptime excluded_cols: []const u8) !BinaryFieldMatrix(r - excluded_rows.len, c - excluded_cols.len, n) {
-            const sr = r - excluded_rows.len;
-            const sc = c - excluded_cols.len;
-            var m = try mat.Matrix(sr, sc).init(self.allocator, self.matrix.mtype);
+        pub fn subMatrix(self: *const Self, comptime excluded_rows: []const usize, comptime excluded_cols: []const usize) !BinaryFieldMatrix(m - excluded_rows.len, n - excluded_cols.len, b) {
+            const sm = m - excluded_rows.len;
+            const sn = n - excluded_cols.len;
+            var sub = try mat.Matrix(sm, sn).init(self.allocator, self.matrix.mtype);
             comptime var i = 0;
-            rblk: inline for (0..r) |ri| {
+            rblk: inline for (0..m) |r| {
                 inline for (excluded_rows) |er| {
-                    if (ri == er) {
+                    if (r == er) {
                         continue :rblk;
                     }
                 }
                 comptime var j = 0;
-                cblk: inline for (0..c) |ci| {
+                cblk: inline for (0..n) |c| {
                     inline for (excluded_cols) |ec| {
-                        if (ci == ec) {
+                        if (c == ec) {
                             continue :cblk;
                         }
                     }
-                    m.set(i, j, self.matrix.get(ri, ci));
+                    sub.set(i, j, self.matrix.get(r, c));
                     j += 1;
                 }
                 i += 1;
             }
-            return try BinaryFieldMatrix(sr, sc, n).initMatrix(self.allocator, m);
+            return try BinaryFieldMatrix(sm, sn, b).initMatrix(self.allocator, sub);
+        }
+
+        pub fn cofactorize(self: *Self) !void {
+            std.debug.assert(m == n);
+
+            inline for (0..m) |r| {
+                inline for (0..n) |c| {
+                    var sub = try self.subMatrix(&[_]usize{r}, &[_]usize{c});
+                    defer sub.deinit();
+                    self.matrix.set(r, c, try sub.det());
+                    if ((r + c) % 2 == 1) {
+                        self.matrix.set(r, c, try self.field.neg(self.matrix.get(r, c)));
+                    }
+                }
+            }
+        }
+
+        pub fn transpose(self: *Self) void {
+            std.debug.assert(m == n);
+
+            self.matrix.transpose();
+        }
+
+        pub fn scale(self: *Self, factor: usize) !void {
+            std.debug.assert(m == n);
+
+            for (0..m) |r| {
+                for (0..n) |c| {
+                    self.matrix.set(r, c, try self.field.mul(self.matrix.get(r, c), factor));
+                }
+            }
+        }
+
+        pub fn invert(self: *Self) !void {
+            try self.cofactorize();
+            self.transpose();
+            try self.scale(try self.field.invert(try self.det()));
+        }
+
+        pub fn multiply(self: *Self, comptime z: comptime_int, other: BinaryFieldMatrix(n, z, b)) !BinaryFieldMatrix(m, z, b) {
+            var matrix = try mat.Matrix(m, z).init(self.allocator, mat.DataOrder.row);
+            for (0..m) |r| {
+                for (0..z) |c| {
+                    for (0..n) |i| {
+                        matrix.set(r, c, try self.field.add(matrix.get(r, c), try self.field.mul(self.get(r, i), other.get(i, c))));
+                    }
+                }
+            }
+            return try BinaryFieldMatrix(m, z, b).initMatrix(self.allocator, matrix);
         }
     };
 }
@@ -126,7 +180,24 @@ test "cauchy matrix" {
     var cnm = try BinaryFieldMatrix(5, 3, 3).initCauchy(std.testing.allocator);
     defer cnm.deinit();
     cnm.print();
-    var bfm = try BinaryFieldMatrix(3, 3, 2).init(std.testing.allocator);
+}
+
+test "square matrix" {
+    var field = try bff.BinaryFiniteField(3).init();
+    var bfm = try BinaryFieldMatrix(3, 3, 3).initMatrix(std.testing.allocator, try field.toMatrix(std.testing.allocator, 5));
     defer bfm.deinit();
+    bfm.print();
     std.debug.print("det == {d}\n", .{try bfm.det()});
+    try bfm.invert();
+    bfm.print();
+}
+
+test "matrix multiplication" {
+    var bfma = try BinaryFieldMatrix(5, 3, 3).init(std.testing.allocator);
+    defer bfma.deinit();
+    var bfmb = try BinaryFieldMatrix(3, 4, 3).init(std.testing.allocator);
+    defer bfmb.deinit();
+    var bfmc = try bfma.multiply(4, bfmb);
+    defer bfmc.deinit();
+    bfmc.print();
 }
