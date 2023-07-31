@@ -51,12 +51,12 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             self.matrix.deinit();
         }
 
-        pub fn numRows(self: *const Self) u8 {
-            return self.matrix.numRows();
+        pub fn numRows(_: *const Self) usize {
+            return m;
         }
 
-        pub fn numCols(self: *const Self) u8 {
-            return self.matrix.numCols();
+        pub fn numCols(_: *const Self) usize {
+            return n;
         }
 
         pub fn get(self: *const Self, r: usize, c: usize) u8 {
@@ -72,7 +72,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
 
             var result: u8 = 0;
             inline for (0..n) |c| {
-                var sub = try self.subMatrix(&[_]usize{0}, &[_]usize{c});
+                var sub = try self.subMatrix(&[_]u8{0}, &[_]u8{c});
                 defer sub.deinit();
                 var x = try self.field.mul(self.matrix.get(0, c), try sub.det());
                 if (c % 2 == 1) {
@@ -87,7 +87,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             std.debug.assert(field.order >= m + n);
 
             var cauchy = try mat.Matrix(m, n).init(allocator, mat.DataOrder.row);
-            for (0..n) |r| {
+            for (0..m) |r| {
                 for (0..n) |c| {
                     cauchy.set(r, c, try field.invert(try field.sub(r + n, c)));
                 }
@@ -99,7 +99,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             self.matrix.print();
         }
 
-        pub fn subMatrix(self: *const Self, comptime excluded_rows: []const usize, comptime excluded_cols: []const usize) !BinaryFieldMatrix(m - excluded_rows.len, n - excluded_cols.len, b) {
+        pub fn subMatrix(self: *const Self, comptime excluded_rows: []const u8, comptime excluded_cols: []const u8) !BinaryFieldMatrix(m - excluded_rows.len, n - excluded_cols.len, b) {
             const sm = m - excluded_rows.len;
             const sn = n - excluded_cols.len;
             var sub = try mat.Matrix(sm, sn).init(self.allocator, self.matrix.mtype);
@@ -130,7 +130,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
 
             inline for (0..m) |r| {
                 inline for (0..n) |c| {
-                    var sub = try self.subMatrix(&[_]usize{r}, &[_]usize{c});
+                    var sub = try self.subMatrix(&[_]u8{r}, &[_]u8{c});
                     defer sub.deinit();
                     self.matrix.set(r, c, try sub.det());
                     if ((r + c) % 2 == 1) {
@@ -173,7 +173,40 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             }
             return try BinaryFieldMatrix(m, z, b).initMatrix(self.allocator, matrix);
         }
+
+        pub fn toBinary(self: *const Self) !BinaryFieldMatrix(m * b, n * b, 1) {
+            var matrix = try mat.Matrix(m * b, n * b).init(self.allocator, mat.DataOrder.row);
+            for (0..m) |r| {
+                for (0..n) |c| {
+                    var a = self.matrix.get(r, c);
+                    var bfm = try self.field.toMatrix(self.allocator, a);
+                    defer bfm.deinit();
+                    for (0..b) |i| {
+                        for (0..b) |j| {
+                            matrix.set(r * b + i, c * b + j, try self.field.validated(bfm.get(i, j)));
+                        }
+                    }
+                }
+            }
+            return try BinaryFieldMatrix(m * b, n * b, 1).initMatrix(self.allocator, matrix);
+        }
     };
+}
+
+fn choose(comptime l: []const u8, comptime k: comptime_int, comptime t: comptime_int) [t][k]u8 {
+    var results: [t][k]u8 = std.mem.zeroes([t][k]u8);
+    comptime var c = 0;
+    inline for (0..l.len - 1) |a| {
+        inline for (1..l.len) |b| {
+            if (a < b) {
+                // std.debug.print("adding [{d}, {d}]\n", .{ a, b });
+                results[c] = [k]u8{ @intCast(a), @intCast(b) };
+                c += 1;
+            }
+        }
+    }
+    // std.debug.print("added {d} pairs\n", .{c});
+    return results;
 }
 
 test "cauchy matrix" {
@@ -200,4 +233,32 @@ test "matrix multiplication" {
     var bfmc = try bfma.multiply(4, bfmb);
     defer bfmc.deinit();
     bfmc.print();
+}
+
+test "matrix binary representation" {
+    var bfma = try BinaryFieldMatrix(5, 3, 3).initCauchy(std.testing.allocator);
+    defer bfma.deinit();
+    bfma.print();
+    var bfmb = try bfma.toBinary();
+    defer bfmb.deinit();
+    bfmb.print();
+}
+
+test "invertible sub-matrices" {
+    var bfm = try BinaryFieldMatrix(5, 3, 3).initCauchy(std.testing.allocator);
+    defer bfm.deinit();
+    comptime var ex_rows: [10][2]u8 = choose(&[_]u8{ 0, 1, 2, 3, 4 }, 2, 10);
+    //defer std.testing.allocator.free(ex_rows);
+    //inline for (0..ex_rows.len) |i| {
+    inline for (0..ex_rows.len) |i| {
+        std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
+        comptime var er = ex_rows[i][0..2];
+        var submatrix = try bfm.subMatrix(er, &[0]u8{});
+        defer submatrix.deinit();
+        try std.testing.expectEqual(bfm.numRows() - ex_rows[i].len, submatrix.numRows());
+        try std.testing.expectEqual(bfm.numCols(), submatrix.numCols());
+        // try submatrix.invert();
+        // var product1 = try submatrix.multiply(submatrix);
+        // var product2 = try inverse.multiply(submatrix);
+    }
 }
