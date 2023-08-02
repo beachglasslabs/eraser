@@ -2,6 +2,7 @@
 const std = @import("std");
 const bff = @import("bf_field.zig");
 const mat = @import("matrix.zig");
+const cho = @import("choose.zig");
 
 // matrix with elements in a 2^n finite field
 pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, comptime b: comptime_int) type {
@@ -190,22 +191,6 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
     };
 }
 
-fn choose(comptime l: []const u8, comptime k: comptime_int, comptime t: comptime_int) [t][k]u8 {
-    var results: [t][k]u8 = std.mem.zeroes([t][k]u8);
-    comptime var c = 0;
-    inline for (0..l.len - 1) |a| {
-        inline for (1..l.len) |b| {
-            if (a < b) {
-                // std.debug.print("adding [{d}, {d}]\n", .{ a, b });
-                results[c] = [k]u8{ @intCast(a), @intCast(b) };
-                c += 1;
-            }
-        }
-    }
-    // std.debug.print("added {d} pairs\n", .{c});
-    return results;
-}
-
 test "square matrix" {
     var field = try bff.BinaryFiniteField(3).init();
     var bfm = try BinaryFieldMatrix(3, 3, 3).initMatrix(std.testing.allocator, try field.toMatrix(std.testing.allocator, 5));
@@ -232,7 +217,7 @@ test "invertible sub-matrices" {
     const n = 3;
     var bfm = try BinaryFieldMatrix(m, n, 3).initCauchy(std.testing.allocator);
     defer bfm.deinit();
-    comptime var ex_rows = choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n, 10);
+    comptime var ex_rows = cho.choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n);
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
         comptime var er = ex_rows[i][0..(m - n)];
