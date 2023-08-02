@@ -6,9 +6,11 @@ const mat = @import("matrix.zig");
 // matrix with elements in a 2^n finite field
 pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, comptime b: comptime_int) type {
     return struct {
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator = undefined,
         field: bff.BinaryFiniteField(b) = undefined,
         matrix: mat.Matrix(m, n) = undefined,
+        comptime numRows: u8 = m,
+        comptime numCols: u8 = n,
 
         const Self = @This();
 
@@ -49,14 +51,6 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
 
         pub fn deinit(self: *Self) void {
             self.matrix.deinit();
-        }
-
-        pub fn numRows(_: *const Self) usize {
-            return m;
-        }
-
-        pub fn numCols(_: *const Self) usize {
-            return n;
         }
 
         pub fn get(self: *const Self, r: usize, c: usize) u8 {
@@ -234,29 +228,29 @@ test "matrix multiplication" {
 }
 
 test "invertible sub-matrices" {
-    var bfm = try BinaryFieldMatrix(5, 3, 3).initCauchy(std.testing.allocator);
+    const m = 5;
+    const n = 3;
+    var bfm = try BinaryFieldMatrix(m, n, 3).initCauchy(std.testing.allocator);
     defer bfm.deinit();
-    comptime var ex_rows: [10][2]u8 = choose(&[_]u8{ 0, 1, 2, 3, 4 }, 2, 10);
-    //defer std.testing.allocator.free(ex_rows);
-    //inline for (0..ex_rows.len) |i| {
+    comptime var ex_rows = choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n, 10);
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
-        comptime var er = ex_rows[i][0..2];
+        comptime var er = ex_rows[i][0..(m - n)];
         var submatrix = try bfm.subMatrix(er, &[0]u8{});
         defer submatrix.deinit();
-        try std.testing.expectEqual(bfm.numRows() - ex_rows[i].len, submatrix.numRows());
-        try std.testing.expectEqual(bfm.numCols(), submatrix.numCols());
+        try std.testing.expectEqual(bfm.numRows - ex_rows[i].len, submatrix.numRows);
+        try std.testing.expectEqual(bfm.numCols, submatrix.numCols);
         var inverse = try submatrix.invert();
         defer inverse.deinit();
-        var product1 = try inverse.multiply(3, submatrix);
+        var product1 = try inverse.multiply(submatrix.numCols, submatrix);
         defer product1.deinit();
-        var product2 = try submatrix.multiply(3, inverse);
+        var product2 = try submatrix.multiply(inverse.numCols, inverse);
         defer product2.deinit();
         product2.print();
-        try std.testing.expectEqual(product1.numRows(), product2.numRows());
-        try std.testing.expectEqual(product1.numCols(), product2.numCols());
-        for (0..product1.numRows()) |r| {
-            for (0..product1.numCols()) |c| {
+        try std.testing.expectEqual(product1.numRows, product2.numRows);
+        try std.testing.expectEqual(product1.numCols, product2.numCols);
+        for (0..product1.numRows) |r| {
+            for (0..product1.numCols) |c| {
                 try std.testing.expectEqual(product1.get(r, c), product2.get(r, c));
                 if (r == c) {
                     try std.testing.expectEqual(product1.get(r, c), 1);
@@ -267,16 +261,16 @@ test "invertible sub-matrices" {
         }
         var sub_bin = try submatrix.toBinary();
         defer sub_bin.deinit();
-        try std.testing.expectEqual(submatrix.numRows() * submatrix.field.exp, sub_bin.numRows());
-        try std.testing.expectEqual(submatrix.numCols() * submatrix.field.exp, sub_bin.numCols());
+        try std.testing.expectEqual(submatrix.numRows * submatrix.field.exp, sub_bin.numRows);
+        try std.testing.expectEqual(submatrix.numCols * submatrix.field.exp, sub_bin.numCols);
         var inv_bin = try inverse.toBinary();
         defer inv_bin.deinit();
-        var pr1_bin = try inv_bin.multiply(9, sub_bin);
+        var pr1_bin = try inv_bin.multiply(sub_bin.numCols, sub_bin);
         defer pr1_bin.deinit();
-        var pr2_bin = try sub_bin.multiply(9, inv_bin);
+        var pr2_bin = try sub_bin.multiply(inv_bin.numCols, inv_bin);
         defer pr2_bin.deinit();
-        for (0..pr1_bin.numRows() * pr1_bin.field.exp) |r| {
-            for (0..pr1_bin.numCols() * pr1_bin.field.exp) |c| {
+        for (0..pr1_bin.numRows * pr1_bin.field.exp) |r| {
+            for (0..pr1_bin.numCols * pr1_bin.field.exp) |c| {
                 try std.testing.expectEqual(pr1_bin.get(r, c), pr2_bin.get(r, c));
                 if (r == c) {
                     try std.testing.expectEqual(pr1_bin.get(r, c), 1);
@@ -300,8 +294,8 @@ test "matrix binary representation" {
             var sum = try bfma.field.add(a, b);
             var mat_sum = try bfma.field.toMatrix(std.testing.allocator, sum);
             defer mat_sum.deinit();
-            for (0..mat_a.numRows()) |r| {
-                for (0..mat_a.numCols()) |c| {
+            for (0..mat_a.numRows) |r| {
+                for (0..mat_a.numCols) |c| {
                     try std.testing.expectEqual(mat_sum.get(r, c), try bfma.field.add(mat_a.get(r, c), mat_b.get(r, c)));
                 }
             }

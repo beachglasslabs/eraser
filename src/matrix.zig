@@ -5,17 +5,16 @@ pub const DataOrder = enum {
     col,
 };
 
-// matrix with elements in a 2^n finite field
 pub fn Matrix(comptime m: comptime_int, comptime n: comptime_int) type {
     return struct {
-        allocator: std.mem.Allocator,
-
+        allocator: std.mem.Allocator = undefined,
         mdata: std.ArrayList(u8) = undefined,
         mtype: DataOrder = undefined,
+        comptime numRows: u8 = m,
+        comptime numCols: u8 = n,
 
         const Self = @This();
 
-        // 2^n field
         pub fn init(allocator: std.mem.Allocator, data_order: DataOrder) !Self {
             var list = try std.ArrayList(u8).initCapacity(allocator, m * n);
             list.appendSliceAssumeCapacity(&std.mem.zeroes([m * n]u8));
@@ -29,14 +28,6 @@ pub fn Matrix(comptime m: comptime_int, comptime n: comptime_int) type {
 
         pub fn deinit(self: *Self) void {
             defer self.mdata.deinit();
-        }
-
-        pub fn numRows(_: *const Self) u8 {
-            return m;
-        }
-
-        pub fn numCols(_: *const Self) u8 {
-            return n;
         }
 
         pub fn get(self: *const Self, row: usize, col: usize) u8 {
