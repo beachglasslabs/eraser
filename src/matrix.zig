@@ -172,27 +172,27 @@ pub fn Matrix(comptime m: comptime_int, comptime n: comptime_int) type {
             }
         }
 
-        pub fn print(self: *const Self) void {
-            return switch (self.mtype) {
+        pub fn format(self: *const Self, comptime _: []const u8, _: std.fmt.FormatOptions, stream: anytype) !void {
+            switch (self.mtype) {
                 .row => {
-                    std.debug.print("\n{d}x{d} row ->\n", .{ m, n });
+                    try stream.print("\n{d}x{d} row ->\n", .{ m, n });
                     for (0..m) |r| {
                         for (0..n) |c| {
-                            std.debug.print("{d} ", .{self.get(r, c)});
+                            try stream.print("{d} ", .{self.get(r, c)});
                         }
-                        std.debug.print("\n", .{});
+                        try stream.print("\n", .{});
                     }
                 },
                 .col => {
-                    std.debug.print("\n{d}x{d} col ->\n", .{ m, n });
+                    try stream.print("\n{d}x{d} col ->\n", .{ m, n });
                     for (0..n) |c| {
                         for (0..m) |r| {
-                            std.debug.print("{d} ", .{self.get(r, c)});
+                            try stream.print("{d} ", .{self.get(r, c)});
                         }
-                        std.debug.print("\n", .{});
+                        try stream.print("\n", .{});
                     }
                 },
-            };
+            }
         }
     };
 }
@@ -204,7 +204,6 @@ test "basic matrix" {
     m.set(0, 1, 2);
     m.set(1, 1, 4);
     m.set(2, 0, 5);
-    // m.print();
     try std.testing.expectEqualSlices(u8, m.getSlice(0), &[_]u8{ 1, 0, 5 });
     try std.testing.expectEqualSlices(u8, m.getSlice(1), &[_]u8{ 2, 4, 0 });
     m.setCol(1, &[_]u8{ 7, 8, 9 });
@@ -226,7 +225,6 @@ test "square matrix" {
     m.set(0, 2, 7);
     m.set(1, 2, 8);
     m.set(2, 2, 9);
-    // m.print();
 
     try std.testing.expectEqualSlices(u8, m.getSlice(0), &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, m.getSlice(1), &[_]u8{ 4, 5, 6 });
@@ -247,7 +245,6 @@ test "matrix transposition" {
     m.set(2, 2, 9);
 
     m.transpose();
-    // m.print();
 
     try std.testing.expectEqualSlices(u8, m.getSlice(0), &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, m.getSlice(1), &[_]u8{ 4, 5, 6 });
@@ -262,16 +259,12 @@ test "rows and cols" {
     m.setRow(2, &[_]u8{ 9, 10, 11 });
     m.setRow(3, &[_]u8{ 13, 14, 15 });
 
-    // m.print();
-
     try std.testing.expectEqualSlices(u8, &m.getRow(0), &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, &m.getRow(1), &[_]u8{ 5, 6, 7 });
     try std.testing.expectEqualSlices(u8, &m.getRow(2), &[_]u8{ 9, 10, 11 });
     try std.testing.expectEqualSlices(u8, &m.getRow(3), &[_]u8{ 13, 14, 15 });
 
     m.setCol(1, &[_]u8{ 4, 8, 12, 16 });
-
-    // m.print();
 
     try std.testing.expectEqualSlices(u8, &m.getRow(0), &[_]u8{ 1, 4, 3 });
     try std.testing.expectEqualSlices(u8, &m.getRow(1), &[_]u8{ 5, 8, 7 });
@@ -286,10 +279,8 @@ test "rows and cols" {
     defer m2.deinit();
     m2.setCol(0, &[_]u8{ 1, 3, 7 });
     m2.setCol(1, &[_]u8{ 2, 5, 2 });
-    // m2.print();
     try std.testing.expectEqualSlices(u8, &m2.getCol(0), &[_]u8{ 1, 3, 7 });
     m2.setRow(1, &[_]u8{ 9, 8 });
-    m2.print();
 
     try std.testing.expectEqualSlices(u8, &m2.getRow(0), &[_]u8{ 1, 2 });
     try std.testing.expectEqualSlices(u8, &m2.getRow(1), &[_]u8{ 9, 8 });

@@ -90,8 +90,8 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             return cnm;
         }
 
-        pub fn print(self: *const Self) void {
-            self.matrix.print();
+        pub fn format(self: *const Self, comptime fmt: []const u8, opts: std.fmt.FormatOptions, stream: anytype) !void {
+            try self.matrix.format(fmt, opts, stream);
         }
 
         pub fn subMatrix(self: *const Self, comptime excluded_rows: []const u8, comptime excluded_cols: []const u8) !BinaryFieldMatrix(m - excluded_rows.len, n - excluded_cols.len, b) {
@@ -195,11 +195,8 @@ test "square matrix" {
     var field = try bff.BinaryFiniteField(3).init();
     var bfm = try BinaryFieldMatrix(3, 3, 3).initMatrix(std.testing.allocator, try field.toMatrix(std.testing.allocator, 5));
     defer bfm.deinit();
-    bfm.print();
-    std.debug.print("det == {d}\n", .{try bfm.det()});
     var inverse = try bfm.invert();
     defer inverse.deinit();
-    inverse.print();
 }
 
 test "matrix multiplication" {
@@ -209,7 +206,6 @@ test "matrix multiplication" {
     defer bfmb.deinit();
     var bfmc = try bfma.multiply(4, bfmb);
     defer bfmc.deinit();
-    bfmc.print();
 }
 
 test "invertible sub-matrices" {
@@ -218,6 +214,7 @@ test "invertible sub-matrices" {
     var bfm = try BinaryFieldMatrix(m, n, 3).initCauchy(std.testing.allocator);
     defer bfm.deinit();
     comptime var ex_rows = cho.choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n);
+    std.debug.print("\nex_rows.len = {d}:\n", .{ex_rows.len});
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
         comptime var er = ex_rows[i][0..(m - n)];
@@ -231,7 +228,6 @@ test "invertible sub-matrices" {
         defer product1.deinit();
         var product2 = try submatrix.multiply(inverse.numCols, inverse);
         defer product2.deinit();
-        product2.print();
         try std.testing.expectEqual(product1.numRows, product2.numRows);
         try std.testing.expectEqual(product1.numCols, product2.numCols);
         for (0..product1.numRows) |r| {
