@@ -1,8 +1,8 @@
 // based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
-const bff = @import("bf_field.zig");
+const bff = @import("field.zig");
 const mat = @import("matrix.zig");
-const cho = @import("choose.zig");
+const math = @import("math.zig");
 
 // matrix with elements in a 2^n finite field
 pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, comptime b: comptime_int) type {
@@ -213,7 +213,7 @@ test "invertible sub-matrices" {
     const n = 3;
     var bfm = try BinaryFieldMatrix(m, n, 3).initCauchy(std.testing.allocator);
     defer bfm.deinit();
-    comptime var ex_rows = cho.choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n);
+    comptime var ex_rows = math.choose(&[_]u8{ 0, 1, 2, 3, 4 }, m - n);
     std.debug.print("\nex_rows.len = {d}:\n", .{ex_rows.len});
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });

@@ -45,6 +45,15 @@ pub fn choose(comptime l: []const u8, comptime k: u8) ChosenType(l.len, k) {
     return ret;
 }
 
+pub fn ceil_binary(comptime n: u8) comptime_int {
+    return std.math.log2_int_ceil(u8, n);
+    // comptime var exp = 2;
+    // while ((1 << exp) < (n + k)) {
+    //     exp += 1;
+    // }
+    // return exp;
+}
+
 test "factorial" {
     try std.testing.expectEqual(factorial(5), 120);
     try std.testing.expectEqual(factorial(3), 6);
@@ -65,11 +74,7 @@ test "chosen return type" {
     try std.testing.expectEqual(ChosenType(5, 3), [10][3]u8);
 }
 
-test "x choose y" {
-    // var list = choose(&[_]u8{ 0, 1, 2, 3, 4 }, 2);
-    // for (0..list.len) |i| {
-    //     std.debug.print("choose[{d}]={any}\n", .{ i, list[i] });
-    // }
+test "x choose 1" {
     var list1 = choose(&[_]u8{9}, 1);
     try std.testing.expectEqual(list1.len, 1);
     try std.testing.expectEqual(list1[0], [1]u8{9});
@@ -84,7 +89,9 @@ test "x choose y" {
     try std.testing.expectEqual(list3[0], [1]u8{7});
     try std.testing.expectEqual(list3[1], [1]u8{8});
     try std.testing.expectEqual(list3[2], [1]u8{9});
+}
 
+test "x choose 2" {
     var list4 = choose(&[_]u8{ 8, 9 }, 2);
     try std.testing.expectEqual(list4.len, 1);
     try std.testing.expectEqual(list4[0], [2]u8{ 8, 9 });
@@ -103,7 +110,9 @@ test "x choose y" {
     try std.testing.expectEqual(list6[3], [2]u8{ 7, 8 });
     try std.testing.expectEqual(list6[4], [2]u8{ 7, 9 });
     try std.testing.expectEqual(list6[5], [2]u8{ 8, 9 });
+}
 
+test "x choose 3" {
     var list7 = choose(&[_]u8{ 7, 8, 9 }, 3);
     try std.testing.expectEqual(list7.len, 1);
     try std.testing.expectEqual(list7[0], [3]u8{ 7, 8, 9 });
@@ -114,4 +123,17 @@ test "x choose y" {
     try std.testing.expectEqual(list8[1], [3]u8{ 6, 7, 9 });
     try std.testing.expectEqual(list8[2], [3]u8{ 6, 8, 9 });
     try std.testing.expectEqual(list8[3], [3]u8{ 7, 8, 9 });
+}
+
+test "5 choose 2" {
+    const list = choose(&[_]u8{ 0, 1, 2, 3, 4 }, 2);
+    try std.testing.expectEqual(list.len, 10);
+    try std.testing.expectEqualDeep(list, [10][2]u8{ [2]u8{ 0, 1 }, [2]u8{ 0, 2 }, [2]u8{ 0, 3 }, [2]u8{ 0, 4 }, [2]u8{ 1, 2 }, [2]u8{ 1, 3 }, [2]u8{ 1, 4 }, [2]u8{ 2, 3 }, [2]u8{ 2, 4 }, [2]u8{ 3, 4 } });
+}
+
+test "binary ceil" {
+    try std.testing.expectEqual(ceil_binary(5 + 3), 3);
+    try std.testing.expectEqual(ceil_binary(15), 4);
+    try std.testing.expectEqual(ceil_binary(16), 4);
+    try std.testing.expectEqual(ceil_binary(17), 5);
 }
