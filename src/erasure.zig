@@ -59,14 +59,19 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
 
             for (0..rs.block.len) |i| {
                 var read_size = try in_fifo.read(&buffer);
+                std.debug.print("read size={d}\n", .{read_size});
                 block_size += read_size;
                 if (read_size < buffer.len) {
+                    std.debug.print("block size={d}\n", .{block_size});
                     buffer[buffer.len - 1] = @intCast(block_size);
                 }
                 rs.block[i] = std.mem.readIntBig(word_type, &buffer);
+                std.debug.print("read int {d}\n", .{rs.block[i]});
             }
             rs.size = block_size;
+            std.debug.print("return size {d}\n", .{rs.size});
             rs.done = block_size < self.data_block_size;
+            std.debug.print("return done {}\n", .{rs.done});
             return rs;
         }
 
@@ -146,15 +151,20 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             var size: usize = 0;
             var done = false;
             while (!done) {
+                std.debug.print("reading data block\n", .{});
                 var rs = try self.readDataBlock(in_fifo);
                 done = rs.done;
+                std.debug.print("done = {}\n", .{done});
+                std.debug.print("writing code block\n", .{});
                 _ = try self.writeCodeBlock(encoder_bin, rs.block, out_fifos);
                 if (!done) {
                     size += self.data_block_size;
+                    std.debug.print("!done size = {d}\n", .{size});
                 } else {
                     var buffer = std.mem.zeroes([word_size]u8);
                     std.mem.writeIntBig(word_type, &buffer, rs.block[rs.block.len - 1]);
                     size += buffer[buffer.len - 1];
+                    std.debug.print("done size = {d}\n", .{size});
                 }
             }
             return size;
@@ -224,42 +234,53 @@ test "erasure coder" {
     var data_filename = "temp_data_file";
     var data_file = try tmp.dir.createFile(data_filename, .{});
     try data_file.writer().writeAll("The quick brown fox jumps over the lazy dog.");
-    defer data_file.close();
+    data_file.close();
+
     var decoded_filename = "temp_decoded_data_file";
     var decoded_file = try tmp.dir.createFile(decoded_filename, .{});
-    defer decoded_file.close();
 
-    var code_file_names = [_][]const u8{ "temp_code_file_1", "temp_code_file_2", "temp_code_file_3", "temp_code_file_4", "temp_code_file_5" };
+    var code_filenames = [_][]const u8{ "temp_code_file_1", "temp_code_file_2", "temp_code_file_3", "temp_code_file_4", "temp_code_file_5" };
     var code_files: [5]std.fs.File = undefined;
-    for (0..code_file_names.len) |i| {
-        code_files[i] = try tmp.dir.createFile(code_file_names[i], .{});
+    for (0..code_filenames.len) |i| {
+        code_files[i] = try tmp.dir.createFile(code_filenames[i], .{});
     }
-    defer for (0..code_file_names.len) |i| {
-        code_files[i].close();
-    };
 
     // encode
     var code_writers: [5]std.fs.File.Writer = undefined;
     for (0..code_files.len) |i| {
         code_writers[i] = code_files[i].writer();
     }
-    var data_size = try ec.encode(data_file.reader(), &code_writers);
+    var data_in = try tmp.dir.openFile(data_filename, .{});
+    var data_size = try ec.encode(data_in.reader(), &code_writers);
     try std.testing.expect(data_size > 0);
+    for (0..code_files.len) |i| {
+        code_files[i].close();
+    }
+    data_in.close();
 
     // decode
     var prng = std.rand.DefaultPrng.init(1234);
     var random = prng.random();
     var excluded_shards = sample(random, 5, 2);
+    var code_in: [3]std.fs.File = undefined;
     var code_readers: [3]std.fs.File.Reader = undefined;
     var j: usize = 0;
-    for (0..code_files.len) |i| {
+    for (0..code_filenames.len) |i| {
         if (notIn(&excluded_shards, @intCast(i))) {
-            code_readers[j] = code_files[i].reader();
+            code_in[j] = try tmp.dir.openFile(code_filenames[i], .{});
+            code_readers[j] = code_in[j].reader();
+            j += 1;
         }
     }
+    defer for (code_in) |f| {
+        f.close();
+    };
     var decoded_size = try ec.decode(&excluded_shards, &code_readers, decoded_file.writer());
+    defer decoded_file.close();
     try std.testing.expectEqual(data_size, decoded_size);
     var buffer = std.mem.zeroes([256]u8);
-    var buffer_size = try decoded_file.reader().readAll(&buffer);
+    var decoded_in = try tmp.dir.openFile(data_filename, .{});
+    defer decoded_in.close();
+    var buffer_size = try decoded_in.reader().readAll(&buffer);
     std.debug.print("decoded: {s}\n", .{buffer[0..buffer_size]});
 }
