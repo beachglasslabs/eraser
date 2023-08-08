@@ -1,6 +1,6 @@
 // based on git@github.com:vishesh-khemani/erasure-coding
 const std = @import("std");
-const bff = @import("field.zig");
+const bff = @import("finite_field.zig");
 const mat = @import("matrix.zig");
 const math = @import("math.zig");
 
@@ -67,7 +67,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
 
             var result: u8 = 0;
             inline for (0..n) |c| {
-                var sub = try self.subMatrix(&[_]u8{0}, &[_]u8{c});
+                var sub = try self.subMatrix(1, 1, &[_]u8{0}, &[_]u8{c});
                 defer sub.deinit();
                 var x = try self.field.mul(self.matrix.get(0, c), try sub.det());
                 if (c % 2 == 1) {
@@ -94,20 +94,20 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             try self.matrix.format(fmt, opts, stream);
         }
 
-        pub fn subMatrix(self: *const Self, comptime excluded_rows: []const u8, comptime excluded_cols: []const u8) !BinaryFieldMatrix(m - excluded_rows.len, n - excluded_cols.len, b) {
-            const sm = m - excluded_rows.len;
-            const sn = n - excluded_cols.len;
-            var sub = try mat.Matrix(sm, sn).init(self.allocator, self.matrix.mtype);
-            comptime var i = 0;
-            rblk: inline for (0..m) |r| {
-                inline for (excluded_rows) |er| {
+        pub fn subMatrix(self: *const Self, comptime em: comptime_int, comptime en: comptime_int, excluded_rows: []const u8, excluded_cols: []const u8) !BinaryFieldMatrix(m - em, n - en, b) {
+            std.debug.assert(em == excluded_rows.len);
+            std.debug.assert(en == excluded_cols.len);
+            var sub = try mat.Matrix(m - em, n - en).init(self.allocator, self.matrix.mtype);
+            var i: usize = 0;
+            rblk: for (0..m) |r| {
+                for (excluded_rows) |er| {
                     if (r == er) {
                         continue :rblk;
                     }
                 }
-                comptime var j = 0;
-                cblk: inline for (0..n) |c| {
-                    inline for (excluded_cols) |ec| {
+                var j: usize = 0;
+                cblk: for (0..n) |c| {
+                    for (excluded_cols) |ec| {
                         if (c == ec) {
                             continue :cblk;
                         }
@@ -117,7 +117,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
                 }
                 i += 1;
             }
-            return try BinaryFieldMatrix(sm, sn, b).initMatrix(self.allocator, sub);
+            return try BinaryFieldMatrix(m - em, n - en, b).initMatrix(self.allocator, sub);
         }
 
         pub fn cofactorize(self: *Self) !BinaryFieldMatrix(m, n, b) {
@@ -126,7 +126,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             var cof = try mat.Matrix(m, n).init(self.allocator, self.matrix.mtype);
             inline for (0..m) |r| {
                 inline for (0..n) |c| {
-                    var sub = try self.subMatrix(&[_]u8{r}, &[_]u8{c});
+                    var sub = try self.subMatrix(1, 1, &[_]u8{r}, &[_]u8{c});
                     defer sub.deinit();
                     cof.set(r, c, try sub.det());
                     if ((r + c) % 2 == 1) {
@@ -218,7 +218,7 @@ test "invertible sub-matrices" {
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
         comptime var er = ex_rows[i][0..(m - n)];
-        var submatrix = try bfm.subMatrix(er, &[0]u8{});
+        var submatrix = try bfm.subMatrix(2, 0, er, &[0]u8{});
         defer submatrix.deinit();
         try std.testing.expectEqual(bfm.numRows - ex_rows[i].len, submatrix.numRows);
         try std.testing.expectEqual(bfm.numCols, submatrix.numCols);
