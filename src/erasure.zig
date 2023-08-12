@@ -186,7 +186,7 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
     };
 }
 
-fn sample(r: std.rand.Random, comptime max: u8, comptime num: u8) [num]u8 {
+pub fn sample(r: std.rand.Random, comptime max: u8, comptime num: u8) [num]u8 {
     var nums: [num]u8 = std.mem.zeroes([num]u8);
     var i: usize = 0;
     while (i < num) {
@@ -214,7 +214,7 @@ fn in(set: []u8, n: u8) bool {
     return false;
 }
 
-fn notIn(set: []u8, n: u8) bool {
+pub fn notIn(set: []u8, n: u8) bool {
     return !in(set, n);
 }
 
