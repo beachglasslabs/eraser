@@ -42,10 +42,51 @@ pub fn main() !void {
     std.debug.print("Leaks detected: {}\n", .{leaked});
 }
 
+const Arg = struct {
+    cmd: []const u8,
+    code: []const u8,
+    data: []const u8,
+};
+
+fn parseArgs(args: []const []const u8) Arg {
+    var parsed: Arg = undefined;
+
+    var bloom: u8 = 0b0;
+    for (args) |arg| {
+        if (bloom & 0b10 != 0) {
+            parsed.code = arg;
+            bloom &= 0b11001;
+            bloom |= 0b00100;
+            continue;
+        } else if (bloom & 0b1000 != 0) {
+            parsed.data = arg;
+            bloom &= 0b00111;
+            bloom |= 0b10000;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--data")) {
+            bloom |= 0b01000;
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--code")) {
+            bloom |= 0b00010;
+        } else if (std.mem.eql(u8, arg, "encode") or std.mem.eql(u8, arg, "decode")) {
+            parsed.cmd = arg;
+            bloom |= 0b00001;
+        } else {
+            std.log.info("{s}", .{usage});
+            fatal("wrong argument: {s}", .{arg});
+        }
+    }
+    if (bloom != 0b10101) {
+        std.log.info("{s}", .{usage});
+        fatal("missing argument", .{});
+    }
+    return parsed;
+}
+
 fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 5) {
         std.log.info("{s}", .{usage});
-        fatal("expected command argument", .{});
+        fatal("missing arguments", .{});
     }
     // comptime var n = try std.fmt.parseInt(u8, args[1], 10);
     // comptime var k = try std.fmt.parseInt(u8, args[2], 10);
@@ -56,31 +97,11 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var ec = try ErasureCoder(n, k, w).init(allocator);
     defer ec.deinit();
 
-    const cmd = args[0];
-    var code_prefix: []const u8 = undefined;
-    var data_filename: []const u8 = undefined;
-    if (std.mem.eql(u8, args[1], "-d") or std.mem.eql(u8, args[1], "--data")) {
-        data_filename = args[2];
-        if (std.mem.eql(u8, args[3], "-c") or std.mem.eql(u8, args[3], "--code")) {
-            code_prefix = args[4];
-        } else {
-            std.log.info("{s}", .{usage});
-            fatal("missing code argument: {s}\n", .{args[3]});
-        }
-    } else if (std.mem.eql(u8, args[1], "-c") or std.mem.eql(u8, args[1], "--code")) {
-        code_prefix = args[3];
-        if (std.mem.eql(u8, args[3], "-d") or std.mem.eql(u8, args[3], "--data")) {
-            data_filename = args[4];
-        } else {
-            std.log.info("{s}", .{usage});
-            fatal("missing data argument: {s}\n", .{args[3]});
-        }
-    } else {
-        std.log.info("{s}", .{usage});
-        fatal("missing data/code argument: {s}\n", .{args[1]});
-    }
+    const cmds = parseArgs(args);
+    var code_prefix: []const u8 = cmds.code;
+    var data_filename: []const u8 = cmds.data;
 
-    if (std.mem.eql(u8, cmd, "encode")) {
+    if (std.mem.eql(u8, cmds.cmd, "encode")) {
         var data_file = try std.fs.cwd().openFile(data_filename, .{});
         defer data_file.close();
         var code_files: [n]std.fs.File = undefined;
@@ -95,7 +116,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer for (code_files) |f| {
             f.close();
         };
-    } else if (std.mem.eql(u8, cmd, "decode")) {
+    } else if (std.mem.eql(u8, cmds.cmd, "decode")) {
         var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
         var random = prng.random();
         var excluded_shards = sample(random, n, n - k);
