@@ -198,7 +198,7 @@ pub fn Matrix(comptime m: comptime_int, comptime n: comptime_int) type {
 }
 
 test "basic matrix" {
-    var m = try Matrix(3, 2).init(std.testing.allocator, DataOrder.col);
+    var m = try Matrix(3, 2).init(std.testing.allocator, .col);
     defer m.deinit();
     m.set(0, 0, 1);
     m.set(0, 1, 2);
@@ -214,7 +214,7 @@ test "basic matrix" {
 }
 
 test "square matrix" {
-    var m = try Matrix(3, 3).init(std.testing.allocator, DataOrder.col);
+    var m = try Matrix(3, 3).init(std.testing.allocator, .col);
     defer m.deinit();
     m.set(0, 0, 1);
     m.set(1, 0, 2);
@@ -232,7 +232,7 @@ test "square matrix" {
 }
 
 test "matrix transposition" {
-    var m = try Matrix(3, 3).init(std.testing.allocator, DataOrder.row);
+    var m = try Matrix(3, 3).init(std.testing.allocator, .row);
     defer m.deinit();
     m.set(0, 0, 1);
     m.set(1, 0, 2);
@@ -252,7 +252,7 @@ test "matrix transposition" {
 }
 
 test "rows and cols" {
-    var m = try Matrix(4, 3).init(std.testing.allocator, DataOrder.row);
+    var m = try Matrix(4, 3).init(std.testing.allocator, .row);
     defer m.deinit();
     m.setRow(0, &[_]u8{ 1, 2, 3 });
     m.setRow(1, &[_]u8{ 5, 6, 7 });
@@ -275,7 +275,7 @@ test "rows and cols" {
     try std.testing.expectEqualSlices(u8, &m.getCol(1), &[_]u8{ 4, 8, 12, 16 });
     try std.testing.expectEqualSlices(u8, &m.getCol(2), &[_]u8{ 3, 7, 11, 15 });
 
-    var m2 = try Matrix(3, 2).init(std.testing.allocator, DataOrder.col);
+    var m2 = try Matrix(3, 2).init(std.testing.allocator, .col);
     defer m2.deinit();
     m2.setCol(0, &[_]u8{ 1, 3, 7 });
     m2.setCol(1, &[_]u8{ 2, 5, 2 });

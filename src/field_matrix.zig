@@ -22,7 +22,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             return .{
                 .allocator = allocator,
                 .field = try bff.BinaryFiniteField(b).init(),
-                .matrix = try mat.Matrix(m, n).init(allocator, mat.DataOrder.row),
+                .matrix = try mat.Matrix(m, n).init(allocator, .row),
             };
         }
 
@@ -81,7 +81,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
         fn toCauchy(allocator: std.mem.Allocator, field: bff.BinaryFiniteField(b)) !mat.Matrix(m, n) {
             std.debug.assert(field.order >= m + n);
 
-            var cnm = try mat.Matrix(m, n).init(allocator, mat.DataOrder.row);
+            var cnm = try mat.Matrix(m, n).init(allocator, .row);
             for (0..m) |r| {
                 for (0..n) |c| {
                     cnm.set(r, c, try field.invert(try field.sub(r + n, c)));
@@ -161,7 +161,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
         }
 
         pub fn multiply(self: *Self, comptime z: comptime_int, other: BinaryFieldMatrix(n, z, b)) !BinaryFieldMatrix(m, z, b) {
-            var matrix = try mat.Matrix(m, z).init(self.allocator, mat.DataOrder.row);
+            var matrix = try mat.Matrix(m, z).init(self.allocator, .row);
             for (0..m) |r| {
                 for (0..z) |c| {
                     for (0..n) |i| {
@@ -173,7 +173,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
         }
 
         pub fn toBinary(self: *const Self) !BinaryFieldMatrix(m * b, n * b, 1) {
-            var matrix = try mat.Matrix(m * b, n * b).init(self.allocator, mat.DataOrder.row);
+            var matrix = try mat.Matrix(m * b, n * b).init(self.allocator, .row);
             for (0..m) |r| {
                 for (0..n) |c| {
                     var a = self.matrix.get(r, c);
