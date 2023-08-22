@@ -1,9 +1,8 @@
 const std = @import("std");
 
-pub const DataOrder = @import("matrix.zig").DataOrder;
-pub const Matrix = @import("matrix.zig").Matrix;
-pub const BinaryFiniteField = @import("finite_field.zig").BinaryFiniteField;
-pub const BinaryFieldMatrix = @import("field_matrix.zig").BinaryFieldMatrix;
+pub const Matrix = @import("Matrix.zig");
+pub const BinaryFiniteField = @import("BinaryFiniteField.zig");
+pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 pub const ErasureCoder = @import("erasure.zig").ErasureCoder;
 pub const sample = @import("erasure.zig").sample;
 pub const notIn = @import("erasure.zig").notIn;
@@ -29,17 +28,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
     }){};
+    defer _ = gpa.deinit();
 
-    {
-        var allocator = gpa.allocator();
-        const args = try std.process.argsAlloc(allocator);
-        defer std.process.argsFree(allocator, args);
-        return mainArgs(allocator, args[1..]);
-    }
-
-    // we'll arrive here after zap.stop()
-    const leaked = gpa.detectLeaks();
-    std.debug.print("Leaks detected: {}\n", .{leaked});
+    const allocator = gpa.allocator();
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    return mainArgs(allocator, args[1..]);
 }
 
 const Arg = struct {
@@ -95,7 +89,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     comptime var k: u8 = 3;
     comptime var w: type = u64;
     var ec = try ErasureCoder(n, k, w).init(allocator);
-    defer ec.deinit();
+    defer ec.deinit(allocator);
 
     const cmds = parseArgs(args);
     var code_prefix: []const u8 = cmds.code;
@@ -112,7 +106,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
             code_files[i] = try std.fs.cwd().createFile(code_filename, .{});
             code_writers[i] = code_files[i].writer();
         }
-        _ = try ec.encode(data_file.reader(), &code_writers);
+        _ = try ec.encode(allocator, data_file.reader(), &code_writers);
         defer for (code_files) |f| {
             f.close();
         };
@@ -138,7 +132,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 j += 1;
             }
         }
-        _ = try ec.decode(&excluded_shards, &code_readers, data_file.writer());
+        _ = try ec.decode(allocator, &excluded_shards, &code_readers, data_file.writer());
         defer for (code_files) |f| {
             f.close();
         };
@@ -154,8 +148,8 @@ pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
 }
 
 test {
-    _ = @import("matrix.zig");
-    _ = @import("finite_field.zig");
-    _ = @import("field_matrix.zig");
+    _ = Matrix;
+    _ = BinaryFiniteField;
+    _ = BinaryFieldMatrix;
     _ = @import("erasure.zig");
 }
