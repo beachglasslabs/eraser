@@ -1,63 +1,61 @@
 const std = @import("std");
-const mat = @import("field_matrix.zig");
+const assert = std.debug.assert;
+const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 const math = @import("math.zig");
 
-fn numBytes(comptime t: type) u8 {
-    return (@bitSizeOf(t) / @bitSizeOf(u8));
+inline fn roundByteSize(comptime T: type) u8 {
+    comptime return @bitSizeOf(T) / @bitSizeOf(u8);
 }
 
-pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime t: type) type {
-    std.debug.assert(@typeInfo(t) == .Int);
-
+pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime T: type) type {
+    std.debug.assert(@typeInfo(T) == .Int);
     return struct {
         const exp: u8 = math.ceil_binary(n + k);
-        const word_size: u8 = numBytes(t);
+        const word_size: u8 = roundByteSize(T);
 
-        encoder: mat.BinaryFieldMatrix(n, k, exp) = undefined,
-        chunk_size: usize = undefined,
-        data_block_size: usize = undefined,
-        code_block_size: usize = undefined,
-
+        encoder: BinaryFieldMatrix,
+        chunk_size: usize,
+        data_block_size: usize,
+        code_block_size: usize,
         const Self = @This();
 
         pub const ReadStatus = struct {
-            block: [exp * k]t,
+            block: [exp * k]T,
             size: usize,
             done: bool,
         };
 
         pub fn init(allocator: std.mem.Allocator) !Self {
-            const chunk_size = numBytes(t) * exp;
-
+            const chunk_size = roundByteSize(T) * exp;
             return .{
-                .encoder = try mat.BinaryFieldMatrix(n, k, exp).initCauchy(allocator),
+                .encoder = try BinaryFieldMatrix.initCauchy(allocator, n, k, exp),
                 .chunk_size = chunk_size,
                 .data_block_size = chunk_size * k,
                 .code_block_size = chunk_size * n,
             };
         }
 
-        pub fn deinit(self: *Self) void {
-            self.encoder.deinit();
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.encoder.deinit(allocator);
         }
 
         pub fn readDataBlock(self: *Self, in_fifo: std.fs.File.Reader) !ReadStatus {
             var rs = ReadStatus{
                 .done = false,
                 .size = 0,
-                .block = std.mem.zeroes([exp * k]t),
+                .block = std.mem.zeroes([exp * k]T),
             };
 
             var block_size: usize = 0;
             var buffer: [word_size]u8 = std.mem.zeroes([word_size]u8);
 
             for (0..rs.block.len) |i| {
-                var read_size = try in_fifo.read(&buffer);
+                const read_size = try in_fifo.read(&buffer);
                 block_size += read_size;
                 if (read_size < buffer.len) {
                     buffer[buffer.len - 1] = @intCast(block_size);
                 }
-                rs.block[i] = std.mem.readIntBig(t, &buffer);
+                rs.block[i] = std.mem.readIntBig(T, &buffer);
                 // std.debug.print("read int {d}\n", .{rs.block[i]});
             }
             rs.size = block_size;
@@ -69,7 +67,7 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             var rs = ReadStatus{
                 .done = false,
                 .size = 0,
-                .block = std.mem.zeroes([exp * k]t),
+                .block = std.mem.zeroes([exp * k]T),
             };
 
             var buffer: [word_size]u8 = std.mem.zeroes([word_size]u8);
@@ -78,7 +76,7 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
                 var p = i / exp;
                 var read_size = try in_fifos[p].reader().read(&buffer);
                 std.debug.assert(read_size == buffer.len);
-                rs.block[i] = std.mem.readIntBig(t, &buffer);
+                rs.block[i] = std.mem.readIntBig(T, &buffer);
             }
             var p = (rs.block.len - 1) / exp;
             rs.size = try in_fifos[p].reader().read(&buffer);
@@ -89,34 +87,34 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             return rs;
         }
 
-        pub fn writeCodeBlock(_: *Self, encoder: mat.BinaryFieldMatrix(n * exp, k * exp, 1), data_block: [exp * k]t, out_fifos: []std.fs.File.Writer) !void {
-            var code_block = std.mem.zeroes([exp * n]t);
+        pub fn writeCodeBlock(_: *Self, encoder: BinaryFieldMatrix, data_block: [exp * k]T, out_fifos: []std.fs.File.Writer) !void {
+            var code_block = std.mem.zeroes([exp * n]T);
             var buffer = std.mem.zeroes([word_size]u8);
 
             for (0..code_block.len) |i| {
-                for (0..encoder.numCols) |j| {
-                    if (encoder.get(i, j) == 1) {
+                for (0..encoder.numCols()) |j| {
+                    if (encoder.get(.{ .row = @intCast(i), .col = @intCast(j) }) == 1) {
                         code_block[i] ^= data_block[j];
                     }
                 }
-                std.mem.writeIntBig(t, &buffer, code_block[i]);
+                std.mem.writeIntBig(T, &buffer, code_block[i]);
                 var p = i / exp;
                 _ = try out_fifos[p].write(&buffer);
             }
         }
 
-        pub fn writeDataBlock(self: *Self, decoder: mat.BinaryFieldMatrix(k * exp, k * exp, 1), code_block: [exp * k]t, out_fifo: std.fs.File.Writer, done: bool) !usize {
-            var data_block = std.mem.zeroes([exp * k]t);
+        pub fn writeDataBlock(self: *Self, decoder: BinaryFieldMatrix, code_block: [exp * k]T, out_fifo: std.fs.File.Writer, done: bool) !usize {
+            var data_block = std.mem.zeroes([exp * k]T);
             var data_block_size: usize = 0;
             var buffer: [exp * k][word_size]u8 = undefined;
 
             for (0..data_block.len) |i| {
-                for (0..decoder.numCols) |j| {
-                    if (decoder.get(i, j) == 1) {
+                for (0..decoder.numCols()) |j| {
+                    if (decoder.get(.{ .row = @intCast(i), .col = @intCast(j) }) == 1) {
                         data_block[i] ^= code_block[j];
                     }
                 }
-                std.mem.writeIntBig(t, &buffer[i], data_block[i]);
+                std.mem.writeIntBig(T, &buffer[i], data_block[i]);
             }
             if (done) {
                 data_block_size = buffer[buffer.len - 1][buffer[0].len - 1];
@@ -137,10 +135,12 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             return data_block_size;
         }
 
-        pub fn encode(self: *Self, in_fifo: std.fs.File.Reader, out_fifos: []std.fs.File.Writer) !usize {
+        pub fn encode(self: *Self, allocator: std.mem.Allocator, in_fifo: anytype, out_fifos: []std.fs.File.Writer) !usize {
             std.debug.assert(out_fifos.len == n);
-            var encoder_bin = try self.encoder.toBinary();
-            defer encoder_bin.deinit();
+
+            var encoder_bin = try self.encoder.toBinary(allocator);
+            defer encoder_bin.deinit(allocator);
+
             var size: usize = 0;
             var done = false;
             while (!done) {
@@ -151,22 +151,26 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
                     size += self.data_block_size;
                 } else {
                     var buffer = std.mem.zeroes([word_size]u8);
-                    std.mem.writeIntBig(t, &buffer, rs.block[rs.block.len - 1]);
+                    std.mem.writeIntBig(T, &buffer, rs.block[rs.block.len - 1]);
                     size += buffer[buffer.len - 1];
                 }
             }
+
             return size;
         }
 
-        pub fn decode(self: *Self, excluded_shards: []u8, in_fifos: []std.fs.File.Reader, out_fifo: std.fs.File.Writer) !usize {
-            std.debug.assert(excluded_shards.len == (n - k));
-            std.debug.assert(in_fifos.len == k);
-            var decoder_sub = try self.encoder.subMatrix(n - k, 0, excluded_shards, &[0]u8{});
-            defer decoder_sub.deinit();
-            var decoder_inv = try decoder_sub.invert();
-            defer decoder_inv.deinit();
-            var decoder_bin = try decoder_inv.toBinary();
-            defer decoder_bin.deinit();
+        pub fn decode(self: *Self, allocator: std.mem.Allocator, excluded_shards: []const u8, in_fifos: []std.fs.File.Reader, out_fifo: std.fs.File.Writer) !usize {
+            assert(excluded_shards.len == (n - k));
+            assert(in_fifos.len == k);
+
+            var decoder_sub = try self.encoder.subMatrix(allocator, n - k, 0, excluded_shards, &[0]u8{});
+            defer decoder_sub.deinit(allocator);
+
+            var decoder_inv = try decoder_sub.invert(allocator);
+            defer decoder_inv.deinit(allocator);
+
+            var decoder_bin = try decoder_inv.toBinary(allocator);
+            defer decoder_bin.deinit(allocator);
 
             var size: usize = 0;
             var done = false;
@@ -239,7 +243,7 @@ test "erasure coder" {
 
         inline for (types) |t| {
             var ec = try ErasureCoder(5, 3, t).init(std.testing.allocator);
-            defer ec.deinit();
+            defer ec.deinit(std.testing.allocator);
 
             var code_filenames = [_][]const u8{ "temp_code_file_1", "temp_code_file_2", "temp_code_file_3", "temp_code_file_4", "temp_code_file_5" };
             var code_files: [5]std.fs.File = undefined;
@@ -256,7 +260,7 @@ test "erasure coder" {
                 code_writers[i] = code_files[i].writer();
             }
             var data_in = try tmp.dir.openFile(data_filename, .{});
-            var data_size = try ec.encode(data_in.reader(), &code_writers);
+            var data_size = try ec.encode(std.testing.allocator, data_in.reader(), &code_writers);
             try std.testing.expect(data_size > 0);
             for (code_files) |f| {
                 f.close();
@@ -281,7 +285,7 @@ test "erasure coder" {
             defer {
                 tmp.dir.deleteFile(decoded_filename) catch {};
             }
-            var decoded_size = try ec.decode(&excluded_shards, &code_readers, decoded_file.writer());
+            var decoded_size = try ec.decode(std.testing.allocator, &excluded_shards, &code_readers, decoded_file.writer());
             for (code_in) |f| {
                 f.close();
             }
