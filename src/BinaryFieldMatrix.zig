@@ -3,9 +3,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const util = @import("util.zig");
 const BinaryFiniteField = @import("BinaryFiniteField.zig");
 const Matrix = @import("Matrix.zig");
-const math = @import("math.zig");
 const mulWide = std.math.mulWide;
 
 const BinaryFieldMatrix = @This();
@@ -293,16 +293,15 @@ test "invertible sub-matrices" {
     var bfm = try BinaryFieldMatrix.initCauchy(std.testing.allocator, rows, cols, 3);
     defer bfm.deinit(std.testing.allocator);
 
-    comptime var ex_rows = math.choose(&.{ 0, 1, 2, 3, 4 }, rows - cols);
+    const ex_rows = util.choose(&.{ 0, 1, 2, 3, 4 }, rows - cols);
     // std.log.debug("\nex_rows.len = {d}:\n", .{ex_rows.len});
-    inline for (0..ex_rows.len) |i| {
-        // std.log.debug("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
-        comptime var er = ex_rows[i][0..(rows - cols)];
+    inline for (ex_rows) |er| {
+        // std.log.debug("ex_rows[{d}] = {any}\n", .{ i, er });
 
-        var submatrix = try bfm.subMatrix(std.testing.allocator, 2, 0, er, &.{});
+        var submatrix = try bfm.subMatrix(std.testing.allocator, 2, 0, &er, &.{});
         defer submatrix.deinit(std.testing.allocator);
 
-        try std.testing.expectEqual(bfm.numRows() - ex_rows[i].len, submatrix.numRows());
+        try std.testing.expectEqual(bfm.numRows() - er.len, submatrix.numRows());
         try std.testing.expectEqual(bfm.numCols(), submatrix.numCols());
 
         var inverse = try submatrix.invert(std.testing.allocator);

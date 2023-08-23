@@ -37,3 +37,48 @@ pub fn safeMemcpy(dst: anytype, src: anytype) void {
         },
     }
 }
+
+pub fn factorial(comptime n: u8) comptime_int {
+    var r = 1;
+    @setEvalBranchQuota(n +| 2);
+    for (1..(n + 1)) |i| r *= i;
+    return r;
+}
+
+pub fn numChosen(comptime m: u8, comptime n: u8) comptime_int {
+    return factorial(m) / (factorial(n) * factorial(m - n));
+}
+
+pub fn ChosenType(comptime m: u8, comptime n: u8) type {
+    const t = numChosen(m, n);
+    return [t][n]u8;
+}
+
+pub inline fn choose(comptime l: []const u8, comptime k: u8) ChosenType(l.len, k) {
+    comptime {
+        assert(l.len >= k);
+        assert(k > 0);
+        var ret = std.mem.zeroes(ChosenType(l.len, k));
+
+        if (k == 1) {
+            inline for (0..l.len) |i| {
+                ret[i] = [k]u8{l[i]};
+            }
+            return ret;
+        }
+
+        var c = choose(l[1..], k - 1);
+        var i = 0;
+        for (0..(l.len - 1)) |m| {
+            for (0..c.len) |n| {
+                if (l[m] >= c[n][0]) continue;
+                ret[i][0] = l[m];
+                for (0..c[n].len) |j| {
+                    ret[i][j + 1] = c[n][j];
+                }
+                i += 1;
+            }
+        }
+        return ret;
+    }
+}
