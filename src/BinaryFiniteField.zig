@@ -126,7 +126,7 @@ fn setAllCols(self: BinaryFiniteField, m: *Matrix, a: anytype) !void {
     }
 }
 
-// n x n binary matrix representation
+/// n x n binary matrix representation
 pub fn toMatrix(self: BinaryFiniteField, allocator: std.mem.Allocator, a: anytype) !Matrix {
     var m = try Matrix.init(allocator, self.n, self.n);
     try self.setAllCols(&m, a);

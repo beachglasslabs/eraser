@@ -45,13 +45,8 @@ pub fn choose(comptime l: []const u8, comptime k: u8) ChosenType(l.len, k) {
     return ret;
 }
 
-pub fn ceil_binary(comptime n: u8) comptime_int {
+pub fn ceil_binary(n: u8) std.math.Log2IntCeil(u8) {
     return std.math.log2_int_ceil(u8, n);
-    // comptime var exp = 2;
-    // while ((1 << exp) < (n + k)) {
-    //     exp += 1;
-    // }
-    // return exp;
 }
 
 test "factorial" {
