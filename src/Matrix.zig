@@ -32,6 +32,17 @@ pub inline fn initWith(data: []align(16) u8, rows: u8, cols: u8) Matrix {
     };
 }
 
+pub fn clone(self: Matrix, allocator: std.mem.Allocator) !Matrix {
+    const data = try allocator.alignedAlloc(u8, 16, self.getCellCount());
+    errdefer allocator.free(data);
+    return self.cloneWith(data);
+}
+
+pub fn cloneWith(self: Matrix, data: []align(16) u8) Matrix {
+    @memcpy(data, self.getDataSlice());
+    return Matrix.initWith(data, self.num_rows, self.num_cols);
+}
+
 /// See the doc comments on `init` and `initWith` for when it is
 /// allowed to call this function.
 pub inline fn deinit(self: Matrix, allocator: std.mem.Allocator) void {

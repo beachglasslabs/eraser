@@ -43,6 +43,20 @@ pub fn initMatrix(matrix: Matrix, b: BinaryFiniteField.Exp) !BinaryFieldMatrix {
     };
 }
 
+pub fn clone(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
+    return .{
+        .field = self.field,
+        .matrix = try self.matrix.clone(allocator),
+    };
+}
+
+pub fn cloneWith(self: BinaryFieldMatrix, data: []align(16) u8) BinaryFieldMatrix {
+    return .{
+        .field = self.field,
+        .matrix = self.matrix.cloneWith(data),
+    };
+}
+
 pub fn deinit(self: BinaryFieldMatrix, allocator: std.mem.Allocator) void {
     self.matrix.deinit(allocator);
 }
@@ -213,16 +227,21 @@ pub fn multiply(
     return try BinaryFieldMatrix.initMatrix(matrix, self.field.n);
 }
 
-pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
-    var matrix = try Matrix.init(allocator, self.numRows() * self.field.n, self.numCols() * self.field.n);
-    errdefer matrix.deinit(allocator);
+pub fn toBinaryWith(
+    self: BinaryFieldMatrix,
+    allocator: std.mem.Allocator,
+    /// the backing buffer that will be used for the matrix in the returned binary field matrix
+    mat_buf: []align(16) u8,
+) !BinaryFieldMatrix {
+    var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.n, self.numCols() * self.field.n);
+
+    var bfm = try Matrix.init(allocator, self.field.n, self.field.n);
+    defer bfm.deinit(allocator);
 
     for (0..self.numRows()) |r| {
         for (0..self.numCols()) |c| {
             const a = self.matrix.get(.{ .row = @intCast(r), .col = @intCast(c) });
-
-            var bfm = try self.field.toMatrix(allocator, a);
-            defer bfm.deinit(allocator);
+            try self.field.setAllCols(&bfm, a);
 
             for (0..self.field.n) |i| {
                 for (0..self.field.n) |j| {
@@ -238,6 +257,12 @@ pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFi
     }
 
     return try BinaryFieldMatrix.initMatrix(matrix, 1);
+}
+
+pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
+    const mat_buf = try allocator.alignedAlloc(u8, 16, @as(usize, self.numRows()) * self.field.n * self.numCols() * self.field.n);
+    errdefer allocator.free(mat_buf);
+    return self.toBinaryWith(allocator, mat_buf);
 }
 
 test "square matrix" {

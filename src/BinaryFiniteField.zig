@@ -116,7 +116,7 @@ fn setCol(mat: *Matrix, c: usize, a: u8) void {
     }
 }
 
-fn setAllCols(self: BinaryFiniteField, m: *Matrix, a: anytype) !void {
+pub fn setAllCols(self: BinaryFiniteField, m: *Matrix, a: anytype) !void {
     assert(m.num_rows == m.num_cols);
     var basis: u8 = 1;
     for (0..m.num_rows) |c| {
@@ -129,6 +129,7 @@ fn setAllCols(self: BinaryFiniteField, m: *Matrix, a: anytype) !void {
 /// n x n binary matrix representation
 pub fn toMatrix(self: BinaryFiniteField, allocator: std.mem.Allocator, a: anytype) !Matrix {
     var m = try Matrix.init(allocator, self.n, self.n);
+    errdefer m.deinit(allocator);
     try self.setAllCols(&m, a);
     return m;
 }

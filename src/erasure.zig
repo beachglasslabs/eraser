@@ -4,7 +4,6 @@ const assert = std.debug.assert;
 
 const BinaryFiniteField = @import("BinaryFiniteField.zig");
 const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
-const math = @import("math.zig");
 
 inline fn roundByteSize(comptime T: type) usize {
     comptime return @bitSizeOf(T) / @bitSizeOf(u8);
@@ -32,27 +31,27 @@ pub fn ErasureCoder(comptime T: type) type {
             state: ReadState,
         };
 
-        pub fn init(allocator: std.mem.Allocator, shard_count_: u8, shard_size_: u8) !Self {
-            const exp_: BinaryFiniteField.Exp = @intCast(math.ceil_binary(shard_count_ + shard_size_)); // <- TODO: handle overflow of n + k?
-            const chunk_size = roundByteSize(T) * exp_;
+        pub fn init(allocator: std.mem.Allocator, shard_count: u8, shard_size: u8) !Self {
+            const exp: BinaryFiniteField.Exp = @intCast(std.math.log2_int_ceil(u8, shard_count + shard_size)); // <- TODO: handle overflow of n + k?
+            const chunk_size = roundByteSize(T) * exp;
 
-            const bfm = try BinaryFieldMatrix.initCauchy(allocator, shard_count_, shard_size_, exp_);
+            const bfm = try BinaryFieldMatrix.initCauchy(allocator, shard_count, shard_size, exp);
             errdefer bfm.deinit(allocator);
 
-            const block_buffer = try allocator.alloc(T, mulWide(u8, exp_, shard_size_));
+            const block_buffer = try allocator.alloc(T, mulWide(u8, exp, shard_size));
             errdefer allocator.free(block_buffer);
             @memset(block_buffer, 0);
 
-            const word_buffer = try allocator.alloc([word_size]u8, mulWide(u8, exp_, shard_size_));
+            const word_buffer = try allocator.alloc([word_size]u8, mulWide(u8, exp, shard_size));
             errdefer allocator.free(word_buffer);
             @memset(word_buffer, .{0} ** word_size);
 
             return .{
                 .encoder = bfm,
                 .chunk_size = chunk_size,
-                .shard_count = shard_count_,
-                .shard_size = shard_size_,
-                .exp = math.ceil_binary(shard_count_ + shard_size_),
+                .shard_count = shard_count,
+                .shard_size = shard_size,
+                .exp = exp,
 
                 .block_buffer = block_buffer,
                 .word_buffer = word_buffer,
