@@ -5,11 +5,12 @@ pub fn build(b: *Build) void {
     // build options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const difftest_file_paths = b.option([]const []const u8, "dt", "List of paths of inputs to test") orelse &.{};
 
     // top level steps
     const run_step = b.step("run", "Run the app");
     const unit_test_step = b.step("unit-test", "Run library tests");
-    const difftest_step = b.step("diff-test", "Run the binary on a test case");
+    const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
 
     const lib = b.addStaticLibrary(.{
         .name = "eraser",
@@ -41,12 +42,12 @@ pub fn build(b: *Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     unit_test_step.dependOn(&run_main_tests.step);
 
-    for (b.option([]const []const u8, "diff-test", "Which inputs to test") orelse &.{}) |file_name| {
-        const input = Build.LazyPath.relative(b.pathJoin(&.{ "tests/inputs", file_name }));
+    for (difftest_file_paths) |file_path| {
+        const input = Build.LazyPath.relative(file_path);
         const output = encodeAndDecode(b, exe, input);
 
         const difftest_exe = b.addTest(.{
-            .name = "difftest",
+            .name = b.fmt("difftest__{s}", .{std.fs.path.basename(file_path)}),
             .root_source_file = Build.LazyPath.relative("tests/difftest.zig"),
             .target = target,
             .optimize = optimize,
@@ -57,8 +58,6 @@ pub fn build(b: *Build) void {
         paths.addOptionPath("output", output);
 
         const run_difftest_exe = b.addRunArtifact(difftest_exe);
-        run_difftest_exe.has_side_effects = true;
-
         difftest_step.dependOn(&run_difftest_exe.step);
     }
 }
