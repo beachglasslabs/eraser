@@ -28,26 +28,40 @@ pub fn main() !void {
         .thread_safe = true,
     }){};
     defer _ = gpa.deinit();
-
     const allocator = gpa.allocator();
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     const cmds = try parseArgs(args[1..]);
-    return mainArgs(allocator, cmds);
+    const data = cmds.data orelse return error.MissingDataFileName;
+    const code = cmds.code orelse return error.MissingCodeDirName;
+
+    switch (cmds.w orelse .u64) {
+        inline else => |word| {
+            const W = switch (word) {
+                .u8 => u8,
+                .u16 => u16,
+                .u32 => u32,
+                .u64 => u64,
+            };
+
+            switch (cmds.verb) {
+                .encode => try encodeCommand(allocator, W, cmds.n orelse 5, cmds.k orelse 3, data, code),
+                .decode => try decodeCommand(allocator, W, cmds.n orelse 5, cmds.k orelse 3, data, code),
+            }
+        },
+    }
 }
 
 const Args = struct {
     verb: Verb,
-    code: []const u8,
-    data: []const u8,
-    n: u8,
-    k: u8,
-    w: Word,
+    code: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    n: ?u8 = null,
+    k: ?u8 = null,
+    w: ?Word = null,
 
-    // -n                  code chunks in a block
-    // -k                  data chunks in a block
-    // -w                  bytes in a word in a chunks
     const Verb = enum { encode, decode };
     const Word = enum { u8, u16, u32, u64 };
 };
@@ -55,20 +69,14 @@ const Args = struct {
 fn parseArgs(argv: []const []const u8) !Args {
     errdefer std.log.info("Usage: {s}", .{usage});
     var parsed: Args = .{
-        .verb = undefined,
-        .code = undefined,
-        .data = undefined,
-        .n = 5,
-        .k = 3,
-        .w = .u64,
+        .verb = std.meta.stringToEnum(Args.Verb, @as(?[]const u8, argv[0]) orelse
+            return error.MissingVerb) orelse
+            return error.UnrecognizedVerb,
     };
 
-    parsed.verb = std.meta.stringToEnum(Args.Verb, @as(?[]const u8, argv[0]) orelse
-        return error.MissingVerb) orelse {
-        return error.UnrecognizedVerb;
-    };
     const FieldTag = std.meta.FieldEnum(Args);
-    var arg_set = std.EnumSet(FieldTag).initMany(&.{ .verb, .n, .k, .w });
+    const FieldSet = std.EnumSet(FieldTag);
+    var arg_set = FieldSet.initMany(&.{ .verb, .n, .k, .w });
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -103,114 +111,106 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
     }
 
-    if (!arg_set.supersetOf(comptime std.EnumSet(FieldTag).initMany(&.{ .code, .data }))) {
+    if (!arg_set.supersetOf(comptime FieldSet.initMany(&.{ .code, .data }))) {
         return error.MissingArguments;
     }
 
     return parsed;
 }
 
-fn mainArgs(allocator: std.mem.Allocator, cmds: Args) !void {
-    const n: u8 = cmds.n;
-    const k: u8 = cmds.k;
-    switch (cmds.w) {
-        inline else => |word| {
-            const T = switch (word) {
-                .u8 => u8,
-                .u16 => u16,
-                .u32 => u32,
-                .u64 => u64,
-            };
-            const ec = try ErasureCoder(T).init(allocator, n, k);
-            defer ec.deinit(allocator);
+fn encodeCommand(
+    allocator: std.mem.Allocator,
+    comptime W: type,
+    shard_count: u8,
+    shard_size: u8,
+    data_filename: []const u8,
+    code_prefix: []const u8,
+) !void {
+    const ec = try ErasureCoder(W).init(allocator, shard_count, shard_size);
+    defer ec.deinit(allocator);
 
-            const code_prefix: []const u8 = cmds.code;
-            const data_filename: []const u8 = cmds.data;
+    const data_file = try std.fs.cwd().openFile(data_filename, .{});
+    defer data_file.close();
 
-            switch (cmds.verb) {
-                .encode => {
-                    const data_file = try std.fs.cwd().openFile(data_filename, .{});
-                    defer data_file.close();
+    var code_dir = try std.fs.cwd().makeOpenPath(code_prefix, .{});
+    defer code_dir.close();
 
-                    var code_dir = try std.fs.cwd().makeOpenPath(code_prefix, .{});
-                    defer code_dir.close();
+    var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
+    defer for (code_files.constSlice()) |cf| cf.close();
 
-                    // var code_files: [n]std.fs.File = undefined;
-                    var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
-                    defer for (code_files.constSlice()) |cf| cf.close();
+    for (0..ec.shard_count) |i| {
+        var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
+        code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
+            error.Overflow => unreachable,
+        };
 
-                    for (0..n) |i| {
-                        var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
-                        code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
-                            error.Overflow => unreachable,
-                        };
-
-                        const code_file = code_dir.createFile(code_filename.constSlice(), .{}) catch |err| return err: {
-                            std.log.err("{s} while creating '{s}'", .{ @errorName(err), code_filename.constSlice() });
-                            break :err err;
-                        };
-                        code_files.appendAssumeCapacity(code_file);
-                    }
-
-                    var code_writers: std.BoundedArray(std.fs.File.Writer, std.math.maxInt(u8)) = .{};
-                    for (code_files.constSlice()) |cf| code_writers.appendAssumeCapacity(cf.writer());
-
-                    _ = try ec.encode(
-                        allocator,
-                        data_file.reader(),
-                        code_writers.constSlice(),
-                    );
-                },
-                .decode => {
-                    // TODO: use better RNG source? maybe from std.crypto?
-                    var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
-                    const random = prng.random();
-
-                    const excluded_shards = sample(random, n, n - k);
-                    std.log.info("excluding {any}", .{excluded_shards.constSlice()});
-
-                    const data_file = try std.fs.cwd().createFile(data_filename, .{});
-                    defer data_file.close();
-
-                    var code_dir = try std.fs.cwd().makeOpenPath(code_prefix, .{});
-                    defer code_dir.close();
-
-                    var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
-                    defer for (code_files.constSlice()) |cf| cf.close();
-
-                    for (0..n) |i| {
-                        if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
-                        var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
-                        code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
-                            error.Overflow => unreachable,
-                        };
-                        std.log.info("opening {s}", .{code_filename.constSlice()});
-
-                        const code_file = code_dir.openFile(code_filename.constSlice(), .{}) catch |err| return err: {
-                            std.log.err("{s} while opening '{s}'", .{ @errorName(err), code_filename.constSlice() });
-                            break :err err;
-                        };
-                        code_files.appendAssumeCapacity(code_file);
-                    }
-
-                    var code_readers: std.BoundedArray(std.fs.File.Reader, std.math.maxInt(u8)) = .{};
-                    for (code_files.constSlice()) |cf| code_readers.appendAssumeCapacity(cf.reader());
-
-                    _ = try ec.decode(
-                        allocator,
-                        excluded_shards.constSlice(),
-                        code_readers.constSlice(),
-                        data_file.writer(),
-                    );
-                },
-            }
-        },
+        const code_file = code_dir.createFile(code_filename.constSlice(), .{}) catch |err| return err: {
+            std.log.err("{s} while creating '{s}'", .{ @errorName(err), code_filename.constSlice() });
+            break :err err;
+        };
+        code_files.appendAssumeCapacity(code_file);
     }
-}
 
-pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
-    std.log.err(format, args);
-    std.process.exit(1);
+    var code_writers: std.BoundedArray(std.fs.File.Writer, std.math.maxInt(u8)) = .{};
+    for (code_files.constSlice()) |cf| code_writers.appendAssumeCapacity(cf.writer());
+
+    _ = try ec.encode(
+        allocator,
+        data_file.reader(),
+        code_writers.constSlice(),
+    );
+}
+fn decodeCommand(
+    allocator: std.mem.Allocator,
+    comptime W: type,
+    shard_count: u8,
+    shard_size: u8,
+    data_filename: []const u8,
+    code_prefix: []const u8,
+) !void {
+    const ec = try ErasureCoder(W).init(allocator, shard_count, shard_size);
+    defer ec.deinit(allocator);
+
+    // TODO: use better RNG source? maybe from std.crypto?
+    var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
+    const random = prng.random();
+
+    const excluded_shards = sample(random, ec.shard_count, ec.shard_count - ec.shard_size);
+    std.log.info("excluding {any}", .{excluded_shards.constSlice()});
+
+    const data_file = try std.fs.cwd().createFile(data_filename, .{});
+    defer data_file.close();
+
+    var code_dir = try std.fs.cwd().makeOpenPath(code_prefix, .{});
+    defer code_dir.close();
+
+    var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
+    defer for (code_files.constSlice()) |cf| cf.close();
+
+    for (0..ec.shard_count) |i| {
+        if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
+        var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
+        code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
+            error.Overflow => unreachable,
+        };
+        std.log.info("opening {s}", .{code_filename.constSlice()});
+
+        const code_file = code_dir.openFile(code_filename.constSlice(), .{}) catch |err| return err: {
+            std.log.err("{s} while opening '{s}'", .{ @errorName(err), code_filename.constSlice() });
+            break :err err;
+        };
+        code_files.appendAssumeCapacity(code_file);
+    }
+
+    var code_readers: std.BoundedArray(std.fs.File.Reader, std.math.maxInt(u8)) = .{};
+    for (code_files.constSlice()) |cf| code_readers.appendAssumeCapacity(cf.reader());
+
+    _ = try ec.decode(
+        allocator,
+        excluded_shards.constSlice(),
+        code_readers.constSlice(),
+        data_file.writer(),
+    );
 }
 
 test {
