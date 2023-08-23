@@ -59,12 +59,14 @@ pub const CellIndex = packed struct(u16) { row: u8, col: u8 };
 
 pub fn getPtr(self: Matrix, idx: CellIndex) *u8 {
     assert(idx.row < self.num_rows and idx.col < self.num_cols);
-    const i = idx.row * self.num_cols + idx.col;
+    const i = mulWide(u8, idx.row, self.num_cols) + idx.col;
     return &self.data[i];
 }
+
 pub fn get(self: Matrix, idx: CellIndex) u8 {
     return self.getPtr(idx).*;
 }
+
 pub fn set(self: *Matrix, idx: CellIndex, value: u8) void {
     self.getPtr(idx).* = value;
 }
