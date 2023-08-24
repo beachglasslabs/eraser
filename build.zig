@@ -12,13 +12,7 @@ pub fn build(b: *Build) void {
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
 
-    const lib = b.addStaticLibrary(.{
-        .name = "eraser",
-        .root_source_file = Build.LazyPath.relative("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(lib);
+    _ = b.addModule("eraser", .{ .source_file = Build.LazyPath.relative("src/lib.zig") });
 
     const exe = b.addExecutable(.{
         .name = "eraser",
