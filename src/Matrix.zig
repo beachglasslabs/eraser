@@ -43,6 +43,19 @@ pub fn cloneWith(self: Matrix, data: []align(16) u8) Matrix {
     return Matrix.initWith(data, self.num_rows, self.num_cols);
 }
 
+/// Attempts to reallocate the matrix to the specified row & column lengths, zeroing out the cells.
+/// Returns true if the resize was successful. Otherwise, returns false, and the data is left unmodified.
+pub fn resizeAndReset(self: *Matrix, allocator: std.mem.Allocator, rows: u8, cols: u8) bool {
+    const new_size = mulWide(u8, rows, cols);
+
+    const result = allocator.resize(self.getDataSlice(), new_size);
+    if (result) {
+        const resized_slice = self.data[0..new_size];
+        self.* = Matrix.initWith(resized_slice, rows, cols);
+    }
+    return result;
+}
+
 /// See the doc comments on `init` and `initWith` for when it is
 /// allowed to call this function.
 pub inline fn deinit(self: Matrix, allocator: std.mem.Allocator) void {
@@ -62,8 +75,15 @@ pub inline fn move(matrix: *Matrix) Matrix {
     return moved;
 }
 
-pub fn getCellCount(self: Matrix) u16 {
+pub inline fn getCellCount(self: Matrix) u16 {
     return mulWide(u8, self.num_rows, self.num_cols);
+}
+
+pub inline fn numRows(self: Matrix) u8 {
+    return self.num_rows;
+}
+pub inline fn numCols(self: Matrix) u8 {
+    return self.num_cols;
 }
 
 pub const CellIndex = packed struct(u16) { row: u8, col: u8 };
@@ -119,13 +139,12 @@ pub const ColIterator = struct {
     mat: *const Matrix,
     row_index: u8,
     col_index: u8,
-    const Self = @This();
 
-    pub inline fn next(self: *Self) ?u8 {
+    pub inline fn next(self: *ColIterator) ?u8 {
         const ptr = self.nextPtr() orelse return null;
         return ptr.*;
     }
-    pub inline fn nextPtr(self: *Self) ?*u8 {
+    pub inline fn nextPtr(self: *ColIterator) ?*u8 {
         if (self.row_index == self.mat.num_rows) return null;
         self.row_index += 1;
         return self.mat.getPtr(.{
@@ -141,7 +160,7 @@ pub fn setSlice(self: *Matrix, rc: u8, new_rc: []const u8) void {
     util.safeMemcpy(self.getSlice(rc)[0..self.num_cols], new_rc);
 }
 
-pub fn setRow(self: *Matrix, row: u8, new_row: []const u8) void {
+pub inline fn setRow(self: *Matrix, row: u8, new_row: []const u8) void {
     self.setSlice(row, new_row);
 }
 
@@ -151,6 +170,178 @@ pub fn setCol(self: *Matrix, col: u8, new_col: []const u8) void {
         self.set(.{ .row = @intCast(i), .col = col }, new_col[i]);
     }
 }
+
+/// All integers in the provided each of the slices should be unique
+pub inline fn subView(
+    self: *const Matrix,
+    excluded_rows: []const u8,
+    excluded_cols: []const u8,
+) SubView {
+    assert(excluded_rows.len <= self.numRows());
+    assert(excluded_cols.len <= self.numCols());
+    if (excluded_rows.len != 0) assert(std.mem.max(u8, excluded_rows) < self.numRows());
+    if (excluded_cols.len != 0) assert(std.mem.max(u8, excluded_cols) < self.numCols());
+    return .{
+        .parent = .{ .matrix = self },
+        .excluded_rows = excluded_rows,
+        .excluded_cols = excluded_cols,
+    };
+}
+
+pub const SubView = struct {
+    parent: Parent,
+    excluded_rows: []const u8,
+    excluded_cols: []const u8,
+    const Parent = union(enum) {
+        matrix: *const Matrix,
+        subview: *const SubView,
+    };
+
+    pub fn subView(self: *const SubView, excluded_rows: []const u8, excluded_cols: []const u8) SubView {
+        assert(excluded_rows.len <= self.numRows());
+        assert(excluded_cols.len <= self.numCols());
+        if (excluded_rows.len != 0) assert(std.mem.max(u8, excluded_rows) < self.numRows());
+        if (excluded_cols.len != 0) assert(std.mem.max(u8, excluded_cols) < self.numCols());
+
+        if (0 == @min(
+            self.excluded_rows.len,
+            excluded_rows.len,
+            self.excluded_cols.len,
+            excluded_cols.len,
+        )) {
+            if (excluded_rows.len == 0 and
+                excluded_cols.len == 0 //
+            ) return self.*;
+
+            if (self.excluded_rows.len == 0 and
+                self.excluded_cols.len == 0 //
+            ) return .{
+                .parent = self.parent,
+                .excluded_rows = excluded_rows,
+                .excluded_cols = excluded_cols,
+            };
+
+            if (self.excluded_rows.len == 0 and
+                excluded_cols.len == 0 //
+            ) return .{
+                .parent = self.parent,
+                .excluded_rows = excluded_rows,
+                .excluded_cols = self.excluded_cols,
+            };
+
+            if (self.excluded_cols.len == 0 and
+                excluded_rows.len == 0 //
+            ) return .{
+                .parent = self.parent,
+                .excluded_rows = self.excluded_rows,
+                .excluded_cols = excluded_cols,
+            };
+        }
+
+        return .{
+            .parent = .{ .subview = self },
+            .excluded_rows = excluded_rows,
+            .excluded_cols = excluded_cols,
+        };
+    }
+
+    pub fn getCellCount(self: SubView) u16 {
+        return mulWide(u8, self.numRows(), self.numCols());
+    }
+    pub fn numRows(self: SubView) u8 {
+        const ex: u8 = @intCast(self.excluded_rows.len);
+        return switch (self.parent) {
+            inline else => |p| p.numRows() - ex,
+        };
+    }
+    pub fn numCols(self: SubView) u8 {
+        const ex: u8 = @intCast(self.excluded_cols.len);
+        return switch (self.parent) {
+            inline else => |p| p.numCols() - ex,
+        };
+    }
+
+    pub fn getPtr(self: SubView, idx: CellIndex) *u8 {
+        assert(idx.row < self.numRows() and idx.col < self.numCols());
+        return switch (self.parent) {
+            inline else => |p| p.getPtr(self.subIndexToParentIdx(idx)),
+        };
+    }
+    pub inline fn get(self: SubView, idx: CellIndex) u8 {
+        return self.getPtr(idx).*;
+    }
+    pub inline fn set(self: SubView, idx: CellIndex, val: u8) void {
+        self.getPtr(idx).* = val;
+    }
+
+    inline fn subIndexToParentIdx(self: SubView, idx: CellIndex) CellIndex {
+        return CellIndex{
+            .row = subRcIndexToParentRcIdx(idx.row, self.excluded_rows),
+            .col = subRcIndexToParentRcIdx(idx.col, self.excluded_cols),
+        };
+    }
+
+    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: []const u8) u8 {
+        var result: u8 = rc_idx;
+        for (excluded) |ex| {
+            if (result < ex) continue;
+            result += result - ex;
+            result += @intFromBool(result == ex);
+        }
+        return result;
+    }
+
+    pub inline fn rowIterator(self: *const SubView, row_idx: u8) SubIterator(.row) {
+        return .{
+            .view = self,
+            .row_index = row_idx,
+            .col_index = 0,
+        };
+    }
+
+    pub inline fn colIterator(self: *const SubView, col_idx: u8) SubIterator(.col) {
+        return .{
+            .view = self,
+            .row_index = 0,
+            .col_index = col_idx,
+        };
+    }
+
+    pub const SubIteratorOrder = enum { row, col };
+    pub fn SubIterator(comptime order: SubIteratorOrder) type {
+        return struct {
+            view: *const SubView,
+            row_index: u8,
+            col_index: u8,
+            const Self = @This();
+
+            pub inline fn next(self: *Self) ?u8 {
+                const ptr = self.nextPtr() orelse return null;
+                return ptr.*;
+            }
+            pub inline fn nextPtr(self: *Self) ?*u8 {
+                switch (comptime order) {
+                    .row => {
+                        if (self.col_index == self.view.numCols()) return null;
+                        self.col_index += 1;
+                        return self.view.getPtr(.{
+                            .row = self.row_index,
+                            .col = self.col_index - 1,
+                        });
+                    },
+                    .col => {
+                        if (self.row_index == self.view.numRows()) return null;
+                        self.row_index += 1;
+                        return self.view.getPtr(.{
+                            .row = self.row_index - 1,
+                            .col = self.col_index,
+                        });
+                    },
+                }
+            }
+        };
+    }
+};
 
 pub fn format(self: *const Matrix, comptime _: []const u8, _: std.fmt.FormatOptions, stream: anytype) !void {
     try stream.print("\n{d}x{d} row ->\n", .{ self.num_rows, self.num_cols });
@@ -174,11 +365,11 @@ test "basic matrix" {
     mat.set(.{ .row = 0, .col = 1 }, 2);
     mat.set(.{ .row = 1, .col = 1 }, 4);
     mat.set(.{ .row = 2, .col = 0 }, 5);
-    try expectSegment(&mat, .col, 0, &.{ 1, 0, 5 });
-    try expectSegment(&mat, .col, 1, &.{ 2, 4, 0 });
+    try expectSegment(mat, .col, 0, &.{ 1, 0, 5 });
+    try expectSegment(mat, .col, 1, &.{ 2, 4, 0 });
 
     mat.setCol(1, &.{ 7, 8, 9 });
-    try expectSegment(&mat, .col, 1, &.{ 7, 8, 9 });
+    try expectSegment(mat, .col, 1, &.{ 7, 8, 9 });
 
     mat.setRow(1, &.{ 6, 7 });
     try std.testing.expectEqual(mat.get(.{ .row = 1, .col = 0 }), 6);
@@ -198,9 +389,9 @@ test "square matrix" {
     mat.set(.{ .row = 0, .col = 2 }, 7);
     mat.set(.{ .row = 1, .col = 2 }, 8);
     mat.set(.{ .row = 2, .col = 2 }, 9);
-    try expectSegment(&mat, .col, 0, &.{ 1, 2, 3 });
-    try expectSegment(&mat, .col, 1, &.{ 4, 5, 6 });
-    try expectSegment(&mat, .col, 2, &.{ 7, 8, 9 });
+    try expectSegment(mat, .col, 0, &.{ 1, 2, 3 });
+    try expectSegment(mat, .col, 1, &.{ 4, 5, 6 });
+    try expectSegment(mat, .col, 2, &.{ 7, 8, 9 });
 }
 
 test "matrix transposition" {
@@ -217,9 +408,9 @@ test "matrix transposition" {
     mat.set(.{ .row = 1, .col = 2 }, 8);
     mat.set(.{ .row = 2, .col = 2 }, 9);
     mat.transpose();
-    try expectSegment(&mat, .row, 0, &.{ 1, 2, 3 });
-    try expectSegment(&mat, .row, 1, &.{ 4, 5, 6 });
-    try expectSegment(&mat, .row, 2, &.{ 7, 8, 9 });
+    try expectSegment(mat, .row, 0, &.{ 1, 2, 3 });
+    try expectSegment(mat, .row, 1, &.{ 4, 5, 6 });
+    try expectSegment(mat, .row, 2, &.{ 7, 8, 9 });
 }
 
 test "rows and cols" {
@@ -230,36 +421,108 @@ test "rows and cols" {
     mat.setRow(1, &.{ 5, 6, 7 });
     mat.setRow(2, &.{ 9, 10, 11 });
     mat.setRow(3, &.{ 13, 14, 15 });
-    try expectSegment(&mat, .row, 0, &.{ 1, 2, 3 });
-    try expectSegment(&mat, .row, 1, &.{ 5, 6, 7 });
-    try expectSegment(&mat, .row, 2, &.{ 9, 10, 11 });
-    try expectSegment(&mat, .row, 3, &.{ 13, 14, 15 });
+    try expectSegment(mat, .row, 0, &.{ 1, 2, 3 });
+    try expectSegment(mat, .row, 1, &.{ 5, 6, 7 });
+    try expectSegment(mat, .row, 2, &.{ 9, 10, 11 });
+    try expectSegment(mat, .row, 3, &.{ 13, 14, 15 });
 
     mat.setCol(1, &.{ 4, 8, 12, 16 });
-    try expectSegment(&mat, .row, 0, &.{ 1, 4, 3 });
-    try expectSegment(&mat, .row, 1, &.{ 5, 8, 7 });
-    try expectSegment(&mat, .row, 2, &.{ 9, 12, 11 });
-    try expectSegment(&mat, .row, 3, &.{ 13, 16, 15 });
+    try expectSegment(mat, .row, 0, &.{ 1, 4, 3 });
+    try expectSegment(mat, .row, 1, &.{ 5, 8, 7 });
+    try expectSegment(mat, .row, 2, &.{ 9, 12, 11 });
+    try expectSegment(mat, .row, 3, &.{ 13, 16, 15 });
 
-    try expectSegment(&mat, .col, 0, &.{ 1, 5, 9, 13 });
-    try expectSegment(&mat, .col, 1, &.{ 4, 8, 12, 16 });
-    try expectSegment(&mat, .col, 2, &.{ 3, 7, 11, 15 });
+    try expectSegment(mat, .col, 0, &.{ 1, 5, 9, 13 });
+    try expectSegment(mat, .col, 1, &.{ 4, 8, 12, 16 });
+    try expectSegment(mat, .col, 2, &.{ 3, 7, 11, 15 });
 
     var m2 = try Matrix.init(std.testing.allocator, 3, 2);
     defer m2.deinit(std.testing.allocator);
 
     m2.setCol(0, &.{ 1, 3, 7 });
     m2.setCol(1, &.{ 2, 5, 2 });
-    try expectSegment(&m2, .col, 0, &.{ 1, 3, 7 });
+    try expectSegment(m2, .col, 0, &.{ 1, 3, 7 });
 
     m2.setRow(1, &.{ 9, 8 });
-    try expectSegment(&m2, .row, 0, &.{ 1, 2 });
-    try expectSegment(&m2, .row, 1, &.{ 9, 8 });
-    try expectSegment(&m2, .row, 2, &.{ 7, 2 });
+    try expectSegment(m2, .row, 0, &.{ 1, 2 });
+    try expectSegment(m2, .row, 1, &.{ 9, 8 });
+    try expectSegment(m2, .row, 2, &.{ 7, 2 });
+}
+
+test subView {
+    var mat = try Matrix.init(std.testing.allocator, 3, 3);
+    defer mat.deinit(std.testing.allocator);
+
+    mat.setRow(0, &.{ 1, 2, 3 });
+    mat.setRow(1, &.{ 4, 5, 6 });
+    mat.setRow(2, &.{ 7, 8, 9 });
+
+    // non-exclusionary sub-view
+
+    // exclusionary sub-views
+    var submat = mat.subView(&.{0}, &.{});
+    try std.testing.expectEqual(@as(u8, 2), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 3), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{ 4, 5, 6 });
+    try expectSubSegment(submat, .row, 1, &.{ 7, 8, 9 });
+
+    try expectSubSegment(submat, .col, 0, &.{ 4, 7 });
+    try expectSubSegment(submat, .col, 1, &.{ 5, 8 });
+    try expectSubSegment(submat, .col, 2, &.{ 6, 9 });
+
+    submat = mat.subView(&.{0}, &.{1});
+    try std.testing.expectEqual(@as(u8, 2), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 2), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{ 4, 6 });
+    try expectSubSegment(submat, .row, 1, &.{ 7, 9 });
+
+    try expectSubSegment(submat, .col, 0, &.{ 4, 7 });
+    try expectSubSegment(submat, .col, 1, &.{ 6, 9 });
+
+    submat = mat.subView(&.{1}, &.{ 0, 2 });
+    try std.testing.expectEqual(@as(u8, 2), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 1), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{2});
+    try expectSubSegment(submat, .row, 1, &.{8});
+
+    try expectSubSegment(submat, .col, 0, &.{ 2, 8 });
+
+    // bigger matrix
+
+    if (!mat.resizeAndReset(std.testing.allocator, 5, 5)) {
+        mat.move().deinit(std.testing.allocator);
+        mat = try Matrix.init(std.testing.allocator, 5, 5);
+    }
+
+    // zig fmt: off
+    //                 0   1   2   3   4
+    mat.setRow(0, &.{  1,  2,  3,  4,  5 });
+    mat.setRow(1, &.{  6,  7,  8,  9, 10 });
+    mat.setRow(2, &.{ 11, 12, 13, 14, 15 });
+    mat.setRow(3, &.{ 16, 17, 18, 19, 20 });
+    mat.setRow(4, &.{ 21, 22, 23, 24, 25 });
+    // zig fmt: on
+
+    submat = mat.subView(&.{ 1, 3 }, &.{ 1, 3 });
+    try std.testing.expectEqual(@as(u8, 3), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 3), submat.numCols());
+
+    // zig fmt: off
+    try expectSubSegment(submat, .row, 0, &.{  1,  3,  5 });
+    try expectSubSegment(submat, .row, 1, &.{ 11, 13, 15 });
+    try expectSubSegment(submat, .row, 2, &.{ 21, 23, 25 });
+    // zig fmt: on
+
+    try expectSubSegment(submat, .col, 0, &.{ 1, 11, 21 });
+    try expectSubSegment(submat, .col, 1, &.{ 3, 13, 23 });
+    try expectSubSegment(submat, .col, 2, &.{ 5, 15, 25 });
 }
 
 fn expectSegment(
-    matrix: *const Matrix,
+    matrix: Matrix,
     segment_order: enum { row, col },
     rc_idx: u8,
     expected_values: []const u8,
@@ -284,4 +547,31 @@ fn expectSegment(
             try std.testing.expectEqualSlices(u8, expected_values, actual_values[0..amt]);
         },
     }
+}
+
+fn expectSubSegment(
+    sub_view: SubView,
+    comptime segment_order: enum { row, col },
+    rc_idx: u8,
+    expected_values: []const u8,
+) !void {
+    const actual_values = try std.testing.allocator.alloc(u8, switch (segment_order) {
+        .row => sub_view.numCols(),
+        .col => sub_view.numRows(),
+    });
+    defer std.testing.allocator.free(actual_values);
+    @memset(actual_values, 0);
+
+    var amt: usize = actual_values.len;
+
+    var iter = switch (segment_order) {
+        .row => sub_view.rowIterator(rc_idx),
+        .col => sub_view.colIterator(rc_idx),
+    };
+    for (actual_values, 0..) |*actual, i| actual.* = iter.next() orelse {
+        amt = i;
+        break;
+    };
+    try std.testing.expectEqual(@as(?u8, null), iter.next());
+    try std.testing.expectEqualSlices(u8, expected_values, actual_values[0..amt]);
 }

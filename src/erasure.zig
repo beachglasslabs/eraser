@@ -236,7 +236,7 @@ pub fn ErasureCoder(comptime T: type) type {
             assert(excluded_shards.len == (self.shard_count - self.shard_size));
             assert(in_fifos.len == self.shard_size);
 
-            var decoder_sub = try self.encoder.subMatrix(allocator, self.shard_count - self.shard_size, 0, excluded_shards, &[0]u8{});
+            var decoder_sub = try self.encoder.subMatrix(allocator, excluded_shards, &[0]u8{});
             defer decoder_sub.deinit(allocator);
 
             var decoder_inv = try decoder_sub.invert(allocator);

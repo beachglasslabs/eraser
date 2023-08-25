@@ -72,24 +72,60 @@ pub fn get(self: BinaryFieldMatrix, idx: Matrix.CellIndex) u8 {
     return self.matrix.get(idx);
 }
 
-pub fn det(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !u8 {
-    std.debug.assert(self.numRows() == self.numCols());
+pub inline fn det(self: BinaryFieldMatrix) !u8 {
+    var view = self.matrix.subView(&.{}, &.{});
+    return viewDet(self.field, &view);
+}
 
-    if (self.numRows() == 1) {
-        return self.matrix.get(.{ .row = 0, .col = 0 });
+fn viewDet(field: BinaryFiniteField, view: *const Matrix.SubView) !u8 {
+    assert(view.numRows() == view.numCols());
+
+    // inline the simplest cases
+    switch (view.numRows()) {
+        1 => return view.get(.{ .row = 0, .col = 0 }),
+        2 => {
+            const a = view.get(.{ .row = 0, .col = 0 });
+            const b = view.get(.{ .row = 0, .col = 1 });
+            const c = view.get(.{ .row = 1, .col = 0 });
+            const d = view.get(.{ .row = 1, .col = 1 });
+            return try field.sub(try field.mul(a, d), try field.mul(b, c));
+        },
+        3 => {
+            const a = view.get(.{ .row = 0, .col = 0 });
+            const b = view.get(.{ .row = 0, .col = 1 });
+            const c = view.get(.{ .row = 0, .col = 2 });
+
+            const d = view.get(.{ .row = 1, .col = 0 });
+            const e = view.get(.{ .row = 1, .col = 1 });
+            const f = view.get(.{ .row = 1, .col = 2 });
+
+            const g = view.get(.{ .row = 2, .col = 0 });
+            const h = view.get(.{ .row = 2, .col = 1 });
+            const i = view.get(.{ .row = 2, .col = 2 });
+
+            const ei_fh = try field.sub(try field.mul(e, i), try field.mul(f, h));
+            const di_fg = try field.sub(try field.mul(d, i), try field.mul(f, g));
+            const dh_eg = try field.sub(try field.mul(d, h), try field.mul(e, g));
+
+            return try field.add(
+                try field.sub(try field.mul(a, ei_fh), try field.mul(b, di_fg)),
+                try field.mul(c, dh_eg),
+            );
+        },
+        else => {},
     }
 
     var result: u8 = 0;
-    for (0..self.numCols()) |c| {
-        var sub = try self.subMatrix(allocator, 1, 1, &.{0}, &[_]u8{@intCast(c)});
-        defer sub.deinit(allocator);
-
-        var x = try self.field.mul(self.matrix.get(.{ .row = 0, .col = @intCast(c) }), try sub.det(allocator));
+    for (0..view.numCols()) |c| {
+        const sub = view.subView(&[_]u8{0}, &[_]u8{@intCast(c)});
+        const sub_det = try viewDet(field, &sub);
+        var x = try field.mul(view.get(.{ .row = 0, .col = @intCast(c) }), sub_det);
         if (c % 2 == 1) {
-            x = try self.field.neg(x);
+            x = try field.neg(x);
         }
-        result = try self.field.add(result, x);
+        result = try field.add(result, x);
     }
+
     return result;
 }
 
@@ -122,21 +158,19 @@ pub fn format(
 pub fn subMatrix(
     self: BinaryFieldMatrix,
     allocator: std.mem.Allocator,
-    em: u8,
-    en: u8,
     excluded_rows: []const u8,
     excluded_cols: []const u8,
 ) !BinaryFieldMatrix {
-    std.debug.assert(em == excluded_rows.len);
-    std.debug.assert(en == excluded_cols.len);
-    var sub = try Matrix.init(allocator, self.numRows() - em, self.numCols() - en);
+    const ex_rows: u8 = @intCast(excluded_rows.len);
+    const ex_cols: u8 = @intCast(excluded_cols.len);
+
+    var sub = try Matrix.init(allocator, self.numRows() - ex_rows, self.numCols() - ex_cols);
     errdefer sub.deinit(allocator);
+
     var i: usize = 0;
     rblk: for (0..self.numRows()) |r| {
         for (excluded_rows) |er| {
-            if (r == er) {
-                continue :rblk;
-            }
+            if (r == er) continue :rblk;
         }
         var j: usize = 0;
         cblk: for (0..self.numCols()) |c| {
@@ -150,6 +184,7 @@ pub fn subMatrix(
         }
         i += 1;
     }
+
     return try BinaryFieldMatrix.initMatrix(sub, self.field.n);
 }
 
@@ -159,12 +194,10 @@ pub fn cofactorize(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !Binar
     var cof = try Matrix.init(allocator, self.numRows(), self.numCols());
     errdefer cof.deinit(allocator);
 
-    for (0..self.numRows()) |r| {
-        for (0..self.numCols()) |c| {
-            var sub = try self.subMatrix(allocator, 1, 1, &[_]u8{@intCast(r)}, &[_]u8{@intCast(c)});
-            defer sub.deinit(allocator);
-
-            cof.set(.{ .row = @intCast(r), .col = @intCast(c) }, try sub.det(allocator));
+    for (0..cof.numRows()) |r| {
+        for (0..cof.num_cols) |c| {
+            const sub = self.matrix.subView(&[_]u8{@intCast(r)}, &[_]u8{@intCast(c)});
+            cof.set(.{ .row = @intCast(r), .col = @intCast(c) }, try viewDet(self.field, &sub));
             if ((r + c) % 2 == 1) {
                 cof.set(.{ .row = @intCast(r), .col = @intCast(c) }, try self.field.neg(cof.get(.{ .row = @intCast(r), .col = @intCast(c) })));
             }
@@ -172,6 +205,10 @@ pub fn cofactorize(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !Binar
     }
 
     return try BinaryFieldMatrix.initMatrix(cof, self.field.n);
+}
+
+pub fn cofactorizeInPlace(self: *BinaryFieldMatrix) !void {
+    _ = self;
 }
 
 pub inline fn transpose(self: *BinaryFieldMatrix) void {
@@ -196,9 +233,14 @@ pub fn invert(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFiel
     errdefer imx.deinit(allocator);
     imx.transpose();
 
-    const determinant = try self.det(allocator);
+    const determinant = try self.det();
     try imx.scale(try self.field.invert(determinant));
     return imx;
+}
+
+pub fn invertInPlace(self: *BinaryFieldMatrix, allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    _ = self;
 }
 
 pub fn multiply(
@@ -294,11 +336,8 @@ test "invertible sub-matrices" {
     defer bfm.deinit(std.testing.allocator);
 
     const ex_rows = util.choose(&.{ 0, 1, 2, 3, 4 }, rows - cols);
-    // std.log.debug("\nex_rows.len = {d}:\n", .{ex_rows.len});
     inline for (ex_rows) |er| {
-        // std.log.debug("ex_rows[{d}] = {any}\n", .{ i, er });
-
-        var submatrix = try bfm.subMatrix(std.testing.allocator, 2, 0, &er, &.{});
+        var submatrix = try bfm.subMatrix(std.testing.allocator, &er, &[_]u8{});
         defer submatrix.deinit(std.testing.allocator);
 
         try std.testing.expectEqual(bfm.numRows() - er.len, submatrix.numRows());
@@ -373,7 +412,7 @@ test "matrix binary representation" {
             var mat_sum = try bfma.field.toMatrix(std.testing.allocator, sum);
             defer mat_sum.deinit(std.testing.allocator);
 
-            for (0..mat_a.num_rows) |r| {
+            for (0..mat_a.numRows()) |r| {
                 for (0..mat_a.num_cols) |c| {
                     const idx: Matrix.CellIndex = .{ .row = @intCast(r), .col = @intCast(c) };
                     try std.testing.expectEqual(mat_sum.get(idx), try bfma.field.add(mat_a.get(idx), mat_b.get(idx)));
