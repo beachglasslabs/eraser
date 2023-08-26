@@ -119,9 +119,13 @@ pub fn transpose(self: *Matrix) void {
     }
 }
 
-pub fn getSlice(self: *const Matrix, col: u8) []u8 {
-    assert(col < self.num_rows);
-    const i = mulWide(u8, col, self.num_cols);
+pub fn loadRow(self: Matrix, row: u8, dst: []u8) []u8 {
+    @memcpy(dst[0..self.numRows()], self.getRow(row));
+}
+
+pub fn getSlice(self: Matrix, row: u8) []u8 {
+    assert(row < self.num_rows);
+    const i = mulWide(u8, row, self.num_cols);
     return self.data[i..][0..self.num_cols];
 }
 
@@ -177,71 +181,47 @@ pub inline fn subView(
     excluded_rows: []const u8,
     excluded_cols: []const u8,
 ) SubView {
-    assert(excluded_rows.len <= self.numRows());
-    assert(excluded_cols.len <= self.numCols());
-    if (excluded_rows.len != 0) assert(std.mem.max(u8, excluded_rows) < self.numRows());
-    if (excluded_cols.len != 0) assert(std.mem.max(u8, excluded_cols) < self.numCols());
-    return .{
-        .parent = .{ .matrix = self },
-        .excluded_rows = excluded_rows,
-        .excluded_cols = excluded_cols,
+    const full_view = SubView{
+        .parent = self,
+        .excluded_rows = SubView.SegmentSet.initEmpty(),
+        .excluded_cols = SubView.SegmentSet.initEmpty(),
     };
+    return full_view.subView(excluded_rows, excluded_cols);
 }
 
 pub const SubView = struct {
-    parent: Parent,
-    excluded_rows: []const u8,
-    excluded_cols: []const u8,
-    const Parent = union(enum) {
-        matrix: *const Matrix,
-        subview: *const SubView,
-    };
+    parent: *const Matrix,
+    // excluded_rows: []const u8,
+    // excluded_cols: []const u8,
+    excluded_rows: SegmentSet = SegmentSet.initEmpty(),
+    excluded_cols: SegmentSet = SegmentSet.initEmpty(),
 
-    pub fn subView(self: *const SubView, excluded_rows: []const u8, excluded_cols: []const u8) SubView {
+    pub const SegmentSet = std.bit_set.IntegerBitSet(std.math.maxInt(u8));
+
+    pub fn subView(
+        self: SubView,
+        excluded_rows: []const u8,
+        excluded_cols: []const u8,
+    ) SubView {
         assert(excluded_rows.len <= self.numRows());
         assert(excluded_cols.len <= self.numCols());
-        if (excluded_rows.len != 0) assert(std.mem.max(u8, excluded_rows) < self.numRows());
-        if (excluded_cols.len != 0) assert(std.mem.max(u8, excluded_cols) < self.numCols());
 
-        if (0 == @min(
-            self.excluded_rows.len,
-            excluded_rows.len,
-            self.excluded_cols.len,
-            excluded_cols.len,
-        )) {
-            if (excluded_rows.len == 0 and
-                excluded_cols.len == 0 //
-            ) return self.*;
+        var ex_rows = self.excluded_rows;
+        for (excluded_rows) |row| {
+            assert(row < self.numRows());
+            ex_rows.set(subRcIndexToParentRcIdx(row, self.excluded_rows));
+        }
 
-            if (self.excluded_rows.len == 0 and
-                self.excluded_cols.len == 0 //
-            ) return .{
-                .parent = self.parent,
-                .excluded_rows = excluded_rows,
-                .excluded_cols = excluded_cols,
-            };
-
-            if (self.excluded_rows.len == 0 and
-                excluded_cols.len == 0 //
-            ) return .{
-                .parent = self.parent,
-                .excluded_rows = excluded_rows,
-                .excluded_cols = self.excluded_cols,
-            };
-
-            if (self.excluded_cols.len == 0 and
-                excluded_rows.len == 0 //
-            ) return .{
-                .parent = self.parent,
-                .excluded_rows = self.excluded_rows,
-                .excluded_cols = excluded_cols,
-            };
+        var ex_cols = self.excluded_cols;
+        for (excluded_cols) |col| {
+            assert(col < self.numCols());
+            ex_cols.set(subRcIndexToParentRcIdx(col, self.excluded_cols));
         }
 
         return .{
-            .parent = .{ .subview = self },
-            .excluded_rows = excluded_rows,
-            .excluded_cols = excluded_cols,
+            .parent = self.parent,
+            .excluded_rows = ex_rows,
+            .excluded_cols = ex_cols,
         };
     }
 
@@ -249,23 +229,17 @@ pub const SubView = struct {
         return mulWide(u8, self.numRows(), self.numCols());
     }
     pub fn numRows(self: SubView) u8 {
-        const ex: u8 = @intCast(self.excluded_rows.len);
-        return switch (self.parent) {
-            inline else => |p| p.numRows() - ex,
-        };
+        const ex: u8 = @intCast(self.excluded_rows.count());
+        return self.parent.numRows() - ex;
     }
     pub fn numCols(self: SubView) u8 {
-        const ex: u8 = @intCast(self.excluded_cols.len);
-        return switch (self.parent) {
-            inline else => |p| p.numCols() - ex,
-        };
+        const ex: u8 = @intCast(self.excluded_cols.count());
+        return self.parent.numCols() - ex;
     }
 
     pub fn getPtr(self: SubView, idx: CellIndex) *u8 {
         assert(idx.row < self.numRows() and idx.col < self.numCols());
-        return switch (self.parent) {
-            inline else => |p| p.getPtr(self.subIndexToParentIdx(idx)),
-        };
+        return self.parent.getPtr(self.subIndexToParentIdx(idx));
     }
     pub inline fn get(self: SubView, idx: CellIndex) u8 {
         return self.getPtr(idx).*;
@@ -281,10 +255,12 @@ pub const SubView = struct {
         };
     }
 
-    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: []const u8) u8 {
+    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: SegmentSet) u8 {
         var result: u8 = rc_idx;
-        for (excluded) |ex| {
-            if (result < ex) continue;
+        var iter = excluded.iterator(.{});
+        while (true) {
+            const ex: u8 = @intCast(iter.next() orelse break);
+            if (result < ex) break;
             result += result - ex;
             result += @intFromBool(result == ex);
         }
@@ -471,7 +447,7 @@ test subView {
     try expectSubSegment(submat, .col, 1, &.{ 5, 8 });
     try expectSubSegment(submat, .col, 2, &.{ 6, 9 });
 
-    submat = mat.subView(&.{0}, &.{1});
+    submat = submat.subView(&.{}, &.{1});
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 2), submat.numCols());
 
@@ -519,6 +495,20 @@ test subView {
     try expectSubSegment(submat, .col, 0, &.{ 1, 11, 21 });
     try expectSubSegment(submat, .col, 1, &.{ 3, 13, 23 });
     try expectSubSegment(submat, .col, 2, &.{ 5, 15, 25 });
+
+    submat = submat.subView(&.{0}, &.{});
+    try std.testing.expectEqual(@as(u8, 2), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 3), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{ 11, 13, 15 });
+    try expectSubSegment(submat, .row, 1, &.{ 21, 23, 25 });
+
+    submat = submat.subView(&.{}, &.{0});
+    try std.testing.expectEqual(@as(u8, 2), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 2), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{ 13, 15 });
+    try expectSubSegment(submat, .row, 1, &.{ 23, 25 });
 }
 
 fn expectSegment(

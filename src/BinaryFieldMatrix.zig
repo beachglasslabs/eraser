@@ -185,7 +185,7 @@ pub fn subMatrix(
         i += 1;
     }
 
-    return try BinaryFieldMatrix.initMatrix(sub, self.field.n);
+    return try BinaryFieldMatrix.initMatrix(sub, self.field.exp);
 }
 
 pub fn cofactorize(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
@@ -204,7 +204,7 @@ pub fn cofactorize(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !Binar
         }
     }
 
-    return try BinaryFieldMatrix.initMatrix(cof, self.field.n);
+    return try BinaryFieldMatrix.initMatrix(cof, self.field.exp);
 }
 
 pub fn cofactorizeInPlace(self: *BinaryFieldMatrix) !void {
@@ -266,7 +266,7 @@ pub fn multiply(
         }
     }
 
-    return try BinaryFieldMatrix.initMatrix(matrix, self.field.n);
+    return try BinaryFieldMatrix.initMatrix(matrix, self.field.exp);
 }
 
 pub fn toBinaryWith(
@@ -275,9 +275,9 @@ pub fn toBinaryWith(
     /// the backing buffer that will be used for the matrix in the returned binary field matrix
     mat_buf: []align(16) u8,
 ) !BinaryFieldMatrix {
-    var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.n, self.numCols() * self.field.n);
+    var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.exp, self.numCols() * self.field.exp);
 
-    var bfm = try Matrix.init(allocator, self.field.n, self.field.n);
+    var bfm = try Matrix.init(allocator, self.field.exp, self.field.exp);
     defer bfm.deinit(allocator);
 
     for (0..self.numRows()) |r| {
@@ -285,13 +285,13 @@ pub fn toBinaryWith(
             const a = self.matrix.get(.{ .row = @intCast(r), .col = @intCast(c) });
             try self.field.setAllCols(&bfm, a);
 
-            for (0..self.field.n) |i| {
-                for (0..self.field.n) |j| {
+            for (0..self.field.exp) |i| {
+                for (0..self.field.exp) |j| {
                     const dst_idx: Matrix.CellIndex = .{
-                        .row = @intCast(r * self.field.n + i),
-                        .col = @intCast(c * self.field.n + j),
+                        .row = @intCast(r * self.field.exp + i),
+                        .col = @intCast(c * self.field.exp + j),
                     };
-                    const src = try self.field.validated(bfm.get(.{ .row = @intCast(i), .col = @intCast(j) }));
+                    const src = try self.field.validate(bfm.get(.{ .row = @intCast(i), .col = @intCast(j) }));
                     matrix.set(dst_idx, src);
                 }
             }
@@ -302,7 +302,7 @@ pub fn toBinaryWith(
 }
 
 pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
-    const mat_buf = try allocator.alignedAlloc(u8, 16, @as(usize, self.numRows()) * self.field.n * self.numCols() * self.field.n);
+    const mat_buf = try allocator.alignedAlloc(u8, 16, @as(usize, self.numRows()) * self.field.exp * self.numCols() * self.field.exp);
     errdefer allocator.free(mat_buf);
     return self.toBinaryWith(allocator, mat_buf);
 }

@@ -4,8 +4,6 @@ const assert = std.debug.assert;
 const Matrix = @import("Matrix.zig");
 
 const BinaryFiniteField = @This();
-n: Exp,
-
 exp: Exp,
 order: Order,
 divisor: Divisor,
@@ -14,10 +12,10 @@ pub const Exp = u3;
 const Order = u8;
 const Divisor = u8;
 
-/// 2^n field
-pub fn init(n: Exp) error{InvalidExponent}!BinaryFiniteField {
+/// 2^exp field
+pub fn init(exp: Exp) error{InvalidExponent}!BinaryFiniteField {
     // Irreducible polynomail for mod multiplication
-    const d: u8 = switch (n) {
+    const d: u8 = switch (exp) {
         0 => return error.InvalidExponent,
         1 => 3, //   1 + x ? undef  shift(0b11)       = 2
         2 => 7, //   1 + x + x^2    shift(0b111)      = 3
@@ -29,29 +27,26 @@ pub fn init(n: Exp) error{InvalidExponent}!BinaryFiniteField {
     };
 
     return .{
-        .n = n,
-        .exp = n,
-        .order = @as(u8, 1) << n,
+        .exp = exp,
+        .order = @as(u8, 1) << exp,
         .divisor = d,
     };
 }
 
-pub inline fn validated(self: BinaryFiniteField, number: anytype) error{InvalidNumber}!u8 {
-    if (number < self.order) {
-        return @intCast(number);
-    } else {
+pub inline fn validate(self: BinaryFiniteField, number: anytype) error{InvalidNumber}!u8 {
+    if (number >= self.order)
         return error.InvalidNumber;
-    }
+    return @intCast(number);
 }
 
 pub fn add(self: BinaryFiniteField, a: anytype, b: anytype) error{InvalidNumber}!u8 {
-    const valid_a = try self.validated(a);
-    const valid_b = try self.validated(b);
-    return try self.validated(valid_a ^ valid_b);
+    const valid_a = try self.validate(a);
+    const valid_b = try self.validate(b);
+    return self.validate(valid_a ^ valid_b) catch unreachable;
 }
 
 pub fn neg(self: BinaryFiniteField, a: usize) error{InvalidNumber}!u8 {
-    return try self.validated(a);
+    return try self.validate(a);
 }
 
 pub fn sub(self: BinaryFiniteField, a: anytype, b: anytype) error{InvalidNumber}!u8 {
@@ -71,12 +66,12 @@ fn countBits(num: usize) u8 {
 
 pub fn mul(self: BinaryFiniteField, a: anytype, b: anytype) error{InvalidNumber}!u8 {
     if (self.exp == 1) {
-        return self.validated(try self.validated(a) * try self.validated(b));
+        return self.validate(try self.validate(a) * try self.validate(b));
     }
 
     // n > 1
-    const x = try self.validated(a);
-    const y = try self.validated(b);
+    const x = try self.validate(a);
+    const y = try self.validate(b);
     var result: u16 = 0;
     for (0..8) |i| {
         const j = 7 - i;
@@ -90,16 +85,16 @@ pub fn mul(self: BinaryFiniteField, a: anytype, b: anytype) error{InvalidNumber}
         j -= self.exp + 1;
         result ^= @as(u16, self.divisor) << @intCast(j);
     }
-    return try self.validated(result);
+    return try self.validate(result);
 }
 
 pub fn invert(self: BinaryFiniteField, a: usize) error{ NoInverse, InvalidNumber }!u8 {
-    if (try self.validated(a) == 0) {
+    if (try self.validate(a) == 0) {
         return error.NoInverse;
     }
     for (0..self.order) |b| {
         if (try self.mul(a, b) == 1) {
-            return try self.validated(b);
+            return try self.validate(b);
         }
     }
     return error.NoInverse;
@@ -128,10 +123,10 @@ pub fn setAllCols(self: BinaryFiniteField, m: *Matrix, a: anytype) !void {
 
 /// n x n binary matrix representation
 pub fn toMatrix(self: BinaryFiniteField, allocator: std.mem.Allocator, a: anytype) !Matrix {
-    var m = try Matrix.init(allocator, self.n, self.n);
-    errdefer m.deinit(allocator);
-    try self.setAllCols(&m, a);
-    return m;
+    var mat = try Matrix.init(allocator, self.exp, self.exp);
+    errdefer mat.deinit(allocator);
+    try self.setAllCols(&mat, a);
+    return mat;
 }
 
 test "convert to matrix" {
