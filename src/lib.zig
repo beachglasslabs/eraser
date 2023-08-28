@@ -3,15 +3,16 @@ const assert = std.debug.assert;
 
 const util = @import("util.zig");
 
-pub inline fn sensitiveBytes(slice: []const u8) SensitiveBytes {
-    return .{ .pointer = slice.ptr, .length = slice.len };
-}
 /// Struct to represent a slice of bytes containing sensitive information
 /// which should be formatted and inspected with great care.
 pub const SensitiveBytes = struct {
     /// using a multi-ptr avoids any introspecting code from easily treating this as a string
     pointer: [*]const u8,
     length: usize,
+
+    pub fn init(slice: []const u8) SensitiveBytes {
+        return .{ .pointer = slice.ptr, .length = slice.len };
+    }
 
     pub fn getSensitiveSlice(self: SensitiveBytes) []const u8 {
         return self.pointer[0..self.length];
@@ -78,17 +79,16 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
     };
     defer client.deinit();
 
-    const string_lt_ctx = struct {
-        fn lessThan(_: @This(), lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.lessThan(u8, lhs, rhs);
-        }
+    var ec = ErasureCoder(u32).init(allocator, @intCast(server_info.gcloud_bucket_names.len), 3) catch |err| switch (err) {
+        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+        inline //
+        error.InvalidNumber,
+        error.InvalidExponent,
+        error.NoInverse,
+        error.ShardSizePlusCountOverflow,
+        => |e| @panic("TODO: decide how to handle '" ++ @errorName(e) ++ "'"),
     };
-    const longest_gcloud_bucket_name = std.sort.max(
-        []const u8,
-        args.server_info.gcloud_bucket_names,
-        string_lt_ctx{},
-        string_lt_ctx.lessThan,
-    ) orelse "";
+    defer ec.deinit(allocator);
 
     while (true) {
         // attempt to reset the arena 3 times, otherwise just free
@@ -110,16 +110,6 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
             };
         };
 
-        var ec = ErasureCoder(u32).init(arena, @intCast(server_info.gcloud_bucket_names.len), 3) catch |err| switch (err) {
-            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-            inline //
-            error.InvalidNumber,
-            error.InvalidExponent,
-            error.NoInverse,
-            => |e| @panic("TODO: decide how to handle '" ++ @errorName(e) ++ "'"),
-        };
-        defer ec.deinit(arena);
-
         switch (node.data) {
             .encode => |*data| {
                 defer if (data.close_after) data.file.close();
@@ -130,27 +120,22 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
                     writer: ReqWriter,
                 };
                 var requests_and_writers = std.MultiArrayList(ReqAndWriter){};
+                defer for (requests_and_writers.items(.request)) |*req| req.deinit();
 
                 if (server_info.gcloud_auth_token) |auth_token| (oom: {
-                    const authorization = std.fmt.allocPrint(arena, "Bearer: {s}", .{
-                        auth_token.getSensitiveSlice(),
-                    }) catch |err| break :oom err;
+                    const authorization = std.fmt.allocPrint(arena, "Bearer {s}", .{auth_token.getSensitiveSlice()}) catch |err| break :oom err;
 
                     var headers = std.http.Headers.init(arena);
                     headers.owned = false;
                     headers.append("Authorization", authorization) catch |err| break :oom err;
-
-                    const url_fmt_str = "https://storage.googleapis.com/storage/v1/b/{s}/{s}";
-                    const url_buf = arena.alloc(u8, std.fmt.count(url_fmt_str, .{ longest_gcloud_bucket_name, data.name }) +| 10) catch |err| break :oom err;
+                    headers.append("Transfer-Encoding", "chunked") catch |err| break :oom err;
 
                     for (server_info.gcloud_bucket_names) |bucket_name| {
-                        const url = std.fmt.bufPrint(url_buf, url_fmt_str, .{ bucket_name, data.name }) catch |err| switch (err) {
-                            error.NoSpaceLeft => unreachable,
-                        };
-
-                        const uri = std.Uri.parse(url) catch |err| switch (err) {
-                            inline else => |e| @panic(@errorName(e) ++ " should be unreachable, but was encountered while parsing google cloud bucket URL"),
-                        };
+                        const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
+                            .bucket = bucket_name,
+                            .object = data.name,
+                        }) catch |err| break :oom err;
+                        const uri = std.Uri.parse(uri_str) catch unreachable;
 
                         const req = client.request(.PUT, uri, headers, .{}) catch |err| switch (err) {
                             error.OutOfMemory => |e| break :oom e,
@@ -188,7 +173,7 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
                         error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
-                    std.debug.print("Response from '{s}':\n{}\n", .{ req.uri, req.response.headers });
+                    std.debug.print("Response from '{s}':\n{}\n\n", .{ req.uri, req.response.headers });
                     const DebugResponseFmt = struct {
                         reader: std.http.Client.Request.Reader,
 
@@ -306,16 +291,18 @@ pub const EncDecQueue = struct {
 };
 
 test {
+    const allocator = std.testing.allocator;
+
     var queue_mtx = std.Thread.Mutex{};
-    var queue = EncDecQueue.init(std.testing.allocator);
+    var queue = EncDecQueue.init(allocator);
     defer queue.deinit();
 
-    const gc_auth_token = try std.process.getEnvVarOwned(std.testing.allocator, "ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY");
-    defer std.testing.allocator.free(gc_auth_token);
+    const gc_auth_token = try std.process.getEnvVarOwned(allocator, "ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY");
+    defer allocator.free(gc_auth_token);
 
     var must_stop = std.atomic.Atomic(bool).init(false);
     const th = try std.Thread.spawn(.{}, encodeDecodeThread, .{EncodeDecodeThreadArgs{
-        .allocator = std.testing.allocator,
+        .allocator = allocator,
 
         .cmd_queue_mtx = &queue_mtx,
         .cmd_queue = &queue,
@@ -323,6 +310,7 @@ test {
         .must_stop = &must_stop,
 
         .server_info = .{
+            .gcloud_auth_token = SensitiveBytes.init(gc_auth_token),
             .gcloud_bucket_names = &[_][]const u8{
                 "ec1.blocktube.net",
                 "ec2.blocktube.net",
@@ -331,7 +319,6 @@ test {
                 "ec5.blocktube.net",
                 "ec6.blocktube.net",
             },
-            .gcloud_auth_token = sensitiveBytes(gc_auth_token),
         },
     }});
     defer th.join();

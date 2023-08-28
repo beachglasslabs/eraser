@@ -24,15 +24,15 @@ pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8, b: BinaryFiniteFie
     };
 }
 
-pub fn initCauchy(allocator: std.mem.Allocator, rows: u8, cols: u8, b: BinaryFiniteField.Exp) !BinaryFieldMatrix {
-    const field = try BinaryFiniteField.init(b);
+pub fn initCauchy(allocator: std.mem.Allocator, rows: u8, cols: u8, exp: BinaryFiniteField.Exp) !BinaryFieldMatrix {
+    const field = try BinaryFiniteField.init(exp);
 
-    var matrix: Matrix = try toCauchy(allocator, field, rows, cols);
-    defer matrix.deinit(allocator);
+    const matrix: Matrix = try toCauchy(allocator, field, rows, cols);
+    errdefer matrix.deinit(allocator);
 
     return .{
         .field = field,
-        .matrix = matrix.move(),
+        .matrix = matrix,
     };
 }
 
@@ -130,7 +130,7 @@ fn viewDet(field: BinaryFiniteField, view: *const Matrix.SubView) !u8 {
 }
 
 fn toCauchy(allocator: std.mem.Allocator, field: BinaryFiniteField, rows: u8, cols: u8) !Matrix {
-    std.debug.assert(field.order >= rows + cols);
+    assert(field.order >= rows + cols);
 
     var cnm = try Matrix.init(allocator, rows, cols);
     defer cnm.deinit(allocator);

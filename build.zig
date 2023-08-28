@@ -38,7 +38,7 @@ pub fn build(b: *Build) void {
 
     for (difftest_file_paths) |file_path| {
         const input = Build.LazyPath.relative(file_path);
-        const output = encodeAndDecode(b, exe, input);
+        const output = encodeAndDecode(b, exe, input, .{});
 
         const difftest_exe = b.addTest(.{
             .name = b.fmt("difftest__{s}", .{std.fs.path.basename(file_path)}),
@@ -60,6 +60,11 @@ fn encodeAndDecode(
     b: *Build,
     eraser_artifact: *Build.CompileStep,
     input: Build.LazyPath,
+    options: struct {
+        n: ?u8 = null,
+        k: ?u8 = null,
+        w: ?[]const u8 = null,
+    },
 ) Build.LazyPath {
     // encode
     const run_exe_difftest_encode = b.addRunArtifact(eraser_artifact);
@@ -71,6 +76,19 @@ fn encodeAndDecode(
     run_exe_difftest_encode.addArg("--code");
     const difftest_output_dir = run_exe_difftest_encode.addOutputFileArg("output");
 
+    if (options.n) |n| {
+        run_exe_difftest_encode.addArg("-n");
+        run_exe_difftest_encode.addArg(b.fmt("{d}", .{n}));
+    }
+    if (options.k) |k| {
+        run_exe_difftest_encode.addArg("-k");
+        run_exe_difftest_encode.addArg(b.fmt("{d}", .{k}));
+    }
+    if (options.w) |w| {
+        run_exe_difftest_encode.addArg("-w");
+        run_exe_difftest_encode.addArg(w);
+    }
+
     // decode
     const run_exe_difftest_decode = b.addRunArtifact(eraser_artifact);
     run_exe_difftest_decode.addArg("decode");
@@ -80,6 +98,19 @@ fn encodeAndDecode(
 
     run_exe_difftest_decode.addArg("--code");
     run_exe_difftest_decode.addDirectoryArg(difftest_output_dir);
+
+    if (options.n) |n| {
+        run_exe_difftest_decode.addArg("-n");
+        run_exe_difftest_decode.addArg(b.fmt("{d}", .{n}));
+    }
+    if (options.k) |k| {
+        run_exe_difftest_decode.addArg("-k");
+        run_exe_difftest_decode.addArg(b.fmt("{d}", .{k}));
+    }
+    if (options.w) |w| {
+        run_exe_difftest_decode.addArg("-w");
+        run_exe_difftest_decode.addArg(w);
+    }
 
     return output;
 }
