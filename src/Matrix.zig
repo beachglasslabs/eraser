@@ -89,7 +89,9 @@ pub inline fn numCols(self: Matrix) u8 {
 pub const CellIndex = packed struct(u16) { row: u8, col: u8 };
 
 pub fn getPtr(self: Matrix, idx: CellIndex) *u8 {
-    assert(idx.row < self.num_rows and idx.col < self.num_cols);
+    if (idx.row >= self.numRows()) std.debug.print("{} {}\n", .{ idx.row, self.numRows() });
+    assert(idx.row < self.numRows());
+    assert(idx.col < self.numCols());
     const i = mulWide(u8, idx.row, self.num_cols) + idx.col;
     return &self.data[i];
 }
@@ -196,7 +198,7 @@ pub const SubView = struct {
     excluded_rows: SegmentSet = SegmentSet.initEmpty(),
     excluded_cols: SegmentSet = SegmentSet.initEmpty(),
 
-    pub const SegmentSet = std.bit_set.IntegerBitSet(std.math.maxInt(u8));
+    pub const SegmentSet = std.bit_set.ArrayBitSet(u32, std.math.maxInt(u8));
 
     pub fn subView(
         self: SubView,
@@ -225,6 +227,20 @@ pub const SubView = struct {
         };
     }
 
+    pub fn copyInto(self: SubView, dst: Matrix) void {
+        assert(self.numRows() == dst.numRows());
+        assert(self.numCols() == dst.numCols());
+
+        for (0..dst.numRows()) |row_idx| {
+            for (dst.getRow(@intCast(row_idx)), 0..) |*cell, col_idx| {
+                cell.* = self.get(.{
+                    .row = @intCast(row_idx),
+                    .col = @intCast(col_idx),
+                });
+            }
+        }
+    }
+
     pub fn getCellCount(self: SubView) u16 {
         return mulWide(u8, self.numRows(), self.numCols());
     }
@@ -238,7 +254,6 @@ pub const SubView = struct {
     }
 
     pub fn getPtr(self: SubView, idx: CellIndex) *u8 {
-        assert(idx.row < self.numRows() and idx.col < self.numCols());
         return self.parent.getPtr(self.subIndexToParentIdx(idx));
     }
     pub inline fn get(self: SubView, idx: CellIndex) u8 {
@@ -249,6 +264,8 @@ pub const SubView = struct {
     }
 
     inline fn subIndexToParentIdx(self: SubView, idx: CellIndex) CellIndex {
+        assert(idx.row < self.numRows());
+        assert(idx.col < self.numCols());
         return CellIndex{
             .row = subRcIndexToParentRcIdx(idx.row, self.excluded_rows),
             .col = subRcIndexToParentRcIdx(idx.col, self.excluded_cols),
@@ -261,8 +278,7 @@ pub const SubView = struct {
         while (true) {
             const ex: u8 = @intCast(iter.next() orelse break);
             if (result < ex) break;
-            result += result - ex;
-            result += @intFromBool(result == ex);
+            result += 1;
         }
         return result;
     }
@@ -509,6 +525,17 @@ test subView {
 
     try expectSubSegment(submat, .row, 0, &.{ 13, 15 });
     try expectSubSegment(submat, .row, 1, &.{ 23, 25 });
+
+    submat = mat.subView(&.{0}, &.{});
+    try std.testing.expectEqual(@as(u8, 4), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 5), submat.numCols());
+
+    // zig fmt: off
+    try expectSubSegment(submat, .row, 0, &.{  6,  7,  8,  9, 10 });
+    try expectSubSegment(submat, .row, 1, &.{ 11, 12, 13, 14, 15 });
+    try expectSubSegment(submat, .row, 2, &.{ 16, 17, 18, 19, 20 });
+    try expectSubSegment(submat, .row, 3, &.{ 21, 22, 23, 24, 25 });
+    // zig fmt: on
 }
 
 fn expectSegment(
