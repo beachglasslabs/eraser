@@ -3,8 +3,8 @@ const std = @import("std");
 pub const Matrix = @import("Matrix.zig");
 pub const BinaryFiniteField = @import("BinaryFiniteField.zig");
 pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
-pub const ErasureCoder = @import("erasure.zig").ErasureCoder;
-pub const sample = @import("erasure.zig").sample;
+const erasure = @import("erasure.zig");
+pub const ErasureCoder = erasure.ErasureCoder;
 
 const usage =
     \\Usage: eraser [command] [options]
@@ -138,7 +138,7 @@ fn encodeCommand(
     var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
     defer for (code_files.constSlice()) |cf| cf.close();
 
-    for (0..ec.shard_count) |i| {
+    for (0..ec.shardCount()) |i| {
         var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
         code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
             error.Overflow => unreachable,
@@ -155,7 +155,6 @@ fn encodeCommand(
     for (code_files.constSlice()) |cf| code_writers.appendAssumeCapacity(cf.writer());
 
     _ = try ec.encode(
-        allocator,
         data_file.reader(),
         code_writers.constSlice(),
     );
@@ -175,8 +174,26 @@ fn decodeCommand(
     var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
     const random = prng.random();
 
-    const excluded_shards = sample(random, ec.shard_count, ec.shard_count - ec.shard_size);
-    std.log.info("excluding {any}", .{excluded_shards.constSlice()});
+    const excluded_shards = erasure.sampleIndexSet(random, ec.shardCount(), ec.shardCount() - ec.shardSize());
+    const ShardListFmt = struct {
+        set: *const erasure.IndexSet,
+        pub fn format(
+            this: @This(),
+            comptime _: []const u8,
+            _: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            var iter = this.set.iterator(.{});
+            var comma: bool = false;
+            while (iter.next()) |idx| {
+                if (comma) {
+                    try writer.writeAll(", ");
+                } else comma = true;
+                try writer.print("{d}", .{idx});
+            }
+        }
+    };
+    std.log.info("excluding shards {}", .{ShardListFmt{ .set = &excluded_shards }});
 
     const data_file = try std.fs.cwd().createFile(data_filename, .{});
     defer data_file.close();
@@ -187,8 +204,9 @@ fn decodeCommand(
     var code_files: std.BoundedArray(std.fs.File, std.math.maxInt(u8)) = .{};
     defer for (code_files.constSlice()) |cf| cf.close();
 
-    for (0..ec.shard_count) |i| {
-        if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
+    for (0..ec.shardCount()) |i| {
+        // if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
+        if (excluded_shards.isSet(i)) continue;
         var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
         code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
             error.Overflow => unreachable,
@@ -206,8 +224,7 @@ fn decodeCommand(
     for (code_files.constSlice()) |cf| code_readers.appendAssumeCapacity(cf.reader());
 
     _ = try ec.decode(
-        allocator,
-        excluded_shards.constSlice(),
+        excluded_shards,
         code_readers.constSlice(),
         data_file.writer(),
     );

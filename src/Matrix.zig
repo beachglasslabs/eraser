@@ -6,9 +6,9 @@ const mulWide = std.math.mulWide;
 const util = @import("util.zig");
 
 const Matrix = @This();
-data: [*]align(16) u8,
-num_rows: u8,
-num_cols: u8,
+data: [*]align(16) u8 = undefined,
+num_rows: u8 = 0,
+num_cols: u8 = 0,
 
 /// Caller allows Matrix to manage the memory, should call `deinit`.
 pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8) std.mem.Allocator.Error!Matrix {
@@ -22,7 +22,7 @@ pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8) std.mem.Allocator.
 /// with the same `std.mem.Allocator` that was used to
 /// allocate `data`, and that `data` is not a sub-slice
 /// of any allocation.
-pub inline fn initWith(data: []align(16) u8, rows: u8, cols: u8) Matrix {
+pub fn initWith(data: []align(16) u8, rows: u8, cols: u8) Matrix {
     assert(mulWide(u8, rows, cols) == data.len);
     @memset(data, 0);
     return .{
@@ -60,19 +60,6 @@ pub fn resizeAndReset(self: *Matrix, allocator: std.mem.Allocator, rows: u8, col
 /// allowed to call this function.
 pub inline fn deinit(self: Matrix, allocator: std.mem.Allocator) void {
     allocator.free(self.getDataSlice());
-}
-
-/// Moves the matrix by copying the pointers and data,
-/// emptying the original (such that freeing it would be the,
-/// same as freeing and empty slice), and returns the copy.
-pub inline fn move(matrix: *Matrix) Matrix {
-    const moved = matrix.*;
-    matrix.* = Matrix{
-        .data = undefined,
-        .num_rows = 0,
-        .num_cols = 0,
-    };
-    return moved;
 }
 
 pub inline fn getCellCount(self: Matrix) u16 {
@@ -485,7 +472,8 @@ test subView {
     // bigger matrix
 
     if (!mat.resizeAndReset(std.testing.allocator, 5, 5)) {
-        mat.move().deinit(std.testing.allocator);
+        mat.deinit(std.testing.allocator);
+        mat = Matrix{};
         mat = try Matrix.init(std.testing.allocator, 5, 5);
     }
 

@@ -38,6 +38,22 @@ pub fn safeMemcpy(dst: anytype, src: anytype) void {
     }
 }
 
+pub inline fn ptrSizedReader(reader_ptr: anytype) PtrSizedReader(@TypeOf(reader_ptr.*)) {
+    return .{ .context = reader_ptr };
+}
+pub fn PtrSizedReader(comptime WrappedReader: type) type {
+    const gen = struct {
+        fn read(ptr: *const WrappedReader, buf: []u8) WrappedReader.Error!usize {
+            return @call(.always_inline, WrappedReader.read, .{ ptr.*, buf });
+        }
+    };
+    return std.io.Reader(*const WrappedReader, WrappedReader.Error, gen.read);
+}
+comptime {
+    const Wrapped = std.io.PeekStream(.{ .Static = 4096 }, std.fs.File.Reader);
+    assert(@sizeOf(PtrSizedReader(Wrapped.Reader)) == @sizeOf(*const Wrapped.Reader));
+}
+
 pub fn factorial(comptime n: u8) comptime_int {
     var r = 1;
     @setEvalBranchQuota(n +| 2);

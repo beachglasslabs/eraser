@@ -13,11 +13,11 @@ field: BinaryFiniteField,
 matrix: Matrix,
 
 /// 2^n field
-pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8, b: BinaryFiniteField.Exp) !BinaryFieldMatrix {
+pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8, exp: BinaryFiniteField.Exp) !BinaryFieldMatrix {
     var matrix = try Matrix.init(allocator, rows, cols);
     defer matrix.deinit(allocator);
 
-    const field = try BinaryFiniteField.init(b);
+    const field = try BinaryFiniteField.init(exp);
     return .{
         .field = field,
         .matrix = matrix.move(),
@@ -68,8 +68,14 @@ pub inline fn numCols(self: BinaryFieldMatrix) u8 {
     return self.matrix.num_cols;
 }
 
-pub fn get(self: BinaryFieldMatrix, idx: Matrix.CellIndex) u8 {
+pub inline fn getPtr(self: BinaryFieldMatrix, idx: Matrix.CellIndex) *u8 {
+    return self.matrix.getPtr(idx);
+}
+pub inline fn get(self: BinaryFieldMatrix, idx: Matrix.CellIndex) u8 {
     return self.matrix.get(idx);
+}
+pub inline fn set(self: BinaryFieldMatrix, idx: Matrix.CellIndex, value: u8) u8 {
+    return self.matrix.set(idx, value);
 }
 
 pub inline fn det(self: BinaryFieldMatrix) !u8 {
@@ -133,7 +139,7 @@ fn toCauchy(allocator: std.mem.Allocator, field: BinaryFiniteField, rows: u8, co
     assert(field.order >= rows + cols);
 
     var cnm = try Matrix.init(allocator, rows, cols);
-    defer cnm.deinit(allocator);
+    errdefer cnm.deinit(allocator);
 
     for (0..rows) |m_i| {
         for (0..cols) |n_i| {
@@ -143,7 +149,7 @@ fn toCauchy(allocator: std.mem.Allocator, field: BinaryFiniteField, rows: u8, co
         }
     }
 
-    return cnm.move();
+    return cnm;
 }
 
 pub fn format(
@@ -155,60 +161,85 @@ pub fn format(
     try self.matrix.format(fmt, opts, stream);
 }
 
+pub const IndexSet = std.bit_set.ArrayBitSet(u32, 255);
+
 pub fn subMatrix(
     self: BinaryFieldMatrix,
     allocator: std.mem.Allocator,
-    excluded_rows: []const u8,
-    excluded_cols: []const u8,
+    excluded_rows: IndexSet,
+    excluded_cols: IndexSet,
 ) !BinaryFieldMatrix {
-    const ex_rows: u8 = @intCast(excluded_rows.len);
-    const ex_cols: u8 = @intCast(excluded_cols.len);
+    const data = try allocator.alignedAlloc(u8, 16, self.subMatrixCellCount(excluded_rows, excluded_cols));
+    errdefer allocator.free(data);
+    return self.subMatrixWith(data, excluded_rows, excluded_cols);
+}
+pub fn subMatrixWith(
+    self: BinaryFieldMatrix,
+    data: []align(16) u8,
+    excluded_rows: IndexSet,
+    excluded_cols: IndexSet,
+) BinaryFieldMatrix {
+    assert(data.len == self.subMatrixCellCount(excluded_rows, excluded_cols));
+    assert(excluded_rows.count() < self.numRows());
+    assert(excluded_cols.count() < self.numCols());
 
-    var sub = try Matrix.init(allocator, self.numRows() - ex_rows, self.numCols() - ex_cols);
-    errdefer sub.deinit(allocator);
+    const sub_view: Matrix.SubView = .{
+        .parent = &self.matrix,
+        .excluded_rows = excluded_rows,
+        .excluded_cols = excluded_cols,
+    };
 
-    var i: usize = 0;
-    rblk: for (0..self.numRows()) |r| {
-        for (excluded_rows) |er| {
-            if (r == er) continue :rblk;
-        }
-        var j: usize = 0;
-        cblk: for (0..self.numCols()) |c| {
-            for (excluded_cols) |ec| {
-                if (c == ec) {
-                    continue :cblk;
-                }
-            }
-            sub.set(.{ .row = @intCast(i), .col = @intCast(j) }, self.matrix.get(.{ .row = @intCast(r), .col = @intCast(c) }));
-            j += 1;
-        }
-        i += 1;
-    }
-
-    return try BinaryFieldMatrix.initMatrix(sub, self.field.exp);
+    const sub_mat = Matrix.initWith(data, sub_view.numRows(), sub_view.numCols());
+    sub_view.copyInto(sub_mat);
+    return .{
+        .matrix = sub_mat,
+        .field = self.field,
+    };
+}
+pub fn subMatrixCellCount(
+    self: BinaryFieldMatrix,
+    excluded_rows: IndexSet,
+    excluded_cols: IndexSet,
+) u16 {
+    return Matrix.SubView.getCellCount(.{
+        .parent = &self.matrix,
+        .excluded_rows = excluded_rows,
+        .excluded_cols = excluded_cols,
+    });
 }
 
 pub fn cofactorize(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
-    std.debug.assert(self.numRows() == self.numCols());
+    assert(self.numRows() == self.numCols());
+    const data = try allocator.alignedAlloc(u8, 16, self.matrix.getCellCount());
+    errdefer allocator.free(data);
+    return try self.cofactorizeWith(data);
+}
 
-    var cof = try Matrix.init(allocator, self.numRows(), self.numCols());
-    errdefer cof.deinit(allocator);
+pub fn cofactorizeWith(self: BinaryFieldMatrix, data: []align(16) u8) !BinaryFieldMatrix {
+    assert(self.numRows() == self.numCols());
+    var result = Matrix.initWith(data, self.numRows(), self.numCols());
 
-    for (0..cof.numRows()) |r| {
-        for (0..cof.num_cols) |c| {
-            const sub = self.matrix.subView(&[_]u8{@intCast(r)}, &[_]u8{@intCast(c)});
-            cof.set(.{ .row = @intCast(r), .col = @intCast(c) }, try viewDet(self.field, &sub));
-            if ((r + c) % 2 == 1) {
-                cof.set(.{ .row = @intCast(r), .col = @intCast(c) }, try self.field.neg(cof.get(.{ .row = @intCast(r), .col = @intCast(c) })));
+    for (0..result.numRows()) |row_idx| {
+        for (0..result.numCols()) |col_idx| {
+            const idx: Matrix.CellIndex = .{
+                .row = @intCast(row_idx),
+                .col = @intCast(col_idx),
+            };
+
+            const sub = self.matrix.subView(&.{idx.row}, &.{idx.col});
+            var sub_det = try viewDet(self.field, &sub);
+            if ((row_idx + col_idx) % 2 == 1) {
+                sub_det = try self.field.neg(sub_det);
             }
+
+            result.set(idx, sub_det);
         }
     }
 
-    return try BinaryFieldMatrix.initMatrix(cof, self.field.exp);
-}
-
-pub fn cofactorizeInPlace(self: *BinaryFieldMatrix) !void {
-    _ = self;
+    return .{
+        .matrix = result,
+        .field = self.field,
+    };
 }
 
 pub inline fn transpose(self: *BinaryFieldMatrix) void {
@@ -216,7 +247,7 @@ pub inline fn transpose(self: *BinaryFieldMatrix) void {
     self.matrix.transpose();
 }
 
-pub fn scale(self: *BinaryFieldMatrix, factor: usize) !void {
+pub fn scale(self: *BinaryFieldMatrix, factor: u8) !void {
     assert(self.numRows() == self.numCols());
 
     for (0..self.numRows()) |r| {
@@ -229,8 +260,12 @@ pub fn scale(self: *BinaryFieldMatrix, factor: usize) !void {
 }
 
 pub fn invert(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
-    var imx = try self.cofactorize(allocator);
-    errdefer imx.deinit(allocator);
+    const data = try allocator.alignedAlloc(u8, 16, self.matrix.getCellCount());
+    errdefer allocator.free(data);
+    return try self.invertWith(data);
+}
+pub fn invertWith(self: BinaryFieldMatrix, data: []align(16) u8) !BinaryFieldMatrix {
+    var imx = try self.cofactorizeWith(data);
     imx.transpose();
 
     const determinant = try self.det();
@@ -238,47 +273,32 @@ pub fn invert(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFiel
     return imx;
 }
 
-pub fn invertInPlace(self: *BinaryFieldMatrix, allocator: std.mem.Allocator) !void {
-    _ = allocator;
-    _ = self;
+pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
+    const tmp_buf = try allocator.alignedAlloc(u8, 16, self.toBinaryTempBufCellCount());
+    defer allocator.free(tmp_buf);
+
+    const mat_buf = try allocator.alignedAlloc(u8, 16, self.toBinaryCellCount());
+    errdefer allocator.free(mat_buf);
+
+    return self.toBinaryWith(mat_buf, tmp_buf);
 }
 
-pub fn multiply(
-    self: BinaryFieldMatrix,
-    allocator: std.mem.Allocator,
-    z: u8,
-    other: BinaryFieldMatrix,
-) !BinaryFieldMatrix {
-    var matrix = try Matrix.init(allocator, self.numRows(), z);
-    errdefer matrix.deinit(allocator);
-
-    for (0..self.numRows()) |r| {
-        for (0..z) |c| {
-            for (0..self.numCols()) |i| {
-                const rc_idx: Matrix.CellIndex = .{ .row = @intCast(r), .col = @intCast(c) };
-                const multiplied = try self.field.mul(
-                    self.get(.{ .row = @intCast(r), .col = @intCast(i) }),
-                    other.get(.{ .row = @intCast(i), .col = @intCast(c) }),
-                );
-                const added = try self.field.add(matrix.get(rc_idx), multiplied);
-                matrix.set(rc_idx, added);
-            }
-        }
-    }
-
-    return try BinaryFieldMatrix.initMatrix(matrix, self.field.exp);
+pub fn toBinaryTempBufCellCount(self: BinaryFieldMatrix) u16 {
+    return mulWide(u8, self.field.exp, self.field.exp);
 }
-
+pub fn toBinaryCellCount(self: BinaryFieldMatrix) u16 {
+    return self.matrix.getCellCount() *
+        mulWide(BinaryFiniteField.Exp, self.field.exp, self.field.exp);
+}
 pub fn toBinaryWith(
     self: BinaryFieldMatrix,
-    allocator: std.mem.Allocator,
     /// the backing buffer that will be used for the matrix in the returned binary field matrix
     mat_buf: []align(16) u8,
+    tmp_buf: []align(16) u8,
 ) !BinaryFieldMatrix {
     var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.exp, self.numCols() * self.field.exp);
 
-    var bfm = try Matrix.init(allocator, self.field.exp, self.field.exp);
-    defer bfm.deinit(allocator);
+    var bfm = Matrix.initWith(tmp_buf, self.field.exp, self.field.exp);
 
     for (0..self.numRows()) |r| {
         for (0..self.numCols()) |c| {
@@ -301,10 +321,36 @@ pub fn toBinaryWith(
     return try BinaryFieldMatrix.initMatrix(matrix, 1);
 }
 
-pub fn toBinary(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
-    const mat_buf = try allocator.alignedAlloc(u8, 16, @as(usize, self.numRows()) * self.field.exp * self.numCols() * self.field.exp);
-    errdefer allocator.free(mat_buf);
-    return self.toBinaryWith(allocator, mat_buf);
+/// As of right now this is only used to ensure
+/// that matrices are invertible in tests.
+fn multiply(
+    self: BinaryFieldMatrix,
+    allocator: std.mem.Allocator,
+    z: u8,
+    other: BinaryFieldMatrix,
+) !BinaryFieldMatrix {
+    var matrix = try Matrix.init(allocator, self.numRows(), z);
+    errdefer matrix.deinit(allocator);
+
+    for (0..matrix.numRows()) |row_idx| {
+        for (0..matrix.numCols()) |col_idx| {
+            for (0..self.numCols()) |i| {
+                const idx: Matrix.CellIndex = .{ .row = @intCast(row_idx), .col = @intCast(col_idx) };
+
+                const multiplied = try self.field.mul(
+                    self.get(.{ .row = idx.row, .col = @intCast(i) }),
+                    other.get(.{ .row = @intCast(i), .col = idx.col }),
+                );
+                const added = try self.field.add(matrix.get(idx), multiplied);
+                matrix.set(idx, added);
+            }
+        }
+    }
+
+    return .{
+        .matrix = matrix,
+        .field = self.field,
+    };
 }
 
 test "square matrix" {
@@ -335,12 +381,14 @@ test "invertible sub-matrices" {
     var bfm = try BinaryFieldMatrix.initCauchy(std.testing.allocator, rows, cols, 3);
     defer bfm.deinit(std.testing.allocator);
 
-    const ex_rows = util.choose(&.{ 0, 1, 2, 3, 4 }, rows - cols);
-    inline for (ex_rows) |er| {
-        var submatrix = try bfm.subMatrix(std.testing.allocator, &er, &[_]u8{});
+    inline for (util.choose(&.{ 0, 1, 2, 3, 4 }, rows - cols)) |excluded_rows| {
+        comptime var ex_rows = IndexSet.initEmpty();
+        comptime for (excluded_rows) |ex_row| ex_rows.set(ex_row);
+
+        var submatrix = try bfm.subMatrix(std.testing.allocator, ex_rows, IndexSet.initEmpty());
         defer submatrix.deinit(std.testing.allocator);
 
-        try std.testing.expectEqual(bfm.numRows() - er.len, submatrix.numRows());
+        try std.testing.expectEqual(bfm.numRows() - ex_rows.count(), submatrix.numRows());
         try std.testing.expectEqual(bfm.numCols(), submatrix.numCols());
 
         var inverse = try submatrix.invert(std.testing.allocator);
