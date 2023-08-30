@@ -266,6 +266,21 @@ pub const IndexSet = struct {
             return result;
         }
     };
+
+    pub fn format(
+        self: IndexSet,
+        comptime fmt_str: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        var comma = false;
+        var iter = self.iterator();
+        while (iter.next()) |idx| {
+            if (comma) try writer.writeAll(", ");
+            comma = true;
+            try std.fmt.formatType(idx, fmt_str, options, writer, undefined);
+        }
+    }
 };
 
 /// All integers in the provided each of the slices should be unique

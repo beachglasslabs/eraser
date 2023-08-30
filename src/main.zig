@@ -175,25 +175,7 @@ fn decodeCommand(
     const random = prng.random();
 
     const excluded_shards = erasure.sampleIndexSet(random, ec.shardCount(), ec.shardCount() - ec.shardSize());
-    const ShardListFmt = struct {
-        set: *const erasure.IndexSet,
-        pub fn format(
-            this: @This(),
-            comptime _: []const u8,
-            _: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            var iter = this.set.iterator();
-            var comma: bool = false;
-            while (iter.next()) |idx| {
-                if (comma) {
-                    try writer.writeAll(", ");
-                } else comma = true;
-                try writer.print("{d}", .{idx});
-            }
-        }
-    };
-    std.log.info("excluding shards {}", .{ShardListFmt{ .set = &excluded_shards }});
+    std.log.info("excluding shards {}", .{excluded_shards});
 
     const data_file = try std.fs.cwd().createFile(data_filename, .{});
     defer data_file.close();
@@ -205,7 +187,6 @@ fn decodeCommand(
     defer for (code_files.constSlice()) |cf| cf.close();
 
     for (0..ec.shardCount()) |i| {
-        // if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
         if (excluded_shards.isSet(@intCast(i))) continue;
         var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
         code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
