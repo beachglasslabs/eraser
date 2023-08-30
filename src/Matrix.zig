@@ -6,13 +6,13 @@ const mulWide = std.math.mulWide;
 const util = @import("util.zig");
 
 const Matrix = @This();
-data: [*]align(16) u8 = undefined,
+data: [*]u8 = undefined,
 num_rows: u8 = 0,
 num_cols: u8 = 0,
 
 /// Caller allows Matrix to manage the memory, should call `deinit`.
 pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8) std.mem.Allocator.Error!Matrix {
-    const data = try allocator.alignedAlloc(u8, 16, mulWide(u8, rows, cols));
+    const data = try allocator.alloc(u8, mulWide(u8, rows, cols));
     errdefer allocator.free(data);
     return Matrix.initWith(data, rows, cols);
 }
@@ -22,7 +22,7 @@ pub fn init(allocator: std.mem.Allocator, rows: u8, cols: u8) std.mem.Allocator.
 /// with the same `std.mem.Allocator` that was used to
 /// allocate `data`, and that `data` is not a sub-slice
 /// of any allocation.
-pub fn initWith(data: []align(16) u8, rows: u8, cols: u8) Matrix {
+pub fn initWith(data: []u8, rows: u8, cols: u8) Matrix {
     assert(mulWide(u8, rows, cols) == data.len);
     @memset(data, 0);
     return .{
@@ -33,21 +33,19 @@ pub fn initWith(data: []align(16) u8, rows: u8, cols: u8) Matrix {
 }
 
 pub fn clone(self: Matrix, allocator: std.mem.Allocator) !Matrix {
-    const data = try allocator.alignedAlloc(u8, 16, self.getCellCount());
+    const data = try allocator.alloc(u8, self.getCellCount());
     errdefer allocator.free(data);
     return self.cloneWith(data);
 }
 
-pub fn cloneWith(self: Matrix, data: []align(16) u8) Matrix {
-    @memcpy(data, self.getDataSlice());
-    return Matrix.initWith(data, self.num_rows, self.num_cols);
+pub fn copyInto(self: Matrix, dst: Matrix) void {
+    util.safeMemcpy(dst.getDataSlice(), self.getDataSlice());
 }
 
 /// Attempts to reallocate the matrix to the specified row & column lengths, zeroing out the cells.
 /// Returns true if the resize was successful. Otherwise, returns false, and the data is left unmodified.
 pub fn resizeAndReset(self: *Matrix, allocator: std.mem.Allocator, rows: u8, cols: u8) bool {
     const new_size = mulWide(u8, rows, cols);
-
     const result = allocator.resize(self.getDataSlice(), new_size);
     if (result) {
         const resized_slice = self.data[0..new_size];
@@ -62,10 +60,6 @@ pub inline fn deinit(self: Matrix, allocator: std.mem.Allocator) void {
     allocator.free(self.getDataSlice());
 }
 
-pub inline fn getCellCount(self: Matrix) u16 {
-    return mulWide(u8, self.num_rows, self.num_cols);
-}
-
 pub inline fn numRows(self: Matrix) u8 {
     return self.num_rows;
 }
@@ -73,54 +67,82 @@ pub inline fn numCols(self: Matrix) u8 {
     return self.num_cols;
 }
 
-pub const CellIndex = packed struct(u16) { row: u8, col: u8 };
+pub inline fn getCellCount(self: Matrix) u16 {
+    return calcCellCount(self.numRows(), self.numCols());
+}
+pub inline fn calcCellCount(rows: u8, cols: u8) u16 {
+    return mulWide(u8, rows, cols);
+}
+
+pub const CellIndex = packed struct {
+    row: u8,
+    col: u8,
+
+    pub fn toLinear(
+        idx: CellIndex,
+        /// maximum valid index of the matrix (as in `.{ .row = matrix.numRows() - 1, .col = matrix.numCols() - 1 }`)
+        max: CellIndex,
+    ) u16 {
+        const num_rows = max.row + 1;
+        const num_cols = max.col + 1;
+
+        assert(idx.row < num_rows);
+        assert(idx.col < num_cols);
+
+        return mulWide(u8, idx.row, num_cols) + idx.col;
+    }
+};
 
 pub fn getPtr(self: Matrix, idx: CellIndex) *u8 {
-    if (idx.row >= self.numRows()) std.debug.print("{} {}\n", .{ idx.row, self.numRows() });
-    assert(idx.row < self.numRows());
-    assert(idx.col < self.numCols());
-    const i = mulWide(u8, idx.row, self.num_cols) + idx.col;
+    const i = idx.toLinear(.{
+        .row = self.numRows() - 1,
+        .col = self.numCols() - 1,
+    });
     return &self.data[i];
 }
 
-pub fn get(self: Matrix, idx: CellIndex) u8 {
+pub inline fn get(self: Matrix, idx: CellIndex) u8 {
     return self.getPtr(idx).*;
 }
 
-pub fn set(self: *Matrix, idx: CellIndex, value: u8) void {
+pub inline fn set(self: *Matrix, idx: CellIndex, value: u8) void {
     self.getPtr(idx).* = value;
 }
 
 pub fn transpose(self: *Matrix) void {
-    assert(self.num_rows == self.num_cols);
-    for (0..self.num_rows) |row| {
-        for (0..self.num_cols) |col| {
+    assert(self.numRows() == self.numCols());
+
+    for (0..self.numRows()) |row| {
+        for (0..self.numCols()) |col| {
             if (row == col) break;
             const row_col_idx: CellIndex = .{ .row = @intCast(row), .col = @intCast(col) };
             const col_row_idx: CellIndex = .{ .row = @intCast(col), .col = @intCast(row) };
 
-            const at_row_col = self.get(row_col_idx);
-            const at_col_row = self.get(col_row_idx);
+            const at_row_col = self.getPtr(row_col_idx);
+            const at_col_row = self.getPtr(col_row_idx);
 
-            self.set(row_col_idx, at_col_row);
-            self.set(col_row_idx, at_row_col);
+            std.mem.swap(u8, at_row_col, at_col_row);
         }
     }
 }
 
-pub fn loadRow(self: Matrix, row: u8, dst: []u8) []u8 {
-    @memcpy(dst[0..self.numRows()], self.getRow(row));
-}
+pub const getSlice = getRow;
 
-pub fn getSlice(self: Matrix, row: u8) []u8 {
+pub fn getRow(self: Matrix, row: u8) []u8 {
     assert(row < self.num_rows);
     const i = mulWide(u8, row, self.num_cols);
     return self.data[i..][0..self.num_cols];
 }
 
-pub const getRow = getSlice;
+pub inline fn rowIterator(self: *const Matrix, row: u8) SegmentIterator(.row) {
+    return .{
+        .mat = self,
+        .row_index = row,
+        .col_index = 0,
+    };
+}
 
-pub inline fn colIterator(self: *const Matrix, col: u8) ColIterator {
+pub inline fn colIterator(self: *const Matrix, col: u8) SegmentIterator(.col) {
     return .{
         .mat = self,
         .row_index = 0,
@@ -128,33 +150,48 @@ pub inline fn colIterator(self: *const Matrix, col: u8) ColIterator {
     };
 }
 
-pub const ColIterator = struct {
-    mat: *const Matrix,
-    row_index: u8,
-    col_index: u8,
+pub const IteratorOrder = enum { row, col };
 
-    pub inline fn next(self: *ColIterator) ?u8 {
-        const ptr = self.nextPtr() orelse return null;
-        return ptr.*;
-    }
-    pub inline fn nextPtr(self: *ColIterator) ?*u8 {
-        if (self.row_index == self.mat.num_rows) return null;
-        self.row_index += 1;
-        return self.mat.getPtr(.{
-            .row = self.row_index - 1,
-            .col = self.col_index,
-        });
-    }
-};
+pub fn SegmentIterator(comptime order: IteratorOrder) type {
+    return struct {
+        mat: *const Matrix,
+        row_index: u8,
+        col_index: u8,
+        const Self = @This();
 
-pub fn setSlice(self: *Matrix, rc: u8, new_rc: []const u8) void {
+        pub inline fn next(self: *Self) ?u8 {
+            const ptr = self.nextPtr() orelse return null;
+            return ptr.*;
+        }
+        pub inline fn nextPtr(self: *Self) ?*u8 {
+            switch (order) {
+                .row => {
+                    if (self.col_index == self.mat.numCols()) return null;
+                    self.col_index += 1;
+                    return self.mat.getPtr(.{
+                        .row = self.row_index,
+                        .col = self.col_index - 1,
+                    });
+                },
+                .col => {
+                    if (self.row_index == self.mat.numRows()) return null;
+                    self.row_index += 1;
+                    return self.mat.getPtr(.{
+                        .row = self.row_index - 1,
+                        .col = self.col_index,
+                    });
+                },
+            }
+        }
+    };
+}
+
+pub const setSlice = setRow;
+
+pub fn setRow(self: *Matrix, rc: u8, new_rc: []const u8) void {
     assert(rc < self.num_rows);
     assert(new_rc.len == self.num_cols);
     util.safeMemcpy(self.getSlice(rc)[0..self.num_cols], new_rc);
-}
-
-pub inline fn setRow(self: *Matrix, row: u8, new_row: []const u8) void {
-    self.setSlice(row, new_row);
 }
 
 pub fn setCol(self: *Matrix, col: u8, new_col: []const u8) void {
@@ -164,53 +201,106 @@ pub fn setCol(self: *Matrix, col: u8, new_col: []const u8) void {
     }
 }
 
+pub const IndexSet = struct {
+    bits: Bits = 0,
+
+    pub const Bits = std.meta.Int(.unsigned, std.math.maxInt(u8));
+    pub const Index = u8;
+
+    inline fn indexMask(index: Index) Bits {
+        return @as(Bits, 1) << index;
+    }
+
+    pub inline fn initOne(index: Index) IndexSet {
+        return .{ .bits = indexMask(index) };
+    }
+    pub inline fn initMany(indices: []const Index) IndexSet {
+        var result = IndexSet{};
+        for (indices) |idx|
+            result.set(idx);
+        return result;
+    }
+
+    pub inline fn count(self: IndexSet) Index {
+        return @popCount(self.bits);
+    }
+    pub inline fn first(self: IndexSet) ?Index {
+        const trailing_zeroes = @ctz(self.bits);
+        return switch (trailing_zeroes) {
+            @bitSizeOf(Bits) => null,
+            else => trailing_zeroes,
+        };
+    }
+    pub inline fn last(self: IndexSet) ?Index {
+        const idx_plus_one = @bitSizeOf(Bits) - @clz(self.bits);
+        if (idx_plus_one == 0) return null;
+        return idx_plus_one - 1;
+    }
+
+    pub inline fn set(self: *IndexSet, index: Index) void {
+        self.bits |= indexMask(index);
+    }
+
+    pub inline fn unset(self: *IndexSet, index: Index) void {
+        self.bits &= ~indexMask(index);
+    }
+
+    pub inline fn isSet(self: IndexSet, index: Index) bool {
+        return self.bits & indexMask(index) != 0;
+    }
+
+    pub inline fn unionWith(self: IndexSet, other: IndexSet) IndexSet {
+        return .{ .bits = self.bits | other.bits };
+    }
+
+    pub inline fn iterator(self: IndexSet) Iterator {
+        return .{ .idx_set = self };
+    }
+
+    pub const Iterator = struct {
+        idx_set: IndexSet,
+
+        pub inline fn next(iter: *Iterator) ?Index {
+            const result = iter.idx_set.first() orelse return null;
+            iter.idx_set.unset(result);
+            return result;
+        }
+    };
+};
+
 /// All integers in the provided each of the slices should be unique
 pub inline fn subView(
     self: *const Matrix,
-    excluded_rows: []const u8,
-    excluded_cols: []const u8,
+    excluded_rows: IndexSet,
+    excluded_cols: IndexSet,
 ) SubView {
-    const full_view = SubView{
-        .parent = self,
-        .excluded_rows = SubView.SegmentSet.initEmpty(),
-        .excluded_cols = SubView.SegmentSet.initEmpty(),
-    };
-    return full_view.subView(excluded_rows, excluded_cols);
+    return SubView.subView(
+        .{ .parent = self },
+        excluded_rows,
+        excluded_cols,
+    );
 }
 
 pub const SubView = struct {
     parent: *const Matrix,
-    // excluded_rows: []const u8,
-    // excluded_cols: []const u8,
-    excluded_rows: SegmentSet = SegmentSet.initEmpty(),
-    excluded_cols: SegmentSet = SegmentSet.initEmpty(),
-
-    pub const SegmentSet = std.bit_set.ArrayBitSet(u32, std.math.maxInt(u8));
+    excluded_rows: IndexSet = IndexSet{},
+    excluded_cols: IndexSet = IndexSet{},
 
     pub fn subView(
         self: SubView,
-        excluded_rows: []const u8,
-        excluded_cols: []const u8,
+        excluded_rows: IndexSet,
+        excluded_cols: IndexSet,
     ) SubView {
-        assert(excluded_rows.len <= self.numRows());
-        assert(excluded_cols.len <= self.numCols());
+        assert(excluded_rows.count() <= self.numRows());
+        assert(excluded_cols.count() <= self.numCols());
 
-        var ex_rows = self.excluded_rows;
-        for (excluded_rows) |row| {
-            assert(row < self.numRows());
-            ex_rows.set(subRcIndexToParentRcIdx(row, self.excluded_rows));
-        }
-
-        var ex_cols = self.excluded_cols;
-        for (excluded_cols) |col| {
-            assert(col < self.numCols());
-            ex_cols.set(subRcIndexToParentRcIdx(col, self.excluded_cols));
-        }
+        if (excluded_rows.last()) |idx| assert(idx < self.numRows());
+        if (excluded_cols.last()) |idx| assert(idx < self.numCols());
 
         return .{
             .parent = self.parent,
-            .excluded_rows = ex_rows,
-            .excluded_cols = ex_cols,
+            .excluded_rows = self.excluded_rows.unionWith(excluded_rows),
+            .excluded_cols = self.excluded_cols.unionWith(excluded_cols),
         };
     }
 
@@ -250,27 +340,7 @@ pub const SubView = struct {
         self.getPtr(idx).* = val;
     }
 
-    inline fn subIndexToParentIdx(self: SubView, idx: CellIndex) CellIndex {
-        assert(idx.row < self.numRows());
-        assert(idx.col < self.numCols());
-        return CellIndex{
-            .row = subRcIndexToParentRcIdx(idx.row, self.excluded_rows),
-            .col = subRcIndexToParentRcIdx(idx.col, self.excluded_cols),
-        };
-    }
-
-    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: SegmentSet) u8 {
-        var result: u8 = rc_idx;
-        var iter = excluded.iterator(.{});
-        while (true) {
-            const ex: u8 = @intCast(iter.next() orelse break);
-            if (result < ex) break;
-            result += 1;
-        }
-        return result;
-    }
-
-    pub inline fn rowIterator(self: *const SubView, row_idx: u8) SubIterator(.row) {
+    pub inline fn rowIterator(self: *const SubView, row_idx: u8) SubSegmentIterator(.row) {
         return .{
             .view = self,
             .row_index = row_idx,
@@ -278,7 +348,7 @@ pub const SubView = struct {
         };
     }
 
-    pub inline fn colIterator(self: *const SubView, col_idx: u8) SubIterator(.col) {
+    pub inline fn colIterator(self: *const SubView, col_idx: u8) SubSegmentIterator(.col) {
         return .{
             .view = self,
             .row_index = 0,
@@ -286,8 +356,7 @@ pub const SubView = struct {
         };
     }
 
-    pub const SubIteratorOrder = enum { row, col };
-    pub fn SubIterator(comptime order: SubIteratorOrder) type {
+    pub fn SubSegmentIterator(comptime order: IteratorOrder) type {
         return struct {
             view: *const SubView,
             row_index: u8,
@@ -320,6 +389,26 @@ pub const SubView = struct {
             }
         };
     }
+
+    inline fn subIndexToParentIdx(self: SubView, idx: CellIndex) CellIndex {
+        assert(idx.row < self.numRows());
+        assert(idx.col < self.numCols());
+        return CellIndex{
+            .row = subRcIndexToParentRcIdx(idx.row, self.excluded_rows),
+            .col = subRcIndexToParentRcIdx(idx.col, self.excluded_cols),
+        };
+    }
+
+    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: IndexSet) u8 {
+        var result: u8 = rc_idx;
+        var iter = excluded.iterator();
+        while (true) {
+            const ex: u8 = @intCast(iter.next() orelse break);
+            if (result < ex) break;
+            result += 1;
+        }
+        return result;
+    }
 };
 
 pub fn format(self: *const Matrix, comptime _: []const u8, _: std.fmt.FormatOptions, stream: anytype) !void {
@@ -332,7 +421,8 @@ pub fn format(self: *const Matrix, comptime _: []const u8, _: std.fmt.FormatOpti
     }
 }
 
-inline fn getDataSlice(self: Matrix) []align(16) u8 {
+/// The full raw data slice backing the matrix
+pub inline fn getDataSlice(self: Matrix) []u8 {
     return self.data[0..self.getCellCount()];
 }
 
@@ -437,9 +527,20 @@ test subView {
     mat.setRow(2, &.{ 7, 8, 9 });
 
     // non-exclusionary sub-view
+    var submat = mat.subView(.{}, .{});
+    try std.testing.expectEqual(@as(u8, 3), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 3), submat.numCols());
+
+    try expectSubSegment(submat, .row, 0, &.{ 1, 2, 3 });
+    try expectSubSegment(submat, .row, 1, &.{ 4, 5, 6 });
+    try expectSubSegment(submat, .row, 2, &.{ 7, 8, 9 });
+
+    try expectSubSegment(submat, .col, 0, &.{ 1, 4, 7 });
+    try expectSubSegment(submat, .col, 1, &.{ 2, 5, 8 });
+    try expectSubSegment(submat, .col, 2, &.{ 3, 6, 9 });
 
     // exclusionary sub-views
-    var submat = mat.subView(&.{0}, &.{});
+    submat = mat.subView(IndexSet.initOne(0), .{});
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 3), submat.numCols());
 
@@ -450,7 +551,7 @@ test subView {
     try expectSubSegment(submat, .col, 1, &.{ 5, 8 });
     try expectSubSegment(submat, .col, 2, &.{ 6, 9 });
 
-    submat = submat.subView(&.{}, &.{1});
+    submat = submat.subView(.{}, IndexSet.initOne(1));
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 2), submat.numCols());
 
@@ -460,7 +561,7 @@ test subView {
     try expectSubSegment(submat, .col, 0, &.{ 4, 7 });
     try expectSubSegment(submat, .col, 1, &.{ 6, 9 });
 
-    submat = mat.subView(&.{1}, &.{ 0, 2 });
+    submat = mat.subView(IndexSet.initOne(1), IndexSet.initMany(&.{ 0, 2 }));
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 1), submat.numCols());
 
@@ -486,7 +587,7 @@ test subView {
     mat.setRow(4, &.{ 21, 22, 23, 24, 25 });
     // zig fmt: on
 
-    submat = mat.subView(&.{ 1, 3 }, &.{ 1, 3 });
+    submat = mat.subView(IndexSet.initMany(&.{ 1, 3 }), IndexSet.initMany(&.{ 1, 3 }));
     try std.testing.expectEqual(@as(u8, 3), submat.numRows());
     try std.testing.expectEqual(@as(u8, 3), submat.numCols());
 
@@ -500,21 +601,21 @@ test subView {
     try expectSubSegment(submat, .col, 1, &.{ 3, 13, 23 });
     try expectSubSegment(submat, .col, 2, &.{ 5, 15, 25 });
 
-    submat = submat.subView(&.{0}, &.{});
+    submat = submat.subView(IndexSet.initOne(0), .{});
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 3), submat.numCols());
 
     try expectSubSegment(submat, .row, 0, &.{ 11, 13, 15 });
     try expectSubSegment(submat, .row, 1, &.{ 21, 23, 25 });
 
-    submat = submat.subView(&.{}, &.{0});
+    submat = submat.subView(.{}, IndexSet.initOne(0));
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 2), submat.numCols());
 
     try expectSubSegment(submat, .row, 0, &.{ 13, 15 });
     try expectSubSegment(submat, .row, 1, &.{ 23, 25 });
 
-    submat = mat.subView(&.{0}, &.{});
+    submat = mat.subView(IndexSet.initOne(0), .{});
     try std.testing.expectEqual(@as(u8, 4), submat.numRows());
     try std.testing.expectEqual(@as(u8, 5), submat.numCols());
 

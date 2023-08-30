@@ -3,7 +3,7 @@ const mulWide = std.math.mulWide;
 const assert = std.debug.assert;
 
 const util = @import("util.zig");
-const BinaryFiniteField = @import("BinaryFiniteField.zig");
+const galois = @import("galois.zig");
 const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
 fn roundByteSize(comptime T: type) comptime_int {
@@ -18,30 +18,29 @@ pub fn ErasureCoder(comptime T: type) type {
     return struct {
         bf_mat: BinaryFieldMatrix,
 
-        // TODO: look into making all of these separate allocations into a single
-        // allocation to reduce fragmentation, and reduce cache contention.
         encoder_bf_mat_bin: BinaryFieldMatrix,
 
-        decoder_bf_sub_mat_buf: []align(16) u8,
-        decoder_bf_mat_inv_buf: []align(16) u8,
-        decoder_bf_mat_bin_buf: []align(16) u8,
-        decoder_bf_mat_bin_tmp_buf: []align(16) u8,
+        decoder_buf_full_allocation: []u8,
+
+        decoder_sub_mat_buf: []u8,
+        decoder_mat_inv_buf: []u8,
+        decoder_mat_bin_buf: []u8,
+        decoder_mat_bin_tmp_buf: []u8,
 
         block_buffer: []T,
-        word_buffer: [][word_size]u8,
         streams_buffer: []align(@alignOf(*anyopaque)) u8,
         const Self = @This();
 
         pub const word_size = roundByteSize(T);
-        const Exp = BinaryFiniteField.Exp;
+        const Exp = galois.BinaryField.Exp;
 
         pub const ReadOutput = struct {
             block: []T,
             state: ReadState,
         };
 
-        pub fn init(allocator: std.mem.Allocator, shard_count: u8, shard_size: u8) !Self {
-            const exp = try calcExponent(shard_count, shard_size);
+        pub fn init(allocator: std.mem.Allocator, shard_count: u7, shard_size: u7) !Self {
+            const exp = try calcGaloisFieldExponent(shard_count, shard_size);
 
             const bf_mat = try BinaryFieldMatrix.initCauchy(allocator, shard_count, shard_size, exp);
             errdefer bf_mat.deinit(allocator);
@@ -49,23 +48,28 @@ pub fn ErasureCoder(comptime T: type) type {
             const encoder_bf_mat_bin = try bf_mat.toBinary(allocator);
             errdefer encoder_bf_mat_bin.deinit(allocator);
 
-            const decoder_bf_sub_mat_buf = try allocator.alignedAlloc(u8, 16, bf_mat.matrix.getCellCount());
-            errdefer allocator.free(decoder_bf_sub_mat_buf);
+            const decoder_buf_full_alloc = try allocator.alloc(
+                u8,
+                @as(usize, 0) +
+                    bf_mat.matrix.getCellCount() +
+                    bf_mat.matrix.getCellCount() +
+                    bf_mat.toBinaryCellCount() +
+                    bf_mat.toBinaryTempBufCellCount(),
+            );
+            errdefer allocator.free(decoder_buf_full_alloc);
 
-            const decoder_bf_mat_inv_buf = try allocator.alignedAlloc(u8, 16, bf_mat.matrix.getCellCount());
-            errdefer allocator.free(decoder_bf_mat_inv_buf);
+            var decoder_buf_fba_state = std.heap.FixedBufferAllocator.init(decoder_buf_full_alloc);
+            const decoder_buf_fba = decoder_buf_fba_state.allocator();
 
-            const decoder_bf_mat_bin_buf = try allocator.alignedAlloc(u8, 16, bf_mat.toBinaryCellCount());
-            errdefer allocator.free(decoder_bf_mat_bin_buf);
+            const decoder_sub_mat_buf = decoder_buf_fba.alloc(u8, bf_mat.matrix.getCellCount()) catch unreachable;
+            const decoder_mat_inv_buf = decoder_buf_fba.alloc(u8, bf_mat.matrix.getCellCount()) catch unreachable;
+            const decoder_mat_bin_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryCellCount()) catch unreachable;
+            const decoder_mat_bin_tmp_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryTempBufCellCount()) catch unreachable;
 
-            const decoder_bf_mat_bin_tmp_buf = try allocator.alignedAlloc(u8, 16, bf_mat.toBinaryTempBufCellCount());
-            errdefer allocator.free(decoder_bf_mat_bin_tmp_buf);
+            decoder_buf_fba_state = undefined;
 
             const block_buffer = try allocator.alloc(T, mulWide(u8, exp, shard_size));
             errdefer allocator.free(block_buffer);
-
-            const word_buffer = try allocator.alloc([word_size]u8, mulWide(u8, exp, shard_size));
-            errdefer allocator.free(word_buffer);
 
             const MinReader = util.PtrSizedReader(std.fs.File.Reader);
             const MinPeekStream = std.io.PeekStream(.{ .Static = word_size }, MinReader);
@@ -77,40 +81,36 @@ pub fn ErasureCoder(comptime T: type) type {
             return .{
                 .bf_mat = bf_mat,
 
+                .decoder_buf_full_allocation = decoder_buf_full_alloc,
                 .encoder_bf_mat_bin = encoder_bf_mat_bin,
-                .decoder_bf_sub_mat_buf = decoder_bf_sub_mat_buf,
-                .decoder_bf_mat_inv_buf = decoder_bf_mat_inv_buf,
-                .decoder_bf_mat_bin_buf = decoder_bf_mat_bin_buf,
-                .decoder_bf_mat_bin_tmp_buf = decoder_bf_mat_bin_tmp_buf,
+                .decoder_sub_mat_buf = decoder_sub_mat_buf,
+                .decoder_mat_inv_buf = decoder_mat_inv_buf,
+                .decoder_mat_bin_buf = decoder_mat_bin_buf,
+                .decoder_mat_bin_tmp_buf = decoder_mat_bin_tmp_buf,
 
                 .block_buffer = block_buffer,
-                .word_buffer = word_buffer,
                 .streams_buffer = streams_buffer,
             };
         }
 
         pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
             allocator.free(self.streams_buffer);
-            allocator.free(self.word_buffer);
             allocator.free(self.block_buffer);
 
-            allocator.free(self.decoder_bf_mat_bin_tmp_buf);
-            allocator.free(self.decoder_bf_mat_bin_buf);
-            allocator.free(self.decoder_bf_mat_inv_buf);
-            allocator.free(self.decoder_bf_sub_mat_buf);
+            allocator.free(self.decoder_buf_full_allocation);
 
             self.encoder_bf_mat_bin.deinit(allocator);
             self.bf_mat.deinit(allocator);
         }
 
         pub inline fn exponent(self: Self) Exp {
-            return self.bf_mat.field.exp;
+            return self.bf_mat.field.exponent();
         }
-        pub inline fn shardCount(self: Self) u8 {
-            return self.bf_mat.matrix.numRows();
+        pub inline fn shardCount(self: Self) u7 {
+            return @intCast(self.bf_mat.matrix.numRows());
         }
-        pub inline fn shardSize(self: Self) u8 {
-            return self.bf_mat.matrix.numCols();
+        pub inline fn shardSize(self: Self) u7 {
+            return @intCast(self.bf_mat.matrix.numCols());
         }
 
         const ChunkSize = std.math.IntFittingRange(0, roundByteSize(T) * std.math.maxInt(Exp));
@@ -131,12 +131,27 @@ pub fn ErasureCoder(comptime T: type) type {
             /// `std.io.Reader(...)`
             in_fifo_reader: anytype,
             /// `[]const std.io.Writer(...)`
-            out_fifos_writers: anytype,
+            out_fifo_writers: anytype,
         ) !usize {
-            var it_enc = self.iterativeEncoder(in_fifo_reader, self.encoder_bf_mat_bin);
             const block = self.block_buffer;
-            while (try it_enc.advance(block, out_fifos_writers)) {}
-            return it_enc.size;
+            var size: usize = 0;
+            while (true) {
+                const rs = try readDataBlock(T, block, in_fifo_reader);
+                try writeCodeBlock(T, self.encoder_bf_mat_bin, block, out_fifo_writers, .{
+                    .shard_count = self.shardCount(),
+                    .shard_size = self.shardSize(),
+                });
+                switch (rs) {
+                    .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardSize()),
+                    .done => {
+                        var buffer = [_]u8{0} ** word_size;
+                        std.mem.writeIntBig(T, &buffer, block[block.len - 1]);
+                        size += buffer[buffer.len - 1];
+                        break;
+                    },
+                }
+            }
+            return size;
         }
 
         pub fn decode(
@@ -150,17 +165,22 @@ pub fn ErasureCoder(comptime T: type) type {
             assert(excluded_shards.count() == (self.shardCount() - self.shardSize()));
             assert(in_fifos.len == self.shardSize());
 
-            const decoder_sub_buf = self.decoder_bf_sub_mat_buf[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet.initEmpty())];
-            const decoder_sub = self.bf_mat.subMatrixWith(decoder_sub_buf, excluded_shards, IndexSet.initEmpty());
+            const decoder_bin = blk: {
+                const decoder_sub_buf = self.decoder_sub_mat_buf[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet{})];
+                const decoder_sub = self.bf_mat.subMatrixWith(decoder_sub_buf, excluded_shards, IndexSet{});
 
-            const decoder_inv_buf = self.decoder_bf_mat_inv_buf[0..decoder_sub.matrix.getCellCount()];
-            const decoder_inv = try decoder_sub.invertWith(decoder_inv_buf);
+                const decoder_inv_buf = self.decoder_mat_inv_buf[0..decoder_sub.matrix.getCellCount()];
+                const decoder_inv = try decoder_sub.invertWith(decoder_inv_buf);
 
-            const decoder_bin_buf = self.decoder_bf_mat_bin_buf[0..decoder_inv.toBinaryCellCount()];
-            const decoder_bin_tmp_buf = self.decoder_bf_mat_bin_tmp_buf[0..decoder_inv.toBinaryTempBufCellCount()];
-            const decoder_bin = try decoder_inv.toBinaryWith(decoder_bin_buf, decoder_bin_tmp_buf);
+                const decoder_bin_buf = self.decoder_mat_bin_buf[0..decoder_inv.toBinaryCellCount()];
+                const decoder_bin_tmp_buf = self.decoder_mat_bin_tmp_buf[0..decoder_inv.toBinaryTempBufCellCount()];
 
-            const PeekStream = std.io.PeekStream(.{ .Static = word_size }, util.PtrSizedReader(@TypeOf(in_fifos[0])));
+                break :blk try decoder_inv.toBinaryWith(decoder_bin_buf, decoder_bin_tmp_buf);
+            };
+
+            const InFifo = @TypeOf(in_fifos[0]);
+            const PeekStream = std.io.PeekStream(.{ .Static = word_size }, util.PtrSizedReader(InFifo));
+
             const peek_streams = std.mem.bytesAsSlice(PeekStream, self.streams_buffer);
             for (peek_streams, in_fifos) |*stream, *in_fifo| {
                 stream.* = std.io.peekStream(word_size, util.ptrSizedReader(in_fifo));
@@ -169,8 +189,12 @@ pub fn ErasureCoder(comptime T: type) type {
             var size: usize = 0;
             while (true) {
                 const block = self.block_buffer;
-                const rs = try self.readCodeBlock(block, peek_streams);
-                const write_size = try self.writeDataBlock(decoder_bin, block, out_fifo_writer, rs == .done);
+                const rs = try readCodeBlock(T, self.exponent(), block, peek_streams);
+                const write_size = try writeDataBlock(T, out_fifo_writer, .{
+                    .decoder = decoder_bin,
+                    .code_block = block,
+                    .done = rs == .done,
+                });
                 size += write_size;
                 switch (rs) {
                     .done => break,
@@ -179,122 +203,6 @@ pub fn ErasureCoder(comptime T: type) type {
             }
 
             return size;
-        }
-
-        pub fn iterativeEncoder(
-            self: *const Self,
-            in_fifo_reader: anytype,
-            encoder_bin: BinaryFieldMatrix,
-        ) IterativeEncoder(@TypeOf(in_fifo_reader)) {
-            return .{
-                .exp = self.exponent(),
-                .shard_count = self.shardCount(),
-                .shard_size = self.shardSize(),
-                .in_reader = in_fifo_reader,
-                .encoder_bin = encoder_bin,
-            };
-        }
-
-        pub fn IterativeEncoder(comptime InReader: type) type {
-            return struct {
-                exp: Exp,
-                shard_count: u8,
-                shard_size: u8,
-                in_reader: InReader,
-                encoder_bin: BinaryFieldMatrix,
-                size: usize = 0,
-
-                /// Returns true if there is still more left to encode,
-                /// returns false if everything has been encoded.
-                pub fn advance(
-                    enc: *@This(),
-                    block: []T,
-                    /// `[]const std.io.Writer(...)`
-                    out_fifo_writers: anytype,
-                ) !bool {
-                    const rs = try readDataBlock(T, block, enc.in_reader);
-                    try writeCodeBlock(T, enc.encoder_bin, block, out_fifo_writers, .{
-                        .shard_count = enc.shard_count,
-                        .shard_size = enc.shard_size,
-                    });
-                    switch (rs) {
-                        .in_progress => enc.size += calcDataBlockSize(calcChunkSize(word_size, enc.exp), enc.shard_size),
-                        .done => {
-                            var buffer = [_]u8{0} ** word_size;
-                            std.mem.writeIntBig(T, &buffer, block[block.len - 1]);
-                            enc.size += buffer[buffer.len - 1];
-                        },
-                    }
-                    return rs == .in_progress;
-                }
-            };
-        }
-
-        pub fn readCodeBlock(
-            self: Self,
-            /// `[]const std.io.Reader(...)`
-            block: []T,
-            in_fifos_reader_slice: anytype,
-        ) !ReadState {
-            @memset(block, 0);
-
-            var buffer = [_]u8{0} ** word_size;
-
-            for (block, 0..block.len) |*block_int, i| {
-                const p = i / self.exponent();
-                const read_size = try in_fifos_reader_slice[p].reader().readAll(&buffer);
-                assert(read_size == buffer.len);
-                block_int.* = std.mem.readIntBig(T, &buffer);
-            }
-
-            const reader_idx = (block.len - 1) / self.exponent();
-            const size: u8 = @intCast(try in_fifos_reader_slice[reader_idx].reader().readAll(&buffer));
-
-            const state: ReadState = if (size == 0) .done else .in_progress;
-            if (state != .done) {
-                try in_fifos_reader_slice[reader_idx].putBack(&buffer);
-            }
-
-            return state;
-        }
-
-        pub fn writeDataBlock(
-            self: Self,
-            decoder: BinaryFieldMatrix,
-            code_block: []const T,
-            /// `std.io.Writer(...)`
-            out_fifo_writer: anytype,
-            done: bool,
-        ) !usize {
-            assert(code_block.len == mulWide(u8, self.exponent(), self.shardSize()));
-            const buffer = self.word_buffer;
-
-            for (buffer, 0..mulWide(u8, self.exponent(), self.shardSize())) |*buf, i| {
-                var val: T = 0;
-                for (0..decoder.numCols()) |j| {
-                    if (decoder.get(.{ .row = @intCast(i), .col = @intCast(j) }) == 1) {
-                        val ^= code_block[j];
-                    }
-                }
-                std.mem.writeIntBig(T, buf, val);
-            }
-
-            const last_word = buffer[buffer.len - 1];
-            const data_block_size: u8 = if (done) last_word[last_word.len - 1] else self.dataBlockSize();
-
-            var written_size: usize = 0;
-            for (buffer) |*buf| {
-                if ((written_size + word_size) <= data_block_size) {
-                    try out_fifo_writer.writeAll(buf);
-                    written_size += word_size;
-                } else {
-                    try out_fifo_writer.writeAll(buf[0..(data_block_size - written_size)]);
-                    written_size = data_block_size;
-                    break;
-                }
-            }
-
-            return data_block_size;
         }
     };
 }
@@ -346,7 +254,7 @@ pub fn writeCodeBlock(
         shard_count: u8,
     },
 ) !void {
-    const exp: BinaryFiniteField.Exp = @intCast(@divExact(data_block.len, values.shard_size));
+    const exp: galois.BinaryField.Exp = @intCast(@divExact(data_block.len, values.shard_size));
     assert(data_block.len == mulWide(u8, exp, values.shard_size));
     var cbw: CodeBlockWriter(Word) = .{
         .exp = exp,
@@ -359,9 +267,92 @@ pub fn writeCodeBlock(
     }
 }
 
+pub fn readCodeBlock(
+    comptime T: type,
+    exp: galois.BinaryField.Exp,
+    block: []T,
+    /// `[]const std.io.Reader(...)`
+    in_fifos_reader_slice: anytype,
+) !ReadState {
+    @memset(block, 0);
+
+    const word_size = roundByteSize(T);
+    var buffer = [_]u8{0} ** word_size;
+
+    for (block, 0..block.len) |*block_int, i| {
+        const p = i / exp;
+        const read_size = try in_fifos_reader_slice[p].reader().readAll(&buffer);
+        assert(read_size == buffer.len);
+        block_int.* = std.mem.readIntBig(T, &buffer);
+    }
+
+    const reader_idx = (block.len - 1) / exp;
+    const size: u8 = @intCast(try in_fifos_reader_slice[reader_idx].reader().readAll(&buffer));
+
+    const state: ReadState = if (size == 0) .done else .in_progress;
+    if (state != .done) {
+        try in_fifos_reader_slice[reader_idx].putBack(&buffer);
+    }
+
+    return state;
+}
+
+pub fn writeDataBlock(
+    comptime T: type,
+    /// `std.io.Writer(...)`
+    out_fifo_writer: anytype,
+    params: struct {
+        decoder: BinaryFieldMatrix,
+        code_block: []const T,
+        done: bool,
+    },
+) !usize {
+    const word_size = roundByteSize(T);
+    const full_data_block_size: u8 = @intCast(params.code_block.len * word_size);
+
+    const data_block_size: u8 = if (!params.done) full_data_block_size else blk: {
+        const i: u8 = @intCast(params.code_block.len - 1);
+
+        var val: T = 0;
+        for (params.code_block, 0..params.decoder.numCols()) |code_byte, j| {
+            if (params.decoder.get(.{ .row = i, .col = @intCast(j) }) == 1) {
+                val ^= code_byte;
+            }
+        }
+
+        var buf = [_]u8{0} ** word_size;
+        std.mem.writeIntBig(T, &buf, val);
+        break :blk buf[buf.len - 1];
+    };
+
+    var written_size: usize = 0;
+    for (0..params.code_block.len) |i| {
+        var val: T = 0;
+        for (params.code_block, 0..params.decoder.numCols()) |code_byte, j| {
+            if (params.decoder.get(.{ .row = @intCast(i), .col = @intCast(j) }) == 1) {
+                val ^= code_byte;
+            }
+        }
+
+        var word = [_]u8{0} ** word_size;
+        std.mem.writeIntBig(T, &word, val);
+
+        if ((written_size + word.len) <= data_block_size) {
+            try out_fifo_writer.writeAll(&word);
+            written_size += word.len;
+        } else {
+            try out_fifo_writer.writeAll(word[0..(data_block_size - written_size)]);
+            written_size = data_block_size;
+            break;
+        }
+    }
+
+    return data_block_size;
+}
+
 pub fn CodeBlockWriter(comptime Word: type) type {
     return struct {
-        exp: BinaryFiniteField.Exp,
+        exp: galois.BinaryField.Exp,
         shard_count: u8,
         encoder: BinaryFieldMatrix,
         data_block: []const Word,
@@ -399,14 +390,17 @@ pub fn CodeBlockWriter(comptime Word: type) type {
     };
 }
 
-inline fn calcExponent(shard_count: u8, shard_size: u8) error{ShardSizePlusCountOverflow}!BinaryFiniteField.Exp {
-    const CountPlusSize = std.math.IntFittingRange(0, std.math.maxInt(u8) * 2);
-    const shard_count_plus_size = @as(CountPlusSize, shard_count) + shard_size;
-    const ceil_log2 = std.math.log2_int_ceil(CountPlusSize, shard_count_plus_size);
+inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) error{ ShardSizePlusCountOverflow, ZeroShards, ZeroSize }!galois.BinaryField.Exp {
+    if (shard_count == 0) return error.ZeroShards;
+    if (shard_size == 0) return error.ZeroSize;
 
-    const Exp = BinaryFiniteField.Exp;
-    return std.math.cast(Exp, ceil_log2) orelse
-        error.ShardSizePlusCountOverflow;
+    const count_plus_size = @as(u8, shard_count) + shard_size;
+    if (count_plus_size >= galois.BinaryField.order(.degree7)) {
+        return error.ShardSizePlusCountOverflow;
+    }
+
+    const ceil_log2 = std.math.log2_int_ceil(u8, count_plus_size);
+    return @intCast(ceil_log2);
 }
 
 inline fn calcChunkSize(
@@ -458,7 +452,7 @@ pub fn sampleIndexSet(
     /// The number of index values to generate.
     num: u8,
 ) IndexSet {
-    var set = IndexSet.initEmpty();
+    var set = IndexSet{};
     while (set.count() < num) {
         const new = random.uintLessThan(u8, max);
         set.set(new);
@@ -527,9 +521,9 @@ test "erasure coder" {
                 var code_readers: [3]std.fs.File.Reader = undefined;
 
                 var j: usize = 0;
-                for (0..code_filenames.len) |i| {
-                    if (excluded_shards.isSet(i)) continue;
-                    code_in[j] = try tmp.dir.openFile(code_filenames[i], .{});
+                for (code_filenames, 0..) |code_filename, i| {
+                    if (excluded_shards.isSet(@intCast(i))) continue;
+                    code_in[j] = try tmp.dir.openFile(code_filename, .{});
                     code_readers[j] = code_in[j].reader();
                     j += 1;
                 }

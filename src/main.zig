@@ -1,10 +1,10 @@
 const std = @import("std");
 
-pub const Matrix = @import("Matrix.zig");
-pub const BinaryFiniteField = @import("BinaryFiniteField.zig");
-pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 const erasure = @import("erasure.zig");
 pub const ErasureCoder = erasure.ErasureCoder;
+pub const Matrix = @import("Matrix.zig");
+pub const BinaryFiniteField = @import("galois.zig").BinaryField;
+pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
 const usage =
     \\Usage: eraser [command] [options]
@@ -58,8 +58,8 @@ const Args = struct {
     verb: Verb,
     code: ?[]const u8 = null,
     data: ?[]const u8 = null,
-    n: ?u8 = null,
-    k: ?u8 = null,
+    n: ?u7 = null,
+    k: ?u7 = null,
     w: ?Word = null,
 
     const Verb = enum { encode, decode };
@@ -102,8 +102,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         switch (field_tag) {
             .verb => return error.UnrecognizedArgument,
             inline .code, .data => |tag| @field(parsed, @tagName(tag)) = argv[i],
-            inline .n, .k => |tag| @field(parsed, @tagName(tag)) = std.fmt.parseInt(u8, argv[i], 0) catch |err| {
-                std.log.err("Encountered error '{s}' while trying to parse '{s}' into an unsigned 8-bit integer", .{ @errorName(err), argv[i] });
+            inline .n, .k => |tag| @field(parsed, @tagName(tag)) = std.fmt.parseInt(u7, argv[i], 0) catch |err| {
+                std.log.err("Encountered error '{s}' while trying to parse '{s}' into an unsigned 7-bit integer", .{ @errorName(err), argv[i] });
                 return error.InvalidArgumentValue;
             },
             inline .w => |tag| @field(parsed, @tagName(tag)) = std.meta.stringToEnum(Args.Word, argv[i]) orelse
@@ -121,8 +121,8 @@ fn parseArgs(argv: []const []const u8) !Args {
 fn encodeCommand(
     allocator: std.mem.Allocator,
     comptime W: type,
-    shard_count: u8,
-    shard_size: u8,
+    shard_count: u7,
+    shard_size: u7,
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
@@ -162,8 +162,8 @@ fn encodeCommand(
 fn decodeCommand(
     allocator: std.mem.Allocator,
     comptime W: type,
-    shard_count: u8,
-    shard_size: u8,
+    shard_count: u7,
+    shard_size: u7,
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
@@ -183,7 +183,7 @@ fn decodeCommand(
             _: std.fmt.FormatOptions,
             writer: anytype,
         ) !void {
-            var iter = this.set.iterator(.{});
+            var iter = this.set.iterator();
             var comma: bool = false;
             while (iter.next()) |idx| {
                 if (comma) {
@@ -206,7 +206,7 @@ fn decodeCommand(
 
     for (0..ec.shardCount()) |i| {
         // if (std.mem.indexOfScalar(u8, excluded_shards.constSlice(), @intCast(i)) != null) continue;
-        if (excluded_shards.isSet(i)) continue;
+        if (excluded_shards.isSet(@intCast(i))) continue;
         var code_filename: std.BoundedArray(u8, "255.code".len + 1) = .{};
         code_filename.writer().print("{d}.shard", .{@as(u8, @intCast(i))}) catch |err| switch (err) {
             error.Overflow => unreachable,
