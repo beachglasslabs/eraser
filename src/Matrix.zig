@@ -253,6 +253,33 @@ pub const IndexSet = struct {
         return .{ .bits = self.bits | other.bits };
     }
 
+    /// Assuming `sub_index` is an index into a list with "holes", which doesn't account
+    /// for said holes, where the holes are considered to be any of the list's elements
+    /// whose index is contained in `excluded`: this function returns the absolute index,
+    /// which accounts for the aforementioned wholes.
+    pub inline fn absoluteFromExclusiveSubIndex(excluded: IndexSet, sub_index: Index) Index {
+        var result: u8 = sub_index;
+        var iter = excluded.iterator();
+        while (iter.next()) |ex| {
+            if (result < ex) break;
+            result += 1;
+        }
+        return result;
+    }
+    test absoluteFromExclusiveSubIndex {
+        const excluded = IndexSet.initMany(&.{ 4, 8, 9, 11 });
+        try std.testing.expectEqual(@as(Index, 0), excluded.absoluteFromExclusiveSubIndex(0));
+        try std.testing.expectEqual(@as(Index, 1), excluded.absoluteFromExclusiveSubIndex(1));
+        try std.testing.expectEqual(@as(Index, 2), excluded.absoluteFromExclusiveSubIndex(2));
+        try std.testing.expectEqual(@as(Index, 3), excluded.absoluteFromExclusiveSubIndex(3));
+        try std.testing.expectEqual(@as(Index, 5), excluded.absoluteFromExclusiveSubIndex(4));
+        try std.testing.expectEqual(@as(Index, 6), excluded.absoluteFromExclusiveSubIndex(5));
+        try std.testing.expectEqual(@as(Index, 7), excluded.absoluteFromExclusiveSubIndex(6));
+        try std.testing.expectEqual(@as(Index, 10), excluded.absoluteFromExclusiveSubIndex(7));
+        try std.testing.expectEqual(@as(Index, 12), excluded.absoluteFromExclusiveSubIndex(8));
+        try std.testing.expectEqual(@as(Index, 13), excluded.absoluteFromExclusiveSubIndex(9));
+    }
+
     pub inline fn iterator(self: IndexSet) Iterator {
         return .{ .idx_set = self };
     }
@@ -312,10 +339,20 @@ pub const SubView = struct {
         if (excluded_rows.last()) |idx| assert(idx < self.numRows());
         if (excluded_cols.last()) |idx| assert(idx < self.numCols());
 
+        var iter: IndexSet.Iterator = undefined;
+
+        var ex_rows = self.excluded_rows;
+        iter = excluded_rows.iterator();
+        while (iter.next()) |ex_row| ex_rows.set(self.excluded_rows.absoluteFromExclusiveSubIndex(ex_row));
+
+        var ex_cols = self.excluded_cols;
+        iter = excluded_cols.iterator();
+        while (iter.next()) |ex_col| ex_cols.set(self.excluded_cols.absoluteFromExclusiveSubIndex(ex_col));
+
         return .{
             .parent = self.parent,
-            .excluded_rows = self.excluded_rows.unionWith(excluded_rows),
-            .excluded_cols = self.excluded_cols.unionWith(excluded_cols),
+            .excluded_rows = ex_rows,
+            .excluded_cols = ex_cols,
         };
     }
 
@@ -409,20 +446,9 @@ pub const SubView = struct {
         assert(idx.row < self.numRows());
         assert(idx.col < self.numCols());
         return CellIndex{
-            .row = subRcIndexToParentRcIdx(idx.row, self.excluded_rows),
-            .col = subRcIndexToParentRcIdx(idx.col, self.excluded_cols),
+            .row = self.excluded_rows.absoluteFromExclusiveSubIndex(idx.row),
+            .col = self.excluded_cols.absoluteFromExclusiveSubIndex(idx.col),
         };
-    }
-
-    fn subRcIndexToParentRcIdx(rc_idx: u8, excluded: IndexSet) u8 {
-        var result: u8 = rc_idx;
-        var iter = excluded.iterator();
-        while (true) {
-            const ex: u8 = @intCast(iter.next() orelse break);
-            if (result < ex) break;
-            result += 1;
-        }
-        return result;
     }
 };
 
@@ -587,58 +613,77 @@ test subView {
 
     // bigger matrix
 
-    if (!mat.resizeAndReset(std.testing.allocator, 5, 5)) {
+    if (!mat.resizeAndReset(std.testing.allocator, 6, 6)) {
         mat.deinit(std.testing.allocator);
         mat = Matrix{};
-        mat = try Matrix.init(std.testing.allocator, 5, 5);
+        mat = try Matrix.init(std.testing.allocator, 6, 6);
     }
 
     // zig fmt: off
-    //                 0   1   2   3   4
-    mat.setRow(0, &.{  1,  2,  3,  4,  5 });
-    mat.setRow(1, &.{  6,  7,  8,  9, 10 });
-    mat.setRow(2, &.{ 11, 12, 13, 14, 15 });
-    mat.setRow(3, &.{ 16, 17, 18, 19, 20 });
-    mat.setRow(4, &.{ 21, 22, 23, 24, 25 });
+    //                 0   1   2   3   4   5
+    mat.setRow(0, &.{  1,  2,  3,  4,  5,  6 });
+    mat.setRow(1, &.{  7,  8,  9, 10, 11, 12 });
+    mat.setRow(2, &.{ 13, 14, 15, 16, 17, 18 });
+    mat.setRow(3, &.{ 19, 20, 21, 22, 23, 24 });
+    mat.setRow(4, &.{ 25, 26, 27, 28, 29, 30 });
+    mat.setRow(5, &.{ 31, 32, 33, 34, 35, 36 });
     // zig fmt: on
 
-    submat = mat.subView(IndexSet.initMany(&.{ 1, 3 }), IndexSet.initMany(&.{ 1, 3 }));
+    // __ __, __, __, __, __
+    // __  8,  9, __, __, 12
+    // __ 14, 15, __, __, 18
+    // __ __, __, __, __, __
+    // __ __, __, __, __, __
+    // __ 32, 33, __, __, 36
+    submat = mat.subView(IndexSet.initMany(&.{ 0, 3, 4 }), IndexSet.initMany(&.{ 0, 3, 4 }));
     try std.testing.expectEqual(@as(u8, 3), submat.numRows());
     try std.testing.expectEqual(@as(u8, 3), submat.numCols());
 
     // zig fmt: off
-    try expectSubSegment(submat, .row, 0, &.{  1,  3,  5 });
-    try expectSubSegment(submat, .row, 1, &.{ 11, 13, 15 });
-    try expectSubSegment(submat, .row, 2, &.{ 21, 23, 25 });
+    try expectSubSegment(submat, .row, 0, &.{  8,  9, 12 });
+    try expectSubSegment(submat, .row, 1, &.{ 14, 15, 18 });
+    try expectSubSegment(submat, .row, 2, &.{ 32, 33, 36 });
+
+    try expectSubSegment(submat, .col, 0, &.{  8, 14, 32 });
+    try expectSubSegment(submat, .col, 1, &.{  9, 15, 33 });
+    try expectSubSegment(submat, .col, 2, &.{ 12, 18, 36 });
     // zig fmt: on
 
-    try expectSubSegment(submat, .col, 0, &.{ 1, 11, 21 });
-    try expectSubSegment(submat, .col, 1, &.{ 3, 13, 23 });
-    try expectSubSegment(submat, .col, 2, &.{ 5, 15, 25 });
-
+    // __, __, __
+    // 14, 15, 18
+    // 32, 33, 36
     submat = submat.subView(IndexSet.initOne(0), .{});
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 3), submat.numCols());
 
-    try expectSubSegment(submat, .row, 0, &.{ 11, 13, 15 });
-    try expectSubSegment(submat, .row, 1, &.{ 21, 23, 25 });
+    try expectSubSegment(submat, .row, 0, &.{ 14, 15, 18 });
+    try expectSubSegment(submat, .row, 1, &.{ 32, 33, 36 });
 
+    // __, 15, 18
+    // __, 33, 36
     submat = submat.subView(.{}, IndexSet.initOne(0));
     try std.testing.expectEqual(@as(u8, 2), submat.numRows());
     try std.testing.expectEqual(@as(u8, 2), submat.numCols());
 
-    try expectSubSegment(submat, .row, 0, &.{ 13, 15 });
-    try expectSubSegment(submat, .row, 1, &.{ 23, 25 });
+    try expectSubSegment(submat, .row, 0, &.{ 15, 18 });
+    try expectSubSegment(submat, .row, 1, &.{ 33, 36 });
 
+    // __, __, __, __, __, __
+    //  7,  8,  9, 10, 11, 12
+    // 13, 14, 15, 16, 17, 18
+    // 19, 20, 21, 22, 23, 24
+    // 25, 26, 27, 28, 29, 30
+    // 31, 32, 33, 34, 35, 36
     submat = mat.subView(IndexSet.initOne(0), .{});
-    try std.testing.expectEqual(@as(u8, 4), submat.numRows());
-    try std.testing.expectEqual(@as(u8, 5), submat.numCols());
+    try std.testing.expectEqual(@as(u8, 5), submat.numRows());
+    try std.testing.expectEqual(@as(u8, 6), submat.numCols());
 
     // zig fmt: off
-    try expectSubSegment(submat, .row, 0, &.{  6,  7,  8,  9, 10 });
-    try expectSubSegment(submat, .row, 1, &.{ 11, 12, 13, 14, 15 });
-    try expectSubSegment(submat, .row, 2, &.{ 16, 17, 18, 19, 20 });
-    try expectSubSegment(submat, .row, 3, &.{ 21, 22, 23, 24, 25 });
+    try expectSubSegment(submat, .row, 0, &.{  7,  8,  9, 10, 11, 12 });
+    try expectSubSegment(submat, .row, 1, &.{ 13, 14, 15, 16, 17, 18 });
+    try expectSubSegment(submat, .row, 2, &.{ 19, 20, 21, 22, 23, 24 });
+    try expectSubSegment(submat, .row, 3, &.{ 25, 26, 27, 28, 29, 30 });
+    try expectSubSegment(submat, .row, 4, &.{ 31, 32, 33, 34, 35, 36 });
     // zig fmt: on
 }
 

@@ -6,6 +6,14 @@ pub const Matrix = @import("Matrix.zig");
 pub const BinaryFiniteField = @import("galois.zig").BinaryField;
 pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
+test {
+    _ = Matrix;
+    _ = BinaryFiniteField;
+    _ = BinaryFieldMatrix;
+    _ = erasure;
+    _ = @import("SensitiveBytes.zig");
+}
+
 const usage =
     \\Usage: eraser [command] [options]
     \\
@@ -206,14 +214,7 @@ fn decodeCommand(
 
     _ = try ec.decode(
         excluded_shards,
-        code_readers.constSlice(),
         data_file.writer(),
+        code_readers.constSlice(),
     );
-}
-
-test {
-    _ = Matrix;
-    _ = BinaryFiniteField;
-    _ = BinaryFieldMatrix;
-    _ = @import("erasure.zig");
 }

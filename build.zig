@@ -11,6 +11,7 @@ pub fn build(b: *Build) void {
     const run_step = b.step("run", "Run the app");
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
+    const run_libtest = b.step("run-lib", "Run the library test executable");
 
     _ = b.addModule("eraser", .{ .source_file = Build.LazyPath.relative("src/lib.zig") });
 
@@ -53,6 +54,22 @@ pub fn build(b: *Build) void {
 
         const run_difftest_exe = b.addRunArtifact(difftest_exe);
         difftest_step.dependOn(&run_difftest_exe.step);
+    }
+
+    const libtest_exe = b.addExecutable(.{
+        .name = "libtest",
+        .root_source_file = Build.LazyPath.relative("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(libtest_exe);
+
+    const libtest_run = b.addRunArtifact(libtest_exe);
+    run_libtest.dependOn(&libtest_run.step);
+    libtest_run.stdio = .inherit;
+
+    if (b.option([]const u8, "gc-auth-key", "Google cloud auth key")) |auth_key| {
+        libtest_run.setEnvironmentVariable("ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY", auth_key);
     }
 }
 

@@ -42,6 +42,7 @@ pub fn ErasureCoder(comptime T: type) type {
         };
 
         pub fn init(allocator: std.mem.Allocator, shard_count: u7, shard_size: u7) !Self {
+            assert(shard_count >= shard_size);
             const exp = try calcGaloisFieldExponent(shard_count, shard_size);
 
             const bf_mat = try BinaryFieldMatrix.initCauchy(allocator, shard_count, shard_size, exp);
@@ -120,18 +121,35 @@ pub fn ErasureCoder(comptime T: type) type {
             return calcDataBlockSize(self.chunkSize(), self.shardSize());
         }
 
-        pub fn encode(
+        pub inline fn encode(
             self: Self,
-            /// `std.io.Reader(...)`
             in_fifo_reader: anytype,
             /// `[]const std.io.Writer(...)`
             out_fifo_writers: anytype,
+        ) !usize {
+            const Ctx = struct {
+                slice: @TypeOf(out_fifo_writers),
+                pub inline fn getWriter(ctx: @This(), idx: anytype) @TypeOf(out_fifo_writers[0]) {
+                    comptime assert(@TypeOf(idx) == u7);
+                    return ctx.slice[idx];
+                }
+            };
+            return self.encodeCtx(in_fifo_reader, Ctx{ .slice = out_fifo_writers });
+        }
+        pub fn encodeCtx(
+            self: Self,
+            /// `std.io.Reader(...)`
+            in_fifo_reader: anytype,
+            /// Value with an associated namespace, in which a method of the form
+            /// `fn getWriter(ctx: @This(), idx: u7) std.io.Writer(...)`
+            /// should be defined.
+            out_fifo_writers_ctx: anytype,
         ) !usize {
             var size: usize = 0;
             while (true) {
                 const data_block = self.block_buffer;
                 const rs = try readDataBlock(T, data_block, in_fifo_reader);
-                try writeCodeBlock(T, self.encoder_bf_mat_bin, data_block, out_fifo_writers, .{
+                try writeCodeBlock(T, self.encoder_bf_mat_bin, data_block, out_fifo_writers_ctx, .{
                     .shard_count = self.shardCount(),
                     .shard_size = self.shardSize(),
                 });
@@ -148,16 +166,35 @@ pub fn ErasureCoder(comptime T: type) type {
             return size;
         }
 
-        pub fn decode(
+        pub inline fn decode(
             self: Self,
             excluded_shards: IndexSet,
-            /// `[]const std.io.Reader(...)`
-            in_fifos: anytype,
             /// `std.io.Writer(...)`
             out_fifo_writer: anytype,
+            /// `[]const std.io.Reader(...)`
+            in_fifos: anytype,
+        ) !usize {
+            assert(in_fifos.len == self.shardSize());
+            const Ctx = struct {
+                slice: @TypeOf(in_fifos),
+                pub inline fn getReader(ctx: @This(), idx: anytype) @TypeOf(in_fifos[0]) {
+                    comptime assert(@TypeOf(idx) == u7);
+                    return ctx.slice[idx];
+                }
+            };
+            return self.decodeCtx(excluded_shards, out_fifo_writer, Ctx{ .slice = in_fifos });
+        }
+        pub fn decodeCtx(
+            self: Self,
+            excluded_shards: IndexSet,
+            /// `std.io.Writer(...)`
+            out_fifo_writer: anytype,
+            /// Value with an associated namespace, in which a method of the form
+            /// `fn getReader(ctx: @This(), idx: u7) std.io.Reader(...)`
+            /// should be defined.
+            in_fifos_ctx: anytype,
         ) !usize {
             assert(excluded_shards.count() == self.shardCount() - self.shardSize());
-            assert(in_fifos.len == self.shardSize());
 
             const decoder_bin = blk: {
                 const decoder_sub_buf = self.decoder_sub_mat_buf[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet{})];
@@ -176,7 +213,7 @@ pub fn ErasureCoder(comptime T: type) type {
             var size: usize = 0;
             while (true) {
                 const block = self.block_buffer;
-                tail_bytes = try readCodeBlock(T, self.exponent(), block, in_fifos, tail_bytes);
+                tail_bytes = try readCodeBlock(T, self.exponent(), block, in_fifos_ctx, tail_bytes);
                 const write_size = try writeDataBlock(T, out_fifo_writer, .{
                     .decoder = decoder_bin,
                     .code_block = block,
@@ -231,7 +268,9 @@ pub fn writeCodeBlock(
     comptime Word: type,
     encoder: BinaryFieldMatrix,
     data_block: []const Word,
-    /// `[]const std.io.Writer(...)`
+    /// Value with an associated namespace, in which a method of the form
+    /// `fn getWriter(ctx: @This(), idx: u7) std.io.Writer(...)`
+    /// should be defined.
     out_fifos: anytype,
     values: struct {
         shard_count: u7,
@@ -255,7 +294,7 @@ pub fn writeCodeBlock(
         const word_size = roundByteSize(Word);
         const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
         const out_idx = index / exp;
-        try out_fifos[out_idx].writeAll(&word);
+        try out_fifos.getWriter(out_idx).writeAll(&word);
     }
 }
 
@@ -266,8 +305,10 @@ pub fn readCodeBlock(
     comptime Word: type,
     exp: galois.BinaryField.Exp,
     block: []Word,
-    /// `[]const std.io.Reader(...)`
-    in_peek_stream_slice: anytype,
+    /// Value with an associated namespace, in which a method of the form
+    /// `fn getReader(ctx: @This(), idx: u7) std.io.Reader(...)`
+    /// should be defined.
+    readers_ctx: anytype,
     /// `null` if this is the first call, otherwise
     /// this should be the result from the previous call to this function.
     last_bytes_from_prev_call: ?[roundByteSize(Word)]u8,
@@ -276,14 +317,11 @@ pub fn readCodeBlock(
     const word_size = roundByteSize(Word);
 
     var maybe_last_reader_bytes = last_bytes_from_prev_call;
-
-    const last_reader_idx = (block.len - 1) / exp;
-    const last_peek_stream = &in_peek_stream_slice[last_reader_idx];
-    assert(in_peek_stream_slice.len == last_reader_idx + 1);
+    const last_reader_idx: u7 = @intCast((block.len - 1) / exp);
 
     for (block, 0..) |*block_int, i| {
         var buffer = [_]u8{0} ** word_size;
-        const reader_idx = i / exp;
+        const reader_idx: u7 = @intCast(i / exp);
 
         const use_prev_bytes =
             reader_idx == last_reader_idx and
@@ -292,7 +330,7 @@ pub fn readCodeBlock(
             buffer = maybe_last_reader_bytes.?;
             maybe_last_reader_bytes = null;
         } else {
-            const read_size = try in_peek_stream_slice[reader_idx].readAll(&buffer);
+            const read_size = try readers_ctx.getReader(reader_idx).readAll(&buffer);
             assert(read_size == buffer.len);
         }
 
@@ -300,7 +338,7 @@ pub fn readCodeBlock(
     }
 
     var buffer = [_]u8{0} ** word_size;
-    const size = try last_peek_stream.readAll(&buffer);
+    const size = try readers_ctx.getReader(last_reader_idx).readAll(&buffer);
 
     return switch (size) {
         0 => null,
@@ -362,9 +400,9 @@ pub fn writeDataBlock(
     return data_block_size;
 }
 
-inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) error{ ShardSizePlusCountOverflow, ZeroShards, ZeroSize }!galois.BinaryField.Exp {
+inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) error{ ShardSizePlusCountOverflow, ZeroShards, ZeroShardSize }!galois.BinaryField.Exp {
     if (shard_count == 0) return error.ZeroShards;
-    if (shard_size == 0) return error.ZeroSize;
+    if (shard_size == 0) return error.ZeroShardSize;
 
     const count_plus_size = @as(u8, shard_count) + shard_size;
     if (count_plus_size >= galois.BinaryField.order(.degree7)) {
@@ -432,7 +470,7 @@ pub fn sampleIndexSet(
     return set;
 }
 
-test "erasure coder" {
+test ErasureCoder {
     const test_data = [_][]const u8{
         "The quick brown fox jumps over the lazy dog.",
         "All your base are belong to us.",
@@ -440,82 +478,77 @@ test "erasure coder" {
         "Whoever fights monsters should see to it that in the process he does not become a monster.\nAnd if you gaze long enough into an abyss, the abyss will gaze back into you.",
     };
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     var prng = std.rand.DefaultPrng.init(1234);
     var random = prng.random();
 
     for (test_data) |data| {
-        const data_filename = "temp_data_file";
-
-        var data_file = try tmp.dir.createFile(data_filename, .{});
-        try data_file.writer().writeAll(data);
-        data_file.close();
-        defer tmp.dir.deleteFile(data_filename) catch {};
-
         inline for ([_]type{ u8, u16, u32, u64 }) |T| {
-            const code_filenames = [5][]const u8{
-                "temp_code_file_1",
-                "temp_code_file_2",
-                "temp_code_file_3",
-                "temp_code_file_4",
-                "temp_code_file_5",
-            };
-
-            var ec = try ErasureCoder(T).init(std.testing.allocator, code_filenames.len, 3);
+            var ec = try ErasureCoder(T).init(std.testing.allocator, 5, 3);
             defer ec.deinit(std.testing.allocator);
 
-            const data_size = encode: {
-                var code_files: [code_filenames.len]std.fs.File = undefined;
-                for (code_files[0..], code_filenames, 0..) |*cf, cf_name, end| {
-                    errdefer for (code_files[0..end]) |prev| prev.close();
-                    cf.* = try tmp.dir.createFile(cf_name, .{});
-                }
-                defer for (code_files) |cf| cf.close();
+            const code_datas = try std.testing.allocator.alloc(std.ArrayListUnmanaged(u8), ec.shardCount());
+            @memset(code_datas, .{});
+            defer {
+                for (code_datas) |*code| code.deinit(std.testing.allocator);
+                std.testing.allocator.free(code_datas);
+            }
 
-                var code_writers: [5]std.fs.File.Writer = undefined;
-                for (code_writers[0..], code_files[0..]) |*cw, cf| {
-                    cw.* = cf.writer();
-                }
+            const data_size: usize = encode: {
+                const WritersCtx = struct {
+                    allocator: std.mem.Allocator,
+                    code_datas: []std.ArrayListUnmanaged(u8),
 
-                const data_in = try tmp.dir.openFile(data_filename, .{});
-                defer data_in.close();
-
-                break :encode try ec.encode(data_in.reader(), &code_writers);
+                    pub inline fn getWriter(ctx: @This(), idx: u7) std.ArrayListUnmanaged(u8).Writer {
+                        return ctx.code_datas[idx].writer(ctx.allocator);
+                    }
+                };
+                var data_in = std.io.fixedBufferStream(data);
+                const writers = WritersCtx{
+                    .allocator = std.testing.allocator,
+                    .code_datas = code_datas,
+                };
+                break :encode try ec.encodeCtx(data_in.reader(), writers);
             };
             try std.testing.expect(data_size > 0);
 
             decode: {
-                const excluded_shards = sampleIndexSet(random, 5, 2);
+                const excluded_shards = sampleIndexSet(
+                    random,
+                    ec.shardCount(),
+                    ec.shardCount() - ec.shardSize(),
+                );
 
-                var code_in: [3]std.fs.File = undefined;
-                var code_readers: [3]std.fs.File.Reader = undefined;
+                const ReadersCtx = struct {
+                    excluded_shards: IndexSet,
+                    code_datas: []std.ArrayListUnmanaged(u8),
 
-                var j: usize = 0;
-                for (code_filenames, 0..) |code_filename, i| {
-                    if (excluded_shards.isSet(@intCast(i))) continue;
-                    code_in[j] = try tmp.dir.openFile(code_filename, .{});
-                    code_readers[j] = code_in[j].reader();
-                    j += 1;
-                }
+                    pub inline fn getReader(ctx: @This(), idx: u7) Reader {
+                        const abs_idx = ctx.excluded_shards.absoluteFromExclusiveSubIndex(idx);
+                        return .{ .context = &ctx.code_datas[abs_idx] };
+                    }
 
-                const decoded_filename = "temp_decoded_data_file";
+                    const Reader = std.io.Reader(*std.ArrayListUnmanaged(u8), error{}, @This().read);
+                    fn read(list: *std.ArrayListUnmanaged(u8), buf: []u8) error{}!usize {
+                        const amt = @min(list.items.len, buf.len);
+                        @memcpy(buf[0..amt], list.items[0..amt]);
+                        std.mem.copyForwards(u8, list.items, list.items[amt..]);
+                        list.shrinkRetainingCapacity(list.items.len - amt);
+                        return amt;
+                    }
+                };
+                const readers_ctx = ReadersCtx{
+                    .excluded_shards = excluded_shards,
+                    .code_datas = code_datas,
+                };
 
-                const decoded_file = try tmp.dir.createFile(decoded_filename, .{});
-                defer decoded_file.close();
+                var decoded_data = std.ArrayList(u8).init(std.testing.allocator);
+                defer decoded_data.deinit();
 
-                const decoded_size = try ec.decode(excluded_shards, &code_readers, decoded_file.writer());
-                for (code_in) |f| f.close();
-                try tmp.dir.deleteFile(decoded_filename);
-
+                const decoded_size = try ec.decodeCtx(excluded_shards, decoded_data.writer(), readers_ctx);
                 try std.testing.expectEqual(data_size, decoded_size);
-                var buffer = std.mem.zeroes([256]u8);
-                var decoded_in = try tmp.dir.openFile(data_filename, .{});
-                defer decoded_in.close();
-                var buffer_size = try decoded_in.reader().readAll(&buffer);
-                try std.testing.expectEqualSlices(u8, data, buffer[0..buffer_size]);
+                try std.testing.expectEqual(decoded_size, decoded_data.items.len);
 
+                try std.testing.expectEqualStrings(data, decoded_data.items);
                 break :decode;
             }
         }

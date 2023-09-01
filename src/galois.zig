@@ -18,8 +18,13 @@ pub const BinaryField = enum(u3) {
     /// 3, 7, 11, 19, 37, 67, 131
     pub const Divisor = u8;
 
+    pub const InitError = error{InvalidExponent};
+    pub const ValidateError = error{InvalidNumber};
+    pub const InvertError = error{NoInverse};
+    pub const OpError = InvertError || ValidateError;
+
     /// 2^exp field
-    pub fn init(exp: Exp) error{InvalidExponent}!BinaryField {
+    pub fn init(exp: Exp) InitError!BinaryField {
         return switch (exp) {
             1...7 => @enumFromInt(exp),
             else => error.InvalidExponent,
@@ -47,30 +52,30 @@ pub const BinaryField = enum(u3) {
         return lut.get(self);
     }
 
-    pub inline fn validate(self: BinaryField, number: u8) error{InvalidNumber}!u8 {
+    pub inline fn validate(self: BinaryField, number: u8) ValidateError!u8 {
         if (number >= self.order())
             return error.InvalidNumber;
         return @intCast(number);
     }
 
-    pub fn add(self: BinaryField, a: u8, b: u8) error{InvalidNumber}!u8 {
+    pub fn add(self: BinaryField, a: u8, b: u8) ValidateError!u8 {
         const valid_a = try self.validate(a);
         const valid_b = try self.validate(b);
         return self.validate(valid_a ^ valid_b) catch unreachable;
     }
 
-    pub fn neg(self: BinaryField, a: u8) error{InvalidNumber}!u8 {
+    pub fn neg(self: BinaryField, a: u8) ValidateError!u8 {
         return try self.validate(a);
     }
 
-    pub fn sub(self: BinaryField, a: u8, b: u8) error{InvalidNumber}!u8 {
+    pub fn sub(self: BinaryField, a: u8, b: u8) ValidateError!u8 {
         const neg_b = try self.neg(b);
         return try self.add(a, neg_b);
     }
 
-    fn countBits(num: u16) u8 {
+    fn countBits(num: u16) u5 {
         var v = num;
-        var c: u8 = 0;
+        var c: u5 = 0;
         while (v != 0) {
             v >>= 1;
             c += 1;
@@ -78,7 +83,7 @@ pub const BinaryField = enum(u3) {
         return c;
     }
 
-    pub fn mul(self: BinaryField, a: u8, b: u8) error{InvalidNumber}!u8 {
+    pub fn mul(self: BinaryField, a: u8, b: u8) ValidateError!u8 {
         if (self.exponent() == 1) {
             return self.validate(try self.validate(a) * try self.validate(b));
         }
@@ -102,7 +107,7 @@ pub const BinaryField = enum(u3) {
         return self.validate(@intCast(result)) catch unreachable;
     }
 
-    pub fn invert(self: BinaryField, a: u8) error{ NoInverse, InvalidNumber }!u8 {
+    pub fn invert(self: BinaryField, a: u8) OpError!u8 {
         if (try self.validate(a) == 0) {
             return error.NoInverse;
         }
@@ -114,19 +119,19 @@ pub const BinaryField = enum(u3) {
         return error.NoInverse;
     }
 
-    pub fn div(self: BinaryField, a: usize, b: usize) error{ NoInverse, InvalidNumber }!u8 {
+    pub fn div(self: BinaryField, a: usize, b: usize) OpError!u8 {
         return try self.mul(a, try self.invert(b));
     }
 
     /// n x n binary matrix representation
-    pub fn toMatrix(self: BinaryField, allocator: std.mem.Allocator, a: u8) (std.mem.Allocator.Error || error{InvalidNumber})!Matrix {
+    pub fn toMatrix(self: BinaryField, allocator: std.mem.Allocator, a: u8) (std.mem.Allocator.Error || ValidateError)!Matrix {
         var mat = try Matrix.init(allocator, self.matrixNumRows(), self.matrixNumCols());
         errdefer mat.deinit(allocator);
         try self.intoMatrix(&mat, a);
         return mat;
     }
 
-    pub fn intoMatrix(self: BinaryField, dst: *Matrix, a: u8) error{InvalidNumber}!void {
+    pub fn intoMatrix(self: BinaryField, dst: *Matrix, a: u8) ValidateError!void {
         assert(self.matrixNumRows() == dst.numRows());
         assert(self.matrixNumRows() == dst.numCols());
         @memset(dst.getDataSlice(), 0);

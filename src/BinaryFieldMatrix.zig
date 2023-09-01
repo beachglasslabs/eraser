@@ -267,7 +267,7 @@ pub fn invert(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFiel
     errdefer allocator.free(data);
     return try self.invertWith(data);
 }
-pub fn invertWith(self: BinaryFieldMatrix, data: []u8) !BinaryFieldMatrix {
+pub fn invertWith(self: BinaryFieldMatrix, data: []u8) galois.BinaryField.OpError!BinaryFieldMatrix {
     var imx = try self.cofactorizeWith(data);
     imx.transpose();
 
@@ -291,7 +291,7 @@ pub fn toBinaryWith(
     /// the backing buffer that will be used for the matrix in the returned binary field matrix
     mat_buf: []u8,
     tmp_buf: []u8,
-) !BinaryFieldMatrix {
+) galois.BinaryField.ValidateError!BinaryFieldMatrix {
     var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.exponent(), self.numCols() * self.field.exponent());
 
     var bfm = Matrix.initWith(tmp_buf, self.field.exponent(), self.field.exponent());
@@ -330,14 +330,14 @@ pub inline fn calcToBinaryTempBufCellCount(field: galois.BinaryField) u16 {
 pub fn toBinaryCellCount(self: BinaryFieldMatrix) u16 {
     return calcToBinaryCellCount(self.field, self.numRows(), self.numCols());
 }
-pub inline fn calcToBinaryCellCount(field: galois.BinaryField, old_rows: u8, old_cols: u8) u16 {
+pub fn calcToBinaryCellCount(field: galois.BinaryField, old_rows: u8, old_cols: u8) u16 {
     const new_rows = calcToBinaryNumRows(field, old_rows);
     const new_cols = calcToBinaryNumCols(field, old_cols);
-    return new_rows * new_cols;
+    return mulWide(u8, new_rows, new_cols);
 }
 // zig fmt: off
-pub inline fn calcToBinaryNumRows(field: galois.BinaryField, old_rows: u8) u8 { return old_rows * field.exponent(); }
-pub inline fn calcToBinaryNumCols(field: galois.BinaryField, old_cols: u8) u8 { return old_cols * field.exponent(); }
+pub fn calcToBinaryNumRows(field: galois.BinaryField, old_rows: u8) u8 { return old_rows * field.exponent(); }
+pub fn calcToBinaryNumCols(field: galois.BinaryField, old_cols: u8) u8 { return old_cols * field.exponent(); }
 // zig fmt: on
 
 /// As of right now this is only used to ensure
