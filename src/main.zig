@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const erasure = @import("erasure.zig");
-pub const ErasureCoder = erasure.ErasureCoder;
 pub const Matrix = @import("Matrix.zig");
 pub const BinaryFiniteField = @import("galois.zig").BinaryField;
 pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
@@ -134,7 +133,7 @@ fn encodeCommand(
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
-    const ec = try ErasureCoder(W).init(allocator, shard_count, shard_size);
+    const ec = try erasure.Coder(W).init(allocator, shard_count, shard_size);
     defer ec.deinit(allocator);
 
     const data_file = try std.fs.cwd().openFile(data_filename, .{});
@@ -175,7 +174,7 @@ fn decodeCommand(
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
-    const ec = try ErasureCoder(W).init(allocator, shard_count, shard_size);
+    const ec = try erasure.Coder(W).init(allocator, shard_count, shard_size);
     defer ec.deinit(allocator);
 
     // TODO: use better RNG source? maybe from std.crypto?

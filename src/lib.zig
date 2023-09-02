@@ -1,11 +1,159 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const util = @import("util.zig");
 
 const erasure = @import("erasure.zig");
-pub const ErasureCoder = @import("erasure.zig").ErasureCoder;
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
+pub const SharedQueue = @import("shared_queue.zig").SharedQueue;
+
+pub const ServerInfo = struct {
+    google_cloud: ?GoogleCloud = null,
+
+    pub const GoogleCloud = struct {
+        auth_token: SensitiveBytes,
+        bucket_names: []const []const u8,
+    };
+
+    inline fn bucketCount(server_info: ServerInfo) usize {
+        var result: usize = 0;
+        if (server_info.google_cloud) |gcloud| {
+            result += gcloud.bucket_names.len;
+        }
+        return result;
+    }
+};
+
+pub const UploadCtx = struct {
+    ptr: *anyopaque,
+    actionFn: *const fn (ptr: *anyopaque, state: Action) void,
+    file: std.fs.File,
+
+    /// Informs the context of the percentage of progress.
+    pub inline fn update(self: UploadCtx, percentage: u8) void {
+        self.actionFn(self.ptr, .{ .update = percentage });
+    }
+
+    /// After returns, the `UploadCtx` will be destroyed,
+    /// meaning either the file has been fully uploaded,
+    /// or the process to upload the file has failed
+    /// irrecoverably.
+    /// Gives the file handle back to the inner context.
+    pub inline fn close(self: UploadCtx) void {
+        self.actionFn(self.ptr, .{ .close = self.file });
+    }
+
+    pub const Action = union(enum) {
+        /// percentage of progress
+        update: u8,
+        /// The upload context is being closed, so the file handle
+        /// is returned. The context may store it elsewhere for
+        /// further use, or simply close it.
+        close: std.fs.File,
+    };
+};
+
+pub fn UploadPipeLine(comptime W: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        must_stop: std.atomic.Atomic(bool),
+        queue_mtx: std.Thread.Mutex,
+        queue: SharedQueue(UploadCtx),
+
+        server_info: ServerInfo,
+        ec: ErasureCoder,
+        thread: std.Thread,
+        const Self = @This();
+
+        const ErasureCoder = erasure.Coder(W);
+
+        pub fn init(
+            /// contents will be entirely oerwritten
+            self: *Self,
+            /// should be a thread-safe allocator
+            allocator: std.mem.Allocator,
+            values: struct {
+                queue_capacity: usize,
+                server_info: ServerInfo,
+            },
+        ) std.mem.Allocator.Error!void {
+            self.* = .{
+                .allocator = allocator,
+                .must_stop = std.atomic.Atomic(bool).init(false),
+                .queue_mtx = .{},
+                .queue = undefined,
+                .ec = undefined,
+                .thread = undefined,
+            };
+
+            self.queue = try SharedQueue(UploadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            errdefer self.queue.deinit(self.allocator);
+
+            assert(values.server_info.bucketCount() == 6); // TODO: remove this and calculate or add a way to specify the shard size
+            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), 3);
+            errdefer self.ec.deinit(self.allocator);
+
+            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, uploadPipeLineThread, .{self});
+        }
+
+        pub fn deinit(
+            self: *Self,
+            remaining_queue_fate: enum {
+                finish_remaining_uploads,
+                cancel_remaining_uploads,
+            },
+        ) void {
+            self.must_stop.store(true, .Monotonic);
+            switch (remaining_queue_fate) {
+                .finish_remaining_uploads => {},
+                .cancel_remaining_uploads => self.queue.clearItems(),
+            }
+            self.thread.join();
+            self.queue.deinit(self.allocator);
+        }
+
+        pub inline fn uploadFile(
+            self: *Self,
+            /// Should be a read-enabled file handle; if this call
+            /// succeeds, the caller must leave the closing of the
+            /// file handle to the `ctx_ptr`.
+            file: std.fs.File,
+            /// A struct/union/enum/opaque pointer implementing
+            /// the `UploadCtx` interface.
+            ctx_ptr: anytype,
+        ) std.mem.Allocator.Error!void {
+            _ = try self.queue.pushValue(self.allocator, UploadCtx{
+                .ptr = ctx_ptr,
+                .actionFn = struct {
+                    fn actionFn(ptr: *anyopaque, action: UploadCtx.Action) void {
+                        const Ptr = @TypeOf(ctx_ptr);
+                        const ctx: Ptr = @ptrCast(@alignCast(ptr));
+                        switch (action) {
+                            .update => |percentage| ctx.update(percentage),
+                            .close => |fd| ctx.close(fd),
+                        }
+                    }
+                }.actionFn,
+                .file = file,
+            });
+        }
+
+        fn uploadPipeLineThread(upp: *Self) void {
+            while (true) {
+                const upload_ctx: *UploadCtx = upp.queue.popBorrowed() orelse {
+                    // TODO: should this use a more strict memory order?
+                    if (upp.must_stop.load(.Monotonic)) break;
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                defer upp.queue.destroyBorrowed(upload_ctx);
+                errdefer upload_ctx.close();
+                @panic("TODO");
+            }
+        }
+    };
+}
 
 pub const EncodeDecodeThreadArgs = struct {
     /// Should be a thread-safe allocator
@@ -23,23 +171,6 @@ pub const EncodeDecodeThreadArgs = struct {
     error_handling_hints: ErrorHandlingHints = .{
         .max_oom_retries = 100,
     },
-
-    pub const ServerInfo = struct {
-        google_cloud: ?GoogleCloud = null,
-
-        pub const GoogleCloud = struct {
-            auth_token: SensitiveBytes,
-            bucket_names: []const []const u8,
-        };
-
-        inline fn bucketCount(server_info: ServerInfo) usize {
-            var result: usize = 0;
-            if (server_info.google_cloud) |gcloud| {
-                result += gcloud.bucket_names.len;
-            }
-            return result;
-        }
-    };
 
     pub const ErrorHandlingHints = struct {
         max_oom_retries: u16,
@@ -68,9 +199,9 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
 
     assert(server_info.bucketCount() == 6);
 
-    var ec: ErasureCoder(u32) = blk: {
+    var ec: erasure.Coder(u32) = blk: {
         var retry_count: u16 = 0;
-        while (true) break :blk ErasureCoder(u32).init(allocator, @intCast(server_info.bucketCount()), 3) catch |err| switch (err) {
+        while (true) break :blk erasure.Coder(u32).init(allocator, @intCast(server_info.bucketCount()), 3) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (retry_count == err_handling_hints.max_oom_retries) @panic("TODO: handle retrying the maximum number of times");
                 retry_count += 1;
@@ -110,7 +241,6 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
             .encode => |*data| {
                 defer if (data.close_after) data.file.close();
 
-                const Sha256 = std.crypto.hash.sha2.Sha256;
                 const file_digest: [Sha256.digest_length]u8 = digest: {
                     const Sha256HasherReader = struct {
                         hasher: *Sha256,

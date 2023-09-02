@@ -16,7 +16,7 @@ comptime {
 pub const IndexSet = BinaryFieldMatrix.IndexSet;
 pub const ReadState = enum { done, in_progress };
 
-pub fn ErasureCoder(comptime T: type) type {
+pub fn Coder(comptime T: type) type {
     assert(@typeInfo(T) == .Int);
     return struct {
         bf_mat: BinaryFieldMatrix,
@@ -331,6 +331,7 @@ pub fn readCodeBlock(
             maybe_last_reader_bytes = null;
         } else {
             const read_size = try readers_ctx.getReader(reader_idx).readAll(&buffer);
+            if (buffer.len < buffer.len) return error.EndOfStream;
             assert(read_size == buffer.len);
         }
 
@@ -343,7 +344,7 @@ pub fn readCodeBlock(
     return switch (size) {
         0 => null,
         word_size => buffer,
-        else => unreachable,
+        else => error.EndOfStream,
     };
 }
 
@@ -470,7 +471,7 @@ pub fn sampleIndexSet(
     return set;
 }
 
-test ErasureCoder {
+test Coder {
     const test_data = [_][]const u8{
         "The quick brown fox jumps over the lazy dog.",
         "All your base are belong to us.",
@@ -483,7 +484,7 @@ test ErasureCoder {
 
     for (test_data) |data| {
         inline for ([_]type{ u8, u16, u32, u64 }) |T| {
-            var ec = try ErasureCoder(T).init(std.testing.allocator, 5, 3);
+            var ec = try Coder(T).init(std.testing.allocator, 5, 3);
             defer ec.deinit(std.testing.allocator);
 
             const code_datas = try std.testing.allocator.alloc(std.ArrayListUnmanaged(u8), ec.shardCount());
