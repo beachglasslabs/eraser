@@ -41,7 +41,8 @@ pub fn Coder(comptime T: type) type {
             state: ReadState,
         };
 
-        pub fn init(allocator: std.mem.Allocator, shard_count: u7, shard_size: u7) !Self {
+        pub const InitError = std.mem.Allocator.Error || CalcGaloisFieldExponentError || galois.BinaryField.InitError || galois.BinaryField.OpError;
+        pub fn init(allocator: std.mem.Allocator, shard_count: u7, shard_size: u7) InitError!Self {
             assert(shard_count >= shard_size);
             const exp = try calcGaloisFieldExponent(shard_count, shard_size);
 
@@ -69,7 +70,9 @@ pub fn Coder(comptime T: type) type {
             const decoder_mat_bin_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryCellCount()) catch unreachable;
             const decoder_mat_bin_tmp_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryTempBufCellCount()) catch unreachable;
 
-            decoder_buf_fba_state = undefined;
+            assert( //
+                decoder_buf_fba_state.end_index ==
+                decoder_buf_fba_state.buffer.len);
 
             const block_buffer = try allocator.alloc(T, mulWide(u8, exp, shard_size));
             errdefer allocator.free(block_buffer);
@@ -331,7 +334,7 @@ pub fn readCodeBlock(
             maybe_last_reader_bytes = null;
         } else {
             const read_size = try readers_ctx.getReader(reader_idx).readAll(&buffer);
-            if (buffer.len < buffer.len) return error.EndOfStream;
+            if (read_size < buffer.len) return error.EndOfStream;
             assert(read_size == buffer.len);
         }
 
@@ -401,7 +404,8 @@ pub fn writeDataBlock(
     return data_block_size;
 }
 
-inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) error{ ShardSizePlusCountOverflow, ZeroShards, ZeroShardSize }!galois.BinaryField.Exp {
+pub const CalcGaloisFieldExponentError = error{ ShardSizePlusCountOverflow, ZeroShards, ZeroShardSize };
+pub inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) CalcGaloisFieldExponentError!galois.BinaryField.Exp {
     if (shard_count == 0) return error.ZeroShards;
     if (shard_size == 0) return error.ZeroShardSize;
 

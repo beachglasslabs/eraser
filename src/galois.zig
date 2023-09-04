@@ -1,6 +1,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const mulWide = std.math.mulWide;
+
 const Matrix = @import("Matrix.zig");
+const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
+
+const galois = @import("galois.zig");
 
 pub const BinaryField = enum(u3) {
     degree1 = 1,
@@ -21,7 +26,7 @@ pub const BinaryField = enum(u3) {
     pub const InitError = error{InvalidExponent};
     pub const ValidateError = error{InvalidNumber};
     pub const InvertError = error{NoInverse};
-    pub const OpError = InvertError || ValidateError;
+    pub const OpError = ValidateError || InvertError;
 
     /// 2^exp field
     pub fn init(exp: Exp) InitError!BinaryField {
@@ -132,30 +137,42 @@ pub const BinaryField = enum(u3) {
     }
 
     pub fn intoMatrix(self: BinaryField, dst: *Matrix, a: u8) ValidateError!void {
+        assert(self.matrixNumRows() == self.matrixNumCols());
+
         assert(self.matrixNumRows() == dst.numRows());
-        assert(self.matrixNumRows() == dst.numCols());
+        assert(self.matrixNumCols() == dst.numCols());
+        const segment = self.matrixNumRows();
+
         @memset(dst.getDataSlice(), 0);
 
         var basis: u8 = 1;
-        for (0..dst.numRows()) |c| {
+        for (0..segment) |col| {
             const p = try self.mul(a, basis);
             basis <<= 1;
-            setMatrixCol(dst, c, p);
+            setMatrixCol(dst, col, p);
         }
+    }
+
+    pub inline fn cauchyMatrixCellValue(self: BinaryField, params: struct { idx: Matrix.CellIndex, cols: u8 }) OpError!u8 {
+        const subtracted = try self.sub(
+            params.idx.row + params.cols,
+            params.idx.col,
+        );
+        return try self.invert(subtracted);
     }
 
     pub inline fn matrixCellCount(self: BinaryField) u16 {
         return Matrix.calcCellCount(self.matrixNumRows(), self.matrixNumCols());
     }
     // zig fmt: off
-    pub fn matrixNumRows(self: BinaryField) u8 { return self.exponent(); }
-    pub fn matrixNumCols(self: BinaryField) u8 { return self.exponent(); }
+    pub inline fn matrixNumRows(self: BinaryField) u8 { return self.exponent(); }
+    pub inline fn matrixNumCols(self: BinaryField) u8 { return self.exponent(); }
     // zig fmt: on
 
-    fn setMatrixCol(mat: *Matrix, c: usize, a: u8) void {
+    fn setMatrixCol(mat: *Matrix, col: usize, value: u8) void {
         for (0..mat.numRows()) |row| {
-            const v = (a >> @intCast(row)) & 1;
-            mat.set(.{ .row = @intCast(row), .col = @intCast(c) }, v);
+            const val = (value >> @intCast(row)) & 1;
+            mat.set(.{ .row = @intCast(row), .col = @intCast(col) }, val);
         }
     }
 };

@@ -9,6 +9,7 @@ pub const SensitiveBytes = @import("SensitiveBytes.zig");
 pub const SharedQueue = @import("shared_queue.zig").SharedQueue;
 
 pub const ServerInfo = struct {
+    shard_size: u7,
     google_cloud: ?GoogleCloud = null,
 
     pub const GoogleCloud = struct {
@@ -28,7 +29,30 @@ pub const ServerInfo = struct {
 pub const UploadCtx = struct {
     ptr: *anyopaque,
     actionFn: *const fn (ptr: *anyopaque, state: Action) void,
-    file: std.fs.File,
+    data: Data,
+
+    pub const Data = struct {
+        file: std.fs.File,
+        precalculated_digest: ?[Sha256.digest_length]u8,
+    };
+
+    pub inline fn init(data: Data, ctx_ptr: anytype) UploadCtx {
+        const Ptr = @TypeOf(ctx_ptr);
+        const gen = struct {
+            fn actionFn(erased_ptr: *anyopaque, action: UploadCtx.Action) void {
+                const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
+                switch (action) {
+                    .update => |percentage| ptr.update(percentage),
+                    .close => |fd| ptr.close(fd),
+                }
+            }
+        };
+        return .{
+            .ptr = ctx_ptr,
+            .actionFn = gen.actionFn,
+            .data = data,
+        };
+    }
 
     /// Informs the context of the percentage of progress.
     pub inline fn update(self: UploadCtx, percentage: u8) void {
@@ -41,7 +65,7 @@ pub const UploadCtx = struct {
     /// irrecoverably.
     /// Gives the file handle back to the inner context.
     pub inline fn close(self: UploadCtx) void {
-        self.actionFn(self.ptr, .{ .close = self.file });
+        self.actionFn(self.ptr, .{ .close = self.data.file });
     }
 
     pub const Action = union(enum) {
@@ -57,16 +81,24 @@ pub const UploadCtx = struct {
 pub fn UploadPipeLine(comptime W: type) type {
     return struct {
         allocator: std.mem.Allocator,
+        server_info: ServerInfo,
+        requests_buf: []std.http.Client.Request,
+        headers_buf: std.http.Headers,
+        gc_authorization_str: ?[]const u8,
+
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
         queue: SharedQueue(UploadCtx),
 
-        server_info: ServerInfo,
         ec: ErasureCoder,
         thread: std.Thread,
         const Self = @This();
 
         const ErasureCoder = erasure.Coder(W);
+
+        // TODO: should this use a more strict memory order?
+        const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
+        const must_stop_load_mo: std.builtin.AtomicOrder = .Monotonic;
 
         pub fn init(
             /// contents will be entirely oerwritten
@@ -77,9 +109,14 @@ pub fn UploadPipeLine(comptime W: type) type {
                 queue_capacity: usize,
                 server_info: ServerInfo,
             },
-        ) std.mem.Allocator.Error!void {
+        ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
             self.* = .{
                 .allocator = allocator,
+                .server_info = values.server_info,
+                .requests_buf = &.{},
+                .headers_buf = std.http.Headers.init(allocator),
+                .gc_authorization_str = null,
+
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue = undefined,
@@ -87,11 +124,23 @@ pub fn UploadPipeLine(comptime W: type) type {
                 .thread = undefined,
             };
 
+            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
+            errdefer self.allocator.free(self.requests_buf);
+
+            self.headers_buf.owned = false;
+            // self.headers.append("Authorization", authorization) catch |err| break :oom err;
+            try self.headers_buf.append("Transfer-Encoding", "chunked");
+            try self.headers_buf.append("Authorization", "");
+
+            if (values.server_info.google_cloud) |gc| {
+                self.gc_authorization_str = try std.fmt.allocPrint(allocator, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()});
+            }
+            errdefer self.allocator.free(self.gc_authorization_str orelse &.{});
+
             self.queue = try SharedQueue(UploadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            assert(values.server_info.bucketCount() == 6); // TODO: remove this and calculate or add a way to specify the shard size
-            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), 3);
+            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
 
             self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, uploadPipeLineThread, .{self});
@@ -104,13 +153,17 @@ pub fn UploadPipeLine(comptime W: type) type {
                 cancel_remaining_uploads,
             },
         ) void {
-            self.must_stop.store(true, .Monotonic);
+            self.must_stop.store(true, must_stop_store_mo);
             switch (remaining_queue_fate) {
                 .finish_remaining_uploads => {},
                 .cancel_remaining_uploads => self.queue.clearItems(),
             }
             self.thread.join();
             self.queue.deinit(self.allocator);
+            self.ec.deinit(self.allocator);
+            self.allocator.free(self.requests_buf);
+            self.allocator.free(self.gc_authorization_str orelse &.{});
+            self.headers_buf.deinit();
         }
 
         pub inline fn uploadFile(
@@ -119,37 +172,172 @@ pub fn UploadPipeLine(comptime W: type) type {
             /// succeeds, the caller must leave the closing of the
             /// file handle to the `ctx_ptr`.
             file: std.fs.File,
+            /// Optionally provide the SHA256 sum digest; if `null`, the
+            /// digest will be calculated during upload.
+            precalclulated_digest: ?*const [Sha256.digest_length]u8,
             /// A struct/union/enum/opaque pointer implementing
             /// the `UploadCtx` interface.
             ctx_ptr: anytype,
         ) std.mem.Allocator.Error!void {
-            _ = try self.queue.pushValue(self.allocator, UploadCtx{
-                .ptr = ctx_ptr,
-                .actionFn = struct {
-                    fn actionFn(ptr: *anyopaque, action: UploadCtx.Action) void {
-                        const Ptr = @TypeOf(ctx_ptr);
-                        const ctx: Ptr = @ptrCast(@alignCast(ptr));
-                        switch (action) {
-                            .update => |percentage| ctx.update(percentage),
-                            .close => |fd| ctx.close(fd),
-                        }
-                    }
-                }.actionFn,
+            const data = UploadCtx.Data{
                 .file = file,
-            });
+                .precalculated_digest = if (precalclulated_digest) |digest| digest.* else null,
+            };
+            _ = try self.queue.pushValue(self.allocator, UploadCtx.init(data, ctx_ptr));
         }
 
         fn uploadPipeLineThread(upp: *Self) void {
+            var arena_state = std.heap.ArenaAllocator.init(upp.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var client = std.http.Client{
+                .allocator = upp.allocator,
+            };
+            defer client.deinit();
+
             while (true) {
-                const upload_ctx: *UploadCtx = upp.queue.popBorrowed() orelse {
-                    // TODO: should this use a more strict memory order?
-                    if (upp.must_stop.load(.Monotonic)) break;
+                for (0..3) |_| {
+                    if (arena_state.reset(.retain_capacity)) break;
+                } else assert(arena_state.reset(.free_all));
+
+                const up_ctx: *UploadCtx = upp.queue.popBorrowed() orelse {
+                    if (upp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                defer upp.queue.destroyBorrowed(upload_ctx);
-                errdefer upload_ctx.close();
-                @panic("TODO");
+                defer upp.queue.destroyBorrowed(up_ctx);
+                defer up_ctx.close();
+                const data = up_ctx.data;
+
+                const file_size = if (data.file.stat()) |stat| 2 * stat.size else |err| @panic(switch (err) {
+                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                });
+
+                const file_digest: [Sha256.digest_length]u8 = data.precalculated_digest orelse digest: {
+                    const Sha256HasherReader = struct {
+                        hasher: *Sha256,
+                        inner: Inner,
+                        const Self = @This();
+
+                        const Inner = std.fs.File.Reader;
+
+                        const Reader = std.io.Reader(@This(), Inner.Error, @This().read);
+                        fn reader(self: @This()) Reader {
+                            return .{ .context = self };
+                        }
+                        fn read(self: @This(), buf: []u8) Inner.Error!usize {
+                            const result = try self.inner.read(buf);
+                            self.hasher.update(buf[0..result]);
+                            return result;
+                        }
+                    };
+                    var hasher = Sha256.init(.{});
+                    const hasher_reader = Sha256HasherReader.reader(.{
+                        .hasher = &hasher,
+                        .inner = data.file.reader(),
+                    });
+                    const Fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 });
+                    var fifo: Fifo = Fifo.init();
+                    defer fifo.deinit();
+
+                    fifo.pump(hasher_reader, std.io.null_writer) catch |err| @panic(switch (err) {
+                        inline else => |e| "Decide how to handle " ++ @errorName(e),
+                    });
+                    data.file.seekTo(0) catch |err| @panic(switch (err) {
+                        inline else => |e| "Decide how to handle " ++ @errorName(e),
+                    });
+
+                    break :digest hasher.finalResult();
+                };
+
+                var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
+                defer for (requests.slice()) |*req| req.deinit();
+
+                if (upp.server_info.google_cloud) |gc| {
+                    const authorization = upp.gc_authorization_str.?;
+
+                    assert(upp.headers_buf.getIndices("Authorization").?.len == 1);
+                    assert(upp.headers_buf.getIndices("Transfer-Encoding").?.len == 1);
+                    upp.headers_buf.list.items[upp.headers_buf.firstIndexOf("Authorization").?].value = authorization;
+                    upp.headers_buf.list.items[upp.headers_buf.firstIndexOf("Transfer-Encoding").?].value = "chunked";
+
+                    const headers = upp.headers_buf;
+
+                    for (gc.bucket_names) |bucket_name| {
+                        const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
+                            .bucket = bucket_name,
+                            .object = digestBytesToString(file_digest),
+                        }) catch |err| switch (err) {
+                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                        };
+                        const uri = std.Uri.parse(uri_str) catch unreachable;
+
+                        const req = client.request(.PUT, uri, headers, .{}) catch |err| switch (err) {
+                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                        requests.appendAssumingCapacity(req);
+                    }
+                }
+
+                for (requests.slice()) |*req| req.start() catch |err| @panic(switch (err) {
+                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                });
+
+                var bytes_uploaded: u64 = 0;
+                const WritersCtx = struct {
+                    requests: []std.http.Client.Request,
+                    up_ctx: *UploadCtx,
+                    bytes_uploaded: *u64,
+                    file_size: u64,
+
+                    const WriterCtx = struct {
+                        inner: Inner,
+                        up_ctx: *UploadCtx,
+                        bytes_uploaded: *u64,
+                        file_size: u64,
+
+                        const Inner = std.http.Client.Request.Writer;
+                        const Error = Inner.Error;
+                        fn write(self: @This(), bytes: []const u8) Error!usize {
+                            const written = try self.inner.write(bytes);
+                            self.bytes_uploaded.* += written;
+                            self.up_ctx.update(@intCast((self.bytes_uploaded.* * 100) / self.file_size));
+                            return written;
+                        }
+                    };
+                    pub inline fn getWriter(ctx: @This(), idx: u7) std.io.Writer(WriterCtx, WriterCtx.Error, WriterCtx.write) {
+                        return .{ .context = .{
+                            .inner = ctx.requests[idx].writer(),
+                            .up_ctx = ctx.up_ctx,
+                            .bytes_uploaded = ctx.bytes_uploaded,
+                            .file_size = ctx.file_size,
+                        } };
+                    }
+                };
+                const writers_ctx = WritersCtx{
+                    .requests = requests.slice(),
+                    .up_ctx = up_ctx,
+                    .bytes_uploaded = &bytes_uploaded,
+                    .file_size = file_size,
+                };
+
+                var buffered = std.io.bufferedReader(data.file.reader());
+                _ = upp.ec.encodeCtx(buffered.reader(), writers_ctx) catch |err| switch (err) {
+                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                };
+
+                for (requests.slice()) |*req| req.finish() catch |err| @panic(switch (err) {
+                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                });
+
+                for (@as([]std.http.Client.Request, requests.slice())) |*req| {
+                    req.wait() catch |err| switch (err) {
+                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    };
+                }
             }
         }
     };
@@ -197,11 +385,9 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
     };
     defer client.deinit();
 
-    assert(server_info.bucketCount() == 6);
-
-    var ec: erasure.Coder(u32) = blk: {
+    var ec: erasure.Coder(u8) = blk: {
         var retry_count: u16 = 0;
-        while (true) break :blk erasure.Coder(u32).init(allocator, @intCast(server_info.bucketCount()), 3) catch |err| switch (err) {
+        while (true) break :blk erasure.Coder(u8).init(allocator, @intCast(server_info.bucketCount()), server_info.shard_size) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (retry_count == err_handling_hints.max_oom_retries) @panic("TODO: handle retrying the maximum number of times");
                 retry_count += 1;
@@ -237,203 +423,87 @@ pub fn encodeDecodeThread(args: EncodeDecodeThreadArgs) void {
             };
         };
 
-        switch (node.data) {
-            .encode => |*data| {
-                defer if (data.close_after) data.file.close();
+        const data = &node.data;
+        const excluded_shards = erasure.sampleIndexSet(
+            random,
+            ec.shardCount(),
+            ec.shardCount() - ec.shardSize(),
+        );
 
-                const file_digest: [Sha256.digest_length]u8 = digest: {
-                    const Sha256HasherReader = struct {
-                        hasher: *Sha256,
-                        inner: Inner,
-                        const Self = @This();
+        var requests = std.ArrayList(std.http.Client.Request).init(arena);
+        defer for (requests.items) |*req| req.deinit();
+        var shard_idx: u8 = 0;
 
-                        const Inner = std.fs.File.Reader;
+        if (server_info.google_cloud) |gc| (oom: {
+            const authorization = std.fmt.allocPrint(arena, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()}) catch |err| break :oom err;
 
-                        const Reader = std.io.Reader(Self, Inner.Error, Self.read);
-                        fn reader(self: Self) Reader {
-                            return .{ .context = self };
-                        }
-                        fn read(self: Self, buf: []u8) Inner.Error!usize {
-                            const result = try self.inner.read(buf);
-                            self.hasher.update(buf[0..result]);
-                            return result;
-                        }
-                    };
-                    var hasher = Sha256.init(.{});
-                    const hasher_reader = Sha256HasherReader.reader(.{
-                        .hasher = &hasher,
-                        .inner = data.file.reader(),
-                    });
-                    const Fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 });
-                    var fifo: Fifo = Fifo.init();
-                    defer fifo.deinit();
+            var headers = std.http.Headers.init(arena);
+            headers.owned = false;
+            headers.append("Authorization", authorization) catch |err| break :oom err;
 
-                    fifo.pump(hasher_reader, std.io.null_writer) catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
-                    data.file.seekTo(0) catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
+            for (gc.bucket_names) |bucket_name| {
+                {
+                    defer shard_idx += 1;
+                    if (excluded_shards.isSet(shard_idx)) continue;
+                }
 
-                    break :digest hasher.finalResult();
-                };
+                const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
+                    .bucket = bucket_name,
+                    .object = digestBytesToString(data.digest),
+                }) catch |err| break :oom err;
+                const uri = std.Uri.parse(uri_str) catch unreachable;
 
-                var requests = std.ArrayList(std.http.Client.Request).init(arena);
-                defer for (requests.items) |*req| req.deinit();
-
-                if (server_info.google_cloud) |gc| (oom: {
-                    const authorization = std.fmt.allocPrint(arena, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()}) catch |err| break :oom err;
-
-                    var headers = std.http.Headers.init(arena);
-                    headers.owned = false;
-                    headers.append("Authorization", authorization) catch |err| break :oom err;
-                    headers.append("Transfer-Encoding", "chunked") catch |err| break :oom err;
-
-                    for (gc.bucket_names) |bucket_name| {
-                        const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
-                            .bucket = bucket_name,
-                            .object = std.fmt.bytesToHex(file_digest, .lower),
-                        }) catch |err| break :oom err;
-                        const uri = std.Uri.parse(uri_str) catch unreachable;
-
-                        const req = client.request(.PUT, uri, headers, .{}) catch |err| switch (err) {
-                            error.OutOfMemory => |e| break :oom e,
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        requests.append(req) catch |err| break :oom err;
-                    }
-                }) catch |err| switch (err) {
-                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                };
-
-                for (requests.items) |*req| req.start() catch |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
-
-                const WritersCtx = struct {
-                    requests: []std.http.Client.Request,
-
-                    pub inline fn getWriter(ctx: @This(), idx: u7) std.http.Client.Request.Writer {
-                        return ctx.requests[idx].writer();
-                    }
-                };
-
-                var buffered = std.io.bufferedReader(data.file.reader());
-                _ = ec.encodeCtx(buffered.reader(), WritersCtx{ .requests = requests.items }) catch |err| switch (err) {
+                const req = client.request(.GET, uri, headers, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => |e| break :oom e,
                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                 };
+                requests.append(req) catch |err| break :oom err;
+            }
+        }) catch |err| switch (err) {
+            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+        };
 
-                for (requests.items) |*req| req.finish() catch |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
-                for (requests.items) |*req| {
-                    req.wait() catch |err| switch (err) {
-                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                    };
-                }
-
-                data.wip.encoded_file = .{
-                    .digest = file_digest,
-                };
-                data.wip.reset_event.set();
-            },
-            .decode => |*data| {
-                const excluded_shards = erasure.sampleIndexSet(
-                    random,
-                    ec.shardCount(),
-                    ec.shardCount() - ec.shardSize(),
-                );
-
-                var requests = std.ArrayList(std.http.Client.Request).init(arena);
-                defer for (requests.items) |*req| req.deinit();
-                var shard_idx: u8 = 0;
-
-                if (server_info.google_cloud) |gc| (oom: {
-                    const authorization = std.fmt.allocPrint(arena, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()}) catch |err| break :oom err;
-
-                    var headers = std.http.Headers.init(arena);
-                    headers.owned = false;
-                    headers.append("Authorization", authorization) catch |err| break :oom err;
-
-                    for (gc.bucket_names) |bucket_name| {
-                        {
-                            defer shard_idx += 1;
-                            if (excluded_shards.isSet(shard_idx)) continue;
-                        }
-
-                        const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
-                            .bucket = bucket_name,
-                            .object = std.fmt.bytesToHex(data.digest, .lower),
-                        }) catch |err| break :oom err;
-                        const uri = std.Uri.parse(uri_str) catch unreachable;
-
-                        const req = client.request(.GET, uri, headers, .{}) catch |err| switch (err) {
-                            error.OutOfMemory => |e| break :oom e,
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        requests.append(req) catch |err| break :oom err;
-                    }
-                }) catch |err| switch (err) {
-                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                };
-
-                for (requests.items) |*req| {
-                    req.start() catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
-                    req.finish() catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
-                }
-
-                for (requests.items) |*req| req.wait() catch |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
-
-                const ReadersCtx = struct {
-                    requests: []std.http.Client.Request,
-
-                    pub fn getReader(ctx: @This(), idx: u7) std.http.Client.Request.Reader {
-                        return ctx.requests[idx].reader();
-                    }
-                };
-
-                var decoded = std.ArrayList(u8).initCapacity(allocator, 2e8) catch |err| switch (err) {
-                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                };
-                defer decoded.deinit();
-
-                // var buffered = std.io.bufferedWriter(decoded.writer());
-                _ = ec.decodeCtx(excluded_shards, decoded.writer(), ReadersCtx{ .requests = requests.items }) catch |err| switch (err) {
-                    inline else => |e| @panic("TODO: decide how to handle " ++ @errorName(e)),
-                };
-                // buffered.flush() catch |err| @panic(@errorName(err));
-
-                data.wip.decoded_file = .{
-                    .data = decoded.toOwnedSlice() catch |err| switch (err) {
-                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                    },
-                };
-                data.wip.reset_event.set();
-            },
+        for (requests.items) |*req| {
+            req.start() catch |err| @panic(switch (err) {
+                inline else => |e| "Decide how to handle " ++ @errorName(e),
+            });
+            req.finish() catch |err| @panic(switch (err) {
+                inline else => |e| "Decide how to handle " ++ @errorName(e),
+            });
         }
+
+        for (requests.items) |*req| req.wait() catch |err| @panic(switch (err) {
+            inline else => |e| "Decide how to handle " ++ @errorName(e),
+        });
+
+        const ReadersCtx = struct {
+            requests: []std.http.Client.Request,
+
+            pub fn getReader(ctx: @This(), idx: u7) std.http.Client.Request.Reader {
+                return ctx.requests[idx].reader();
+            }
+        };
+
+        var decoded = std.ArrayList(u8).initCapacity(allocator, 2e8) catch |err| switch (err) {
+            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+        };
+        defer decoded.deinit();
+
+        // var buffered = std.io.bufferedWriter(decoded.writer());
+        _ = ec.decodeCtx(excluded_shards, decoded.writer(), ReadersCtx{ .requests = requests.items }) catch |err| switch (err) {
+            inline else => |e| @panic("TODO: decide how to handle " ++ @errorName(e)),
+        };
+        // buffered.flush() catch |err| @panic(@errorName(err));
+
+        data.wip.decoded_file = .{
+            .data = decoded.toOwnedSlice() catch |err| switch (err) {
+                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+            },
+        };
+        data.wip.reset_event.set();
     }
 }
 
-pub const EncodedFile = struct {
-    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-
-    pub const Wip = struct {
-        reset_event: std.Thread.ResetEvent = .{},
-        encoded_file: ?EncodedFile = null,
-
-        pub fn wait(wip: *Wip) EncodedFile {
-            wip.reset_event.wait();
-            return wip.encoded_file.?;
-        }
-    };
-};
 pub const DecodedFile = struct {
     data: []const u8,
 
@@ -462,48 +532,9 @@ pub const EncDecQueue = struct {
         self.queue = .{};
     }
 
-    pub fn queueFileForEncoding(
-        self: *EncDecQueue,
-        file: std.fs.File,
-        /// Whether or not the file handle should be closed after it has been encoded
-        close_handling: enum { close_after, dont_close },
-    ) std.mem.Allocator.Error!*EncodedFile.Wip {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const node = try self.newNode();
-        errdefer self.unUseNode(node);
-
-        node.* = .{ .data = .{ .encode = undefined } };
-        self.queue.append(node);
-        const encode = &node.data.encode;
-
-        encode.* = .{
-            .file = file,
-            .close_after = close_handling == .close_after,
-            .wip = .{},
-        };
-
-        return &encode.wip;
-    }
-
-    pub fn releaseEncodedFile(
-        self: *EncDecQueue,
-        wip: *EncodedFile.Wip,
-    ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const encode = @fieldParentPtr(CmdQueueItem.Encode, "wip", wip);
-        const data = @fieldParentPtr(CmdQueueItem, "encode", encode);
-        const node = @fieldParentPtr(CmdTailQueue.Node, "data", data);
-
-        self.unUseNode(node);
-    }
-
     pub fn queueFileForDecoding(
         self: *EncDecQueue,
-        digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        digest: [Sha256.digest_length]u8,
     ) std.mem.Allocator.Error!*DecodedFile.Wip {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -511,9 +542,9 @@ pub const EncDecQueue = struct {
         const node = try self.newNode();
         errdefer self.unUseNode(node);
 
-        node.* = .{ .data = .{ .decode = undefined } };
+        node.* = .{ .data = undefined };
         self.queue.append(node);
-        const decode = &node.data.decode;
+        const decode = &node.data;
 
         decode.* = .{
             .digest = digest,
@@ -532,8 +563,7 @@ pub const EncDecQueue = struct {
         const info = wip.wait();
         self.allocator.free(info.data);
 
-        const encode = @fieldParentPtr(CmdQueueItem.Decode, "wip", wip);
-        const data = @fieldParentPtr(CmdQueueItem, "decode", encode);
+        const data = @fieldParentPtr(CmdQueueItem, "wip", wip);
         const node = @fieldParentPtr(CmdTailQueue.Node, "data", data);
 
         self.unUseNode(node);
@@ -563,19 +593,9 @@ pub const EncDecQueue = struct {
 
     const CmdList = std.SegmentedList(CmdTailQueue.Node, 0);
     const CmdTailQueue = std.TailQueue(CmdQueueItem);
-    const CmdQueueItem = union(enum) {
-        encode: Encode,
-        decode: Decode,
-
-        const Encode = struct {
-            file: std.fs.File,
-            close_after: bool,
-            wip: EncodedFile.Wip,
-        };
-        const Decode = struct {
-            digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-            wip: DecodedFile.Wip,
-        };
+    const CmdQueueItem = struct {
+        digest: [Sha256.digest_length]u8,
+        wip: DecodedFile.Wip,
     };
 };
 
@@ -595,6 +615,28 @@ pub fn main() !void {
     const gc_auth_token = try std.process.getEnvVarOwned(allocator, "ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY");
     defer allocator.free(gc_auth_token);
 
+    const server_info = ServerInfo{
+        .google_cloud = .{
+            .auth_token = SensitiveBytes.init(gc_auth_token),
+            .bucket_names = &[_][]const u8{
+                "ec1.blocktube.net",
+                "ec2.blocktube.net",
+                "ec3.blocktube.net",
+                "ec4.blocktube.net",
+                "ec5.blocktube.net",
+                "ec6.blocktube.net",
+            },
+        },
+        .shard_size = 3,
+    };
+
+    var upload_pipeline: UploadPipeLine(u8) = undefined;
+    try upload_pipeline.init(allocator, .{
+        .queue_capacity = 8,
+        .server_info = server_info,
+    });
+    defer upload_pipeline.deinit(.finish_remaining_uploads);
+
     var ect_prng = std.rand.DefaultPrng.init(1234);
 
     var must_stop = std.atomic.Atomic(bool).init(false);
@@ -606,19 +648,7 @@ pub fn main() !void {
 
         .must_stop = &must_stop,
 
-        .server_info = .{
-            .google_cloud = .{
-                .auth_token = SensitiveBytes.init(gc_auth_token),
-                .bucket_names = &[_][]const u8{
-                    "ec1.blocktube.net",
-                    "ec2.blocktube.net",
-                    "ec3.blocktube.net",
-                    "ec4.blocktube.net",
-                    "ec5.blocktube.net",
-                    "ec6.blocktube.net",
-                },
-            },
-        },
+        .server_info = server_info,
     }});
     defer th.join();
     defer must_stop.store(true, .Monotonic);
@@ -645,27 +675,63 @@ pub fn main() !void {
             const input = try std.fs.cwd().openFile(input_path, .{});
             errdefer input.close();
 
-            const wip = try queue.queueFileForEncoding(input, .close_after);
-            defer queue.releaseEncodedFile(wip);
+            var progress = std.Progress{};
+            const root_node = progress.start("Upload", 100);
+            root_node.activate();
 
-            const info = wip.wait();
-            std.log.info("Encoded file SHA-256 digest: {s}", .{std.fmt.bytesToHex(info.digest, .lower)});
+            const WaitCtx = struct {
+                progress: *std.Progress.Node,
+                close_re: std.Thread.ResetEvent = .{},
+
+                pub inline fn update(self: *@This(), percentage: u8) void {
+                    self.progress.setCompletedItems(percentage);
+                    self.progress.context.maybeRefresh();
+                }
+                pub inline fn close(self: *@This(), file: std.fs.File) void {
+                    file.close();
+                    self.close_re.set();
+                    while (self.close_re.isSet()) {}
+                }
+            };
+            var wait_ctx = WaitCtx{
+                .progress = root_node,
+            };
+
+            try upload_pipeline.uploadFile(input, null, &wait_ctx);
+            wait_ctx.close_re.wait();
+            root_node.end();
+            wait_ctx.close_re.reset();
+
+            std.log.info("Finished encoding '{s}'", .{input_path});
         } else if (std.mem.eql(u8, cmd, "decode")) {
             const digest_str = tokenizer.next() orelse continue;
-            const expected_len = std.crypto.hash.sha2.Sha256.digest_length;
-            if (digest_str.len != expected_len * 2) {
-                std.log.err("Invalid digest length", .{});
+            const digest: [Sha256.digest_length]u8 = digestStringToBytes(digest_str) catch |err| {
+                std.log.err("|{s}| Invalid digest", .{@errorName(err)});
                 continue;
-            }
-            var digest: [expected_len]u8 = undefined;
-            assert(digest.len == (std.fmt.hexToBytes(&digest, digest_str) catch unreachable).len);
+            };
 
             const wip = try queue.queueFileForDecoding(digest);
             defer queue.releaseDecodedFile(wip);
 
             const info = wip.wait();
-            std.log.err("writing to {s}.out", .{std.fmt.bytesToHex(digest, .lower)});
-            try std.fs.cwd().writeFile(&std.fmt.bytesToHex(digest, .lower) ++ ".out".*, info.data);
+            std.log.err("writing to {s}.out", .{digestBytesToString(digest)});
+            try std.fs.cwd().writeFile(&digestBytesToString(digest) ++ ".out".*, info.data);
         }
     }
+}
+
+fn digestBytesToString(bytes: [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
+    return std.fmt.bytesToHex(bytes, .lower);
+}
+fn digestStringToBytes(str: []const u8) error{ InvalidDigestLength, InvalidCharacter }![Sha256.digest_length]u8 {
+    if (str.len != Sha256.digest_length * 2)
+        return error.InvalidDigestLength;
+    var digest = [_]u8{0} ** Sha256.digest_length;
+    const digest_slice = std.fmt.hexToBytes(&digest, str) catch |err| switch (err) {
+        error.InvalidLength => unreachable,
+        error.NoSpaceLeft => unreachable,
+        error.InvalidCharacter => |e| return e,
+    };
+    assert(digest.len == digest_slice.len);
+    return digest;
 }

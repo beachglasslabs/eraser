@@ -310,7 +310,6 @@ pub const IndexSet = struct {
     }
 };
 
-/// All integers in the provided each of the slices should be unique
 pub inline fn subView(
     self: *const Matrix,
     excluded_rows: IndexSet,

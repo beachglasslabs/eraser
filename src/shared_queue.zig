@@ -19,7 +19,7 @@ pub fn SharedQueue(comptime T: type) type {
             mutex: *std.Thread.Mutex,
             allocator: std.mem.Allocator,
             capacity: usize,
-        ) std.mem.Allocator.Error!void {
+        ) std.mem.Allocator.Error!Self {
             var self: Self = .{ .mutex = mutex };
             errdefer self.deinit(allocator);
             if (capacity == 0) return self;

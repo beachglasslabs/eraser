@@ -36,13 +36,6 @@ pub fn initCauchy(allocator: std.mem.Allocator, rows: u8, cols: u8, exp: galois.
     };
 }
 
-pub fn initMatrix(matrix: Matrix, b: galois.BinaryField.Exp) !BinaryFieldMatrix {
-    return .{
-        .field = try galois.BinaryField.init(b),
-        .matrix = matrix,
-    };
-}
-
 pub fn clone(self: BinaryFieldMatrix, allocator: std.mem.Allocator) !BinaryFieldMatrix {
     return .{
         .field = self.field,
@@ -147,8 +140,10 @@ fn toCauchy(allocator: std.mem.Allocator, field: galois.BinaryField, rows: u8, c
             const col_idx: u8 = @intCast(n_i);
 
             const idx: Matrix.CellIndex = .{ .row = row_idx, .col = col_idx };
-            const inverted = try field.invert(try field.sub(row_idx + cols, col_idx));
-            cnm.set(idx, inverted);
+            cnm.set(idx, try field.cauchyMatrixCellValue(.{
+                .idx = idx,
+                .cols = cols,
+            }));
         }
     }
 
@@ -292,8 +287,10 @@ pub fn toBinaryWith(
     mat_buf: []u8,
     tmp_buf: []u8,
 ) galois.BinaryField.ValidateError!BinaryFieldMatrix {
+    assert(mat_buf.len == self.toBinaryCellCount());
     var matrix = Matrix.initWith(mat_buf, self.numRows() * self.field.exponent(), self.numCols() * self.field.exponent());
 
+    assert(tmp_buf.len == self.toBinaryTempBufCellCount());
     var bfm = Matrix.initWith(tmp_buf, self.field.exponent(), self.field.exponent());
 
     for (0..self.numRows()) |r| {
@@ -375,7 +372,10 @@ fn multiply(
 test "square matrix" {
     const field = try galois.BinaryField.init(3);
 
-    var bfm = try BinaryFieldMatrix.initMatrix(try field.toMatrix(std.testing.allocator, 5), 3);
+    var bfm = BinaryFieldMatrix{
+        .matrix = try field.toMatrix(std.testing.allocator, 5),
+        .field = field,
+    };
     defer bfm.deinit(std.testing.allocator);
 
     var inverse = try bfm.invert(std.testing.allocator);

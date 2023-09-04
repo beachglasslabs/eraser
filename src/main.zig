@@ -1,15 +1,15 @@
 const std = @import("std");
 
+const galois = @import("galois.zig");
 const erasure = @import("erasure.zig");
-pub const Matrix = @import("Matrix.zig");
-pub const BinaryFiniteField = @import("galois.zig").BinaryField;
-pub const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
+const Matrix = @import("Matrix.zig");
+const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
 test {
-    _ = Matrix;
-    _ = BinaryFiniteField;
-    _ = BinaryFieldMatrix;
+    _ = galois;
     _ = erasure;
+    _ = Matrix;
+    _ = BinaryFieldMatrix;
     _ = @import("SensitiveBytes.zig");
 }
 
