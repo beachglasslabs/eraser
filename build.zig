@@ -7,13 +7,19 @@ pub fn build(b: *Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const difftest_file_paths = b.option([]const []const u8, "dt", "List of paths of inputs to test") orelse &.{};
 
+    const shard_count = b.option([]const u8, "shard-count", "Erasure shard count to specify for executables and tests");
+    const shard_size = b.option([]const u8, "shard-size", "Erasure shard size to specify for executables and tests");
+    const word_size = b.option([]const u8, "word-size", "Erasure word size to specify for executables and tests");
+
     // top level steps
     const run_step = b.step("run", "Run the app");
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
-    const run_libtest = b.step("run-lib", "Run the library test executable");
+    const run_libtest = b.step("pipeline-demo", "Run the library test executable");
 
-    _ = b.addModule("eraser", .{ .source_file = Build.LazyPath.relative("src/lib.zig") });
+    // everything else
+
+    const eraser_mod = b.addModule("eraser", .{ .source_file = Build.LazyPath.relative("src/lib.zig") });
 
     const exe = b.addExecutable(.{
         .name = "eraser",
@@ -39,7 +45,11 @@ pub fn build(b: *Build) void {
 
     for (difftest_file_paths) |file_path| {
         const input = Build.LazyPath.relative(file_path);
-        const output = encodeAndDecode(b, exe, input, .{});
+        const output = encodeAndDecode(b, exe, input, .{
+            .n = shard_count,
+            .k = shard_size,
+            .w = word_size,
+        });
 
         const difftest_exe = b.addTest(.{
             .name = b.fmt("difftest__{s}", .{std.fs.path.basename(file_path)}),
@@ -57,12 +67,13 @@ pub fn build(b: *Build) void {
     }
 
     const libtest_exe = b.addExecutable(.{
-        .name = "libtest",
-        .root_source_file = Build.LazyPath.relative("src/lib.zig"),
+        .name = "pipelines-demo",
+        .root_source_file = Build.LazyPath.relative("tests/pipelines-demo.zig"),
         .target = target,
         .optimize = optimize,
     });
     b.installArtifact(libtest_exe);
+    libtest_exe.addModule("eraser", eraser_mod);
 
     const libtest_run = b.addRunArtifact(libtest_exe);
     run_libtest.dependOn(&libtest_run.step);
@@ -78,8 +89,8 @@ fn encodeAndDecode(
     eraser_artifact: *Build.CompileStep,
     input: Build.LazyPath,
     options: struct {
-        n: ?u8 = null,
-        k: ?u8 = null,
+        n: ?[]const u8 = null,
+        k: ?[]const u8 = null,
         w: ?[]const u8 = null,
     },
 ) Build.LazyPath {
@@ -95,11 +106,11 @@ fn encodeAndDecode(
 
     if (options.n) |n| {
         run_exe_difftest_encode.addArg("-n");
-        run_exe_difftest_encode.addArg(b.fmt("{d}", .{n}));
+        run_exe_difftest_encode.addArg(n);
     }
     if (options.k) |k| {
         run_exe_difftest_encode.addArg("-k");
-        run_exe_difftest_encode.addArg(b.fmt("{d}", .{k}));
+        run_exe_difftest_encode.addArg(k);
     }
     if (options.w) |w| {
         run_exe_difftest_encode.addArg("-w");

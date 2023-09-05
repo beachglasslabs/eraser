@@ -8,6 +8,14 @@ const erasure = @import("erasure.zig");
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
 pub const SharedQueue = @import("shared_queue.zig").SharedQueue;
 
+pub const chunk_size: comptime_int = 15 * bytes_per_megabyte;
+const bytes_per_megabyte = 1e7;
+
+const ChunkCount = std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size);
+inline fn chunksForFileSize(size: u64) std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size) {
+    return @intCast(size / chunk_size + 1);
+}
+
 pub const ServerInfo = struct {
     shard_size: u7,
     google_cloud: ?GoogleCloud = null,
@@ -16,7 +24,89 @@ pub const ServerInfo = struct {
         auth_token: SensitiveBytes,
         bucket_names: []const []const u8,
 
+        const authorization_value_fmt = "Bearer {[auth_token]s}";
         const bucket_object_uri_fmt = "https://storage.googleapis.com/{[bucket]s}/{[object]s}";
+
+        fn preAllocated(gc: GoogleCloud, allocator: std.mem.Allocator) std.mem.Allocator.Error!PreAllocated {
+            var full_size: usize = 0;
+            full_size += std.fmt.count(authorization_value_fmt, .{ .auth_token = gc.auth_token.getSensitiveSlice() });
+
+            for (gc.bucket_names) |bucket_name| {
+                const max_digest_str: []const u8 = comptime &digestBytesToString("\xff".* ** Sha256.digest_length);
+                full_size += std.fmt.count(bucket_object_uri_fmt, .{
+                    .bucket = bucket_name,
+                    .object = max_digest_str,
+                });
+            }
+
+            const full_buf_alloc = try allocator.alloc(u8, full_size);
+            errdefer allocator.free(full_buf_alloc);
+
+            const authorization_value = std.fmt.bufPrint(full_buf_alloc, authorization_value_fmt, .{ .auth_token = gc.auth_token.getSensitiveSlice() }) catch unreachable;
+            const bucket_uris_buf = full_buf_alloc[authorization_value.len..];
+
+            var headers = std.http.Headers.init(allocator);
+            errdefer headers.deinit();
+            headers.owned = false;
+
+            try headers.append("Authorization", authorization_value);
+            try headers.append("Transfer-Encoding", "chunked");
+
+            return .{
+                .full_buf_alloc = full_buf_alloc,
+                .authorization_value = authorization_value,
+                .bucket_uris_buf = bucket_uris_buf,
+                .headers = headers,
+            };
+        }
+
+        const PreAllocated = struct {
+            full_buf_alloc: []u8,
+            authorization_value: []const u8,
+            bucket_uris_buf: []u8,
+            headers: std.http.Headers,
+
+            pub fn deinit(pre_allocated: PreAllocated, allocator: std.mem.Allocator) void {
+                allocator.free(pre_allocated.full_buf_alloc);
+
+                var headers_copy = pre_allocated.headers;
+                headers_copy.allocator = allocator;
+                headers_copy.deinit();
+            }
+
+            /// The strings obtained from the returned iterator are valid until the next call to this function.
+            pub fn bucketObjectUriIterator(self: PreAllocated, gc: GoogleCloud, object: *const [Sha256.digest_length]u8) BucketObjectUriIterator {
+                return .{
+                    .bucket_names = gc.bucket_names,
+                    .bytes = .{ .buffer = self.bucket_uris_buf },
+                    .object = object,
+                };
+            }
+
+            const BucketObjectUriIterator = struct {
+                index: usize = 0,
+                bucket_names: []const []const u8,
+                bytes: util.BoundedBufferArray(u8),
+                object: *const [Sha256.digest_length]u8,
+
+                /// Each string returned is a unique slice which does not overlap with any previously returned slice.
+                pub fn next(iter: *BucketObjectUriIterator) ?[]const u8 {
+                    if (iter.index == iter.bucket_names.len) return null;
+                    const bucket = iter.bucket_names[iter.index];
+                    iter.index += 1;
+
+                    const start = iter.bytes.len;
+                    iter.bytes.writer().print(bucket_object_uri_fmt, .{
+                        .bucket = bucket,
+                        .object = iter.object,
+                    }) catch |err| switch (err) {
+                        error.Overflow => unreachable,
+                    };
+                    const end = iter.bytes.len;
+                    return iter.bytes.slice()[start..end];
+                }
+            };
+        };
     };
 
     inline fn bucketCount(server_info: ServerInfo) usize {
@@ -35,7 +125,8 @@ pub const UploadCtx = struct {
 
     pub const Data = struct {
         file: std.fs.File,
-        precalculated_digest: ?[Sha256.digest_length]u8,
+        file_size: u64,
+        start: u64,
     };
 
     pub inline fn init(data: Data, ctx_ptr: anytype) UploadCtx {
@@ -83,11 +174,9 @@ pub const UploadCtx = struct {
 pub fn UploadPipeLine(comptime W: type) type {
     return struct {
         allocator: std.mem.Allocator,
-        server_info: ServerInfo,
         requests_buf: []std.http.Client.Request,
-        gc_authorization_str: ?[]const u8,
-        gc_headers: std.http.Headers,
-        gc_uris_buf: ?[]u8,
+        server_info: ServerInfo,
+        gc_prealloc: ?ServerInfo.GoogleCloud.PreAllocated,
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
@@ -115,15 +204,14 @@ pub fn UploadPipeLine(comptime W: type) type {
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
             self.* = .{
                 .allocator = allocator,
-                .server_info = values.server_info,
                 .requests_buf = &.{},
-                .gc_authorization_str = null,
-                .gc_headers = undefined,
-                .gc_uris_buf = null,
+                .server_info = values.server_info,
+                .gc_prealloc = null,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue = undefined,
+
                 .ec = undefined,
                 .thread = undefined,
             };
@@ -132,30 +220,9 @@ pub fn UploadPipeLine(comptime W: type) type {
             errdefer self.allocator.free(self.requests_buf);
 
             if (values.server_info.google_cloud) |gc| {
-                self.gc_authorization_str = try std.fmt.allocPrint(allocator, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()});
+                self.gc_prealloc = try gc.preAllocated(self.allocator);
             }
-            errdefer self.allocator.free(self.gc_authorization_str orelse &.{});
-
-            self.gc_headers = std.http.Headers.init(self.allocator);
-            errdefer self.gc_headers.deinit();
-            self.gc_headers.owned = false;
-            try self.gc_headers.append("Transfer-Encoding", "chunked");
-            if (self.gc_authorization_str) |auth_str| try self.gc_headers.append("Authorization", auth_str);
-
-            if (values.server_info.google_cloud) |gc| {
-                const dummy_digest_str: []const u8 = comptime &digestBytesToString("\xff".* ** Sha256.digest_length);
-
-                var total_bytes: usize = 0;
-                for (gc.bucket_names) |bucket_name| {
-                    total_bytes += std.fmt.count(ServerInfo.GoogleCloud.bucket_object_uri_fmt, .{
-                        .bucket = bucket_name,
-                        .object = dummy_digest_str,
-                    });
-                }
-
-                self.gc_uris_buf = try self.allocator.alloc(u8, total_bytes);
-            }
-            errdefer self.allocator.free(self.gc_uris_buf orelse &.{});
+            errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
             self.queue = try SharedQueue(UploadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
@@ -182,9 +249,7 @@ pub fn UploadPipeLine(comptime W: type) type {
             self.queue.deinit(self.allocator);
             self.ec.deinit(self.allocator);
             self.allocator.free(self.requests_buf);
-            self.gc_headers.deinit();
-            self.allocator.free(self.gc_authorization_str orelse &.{});
-            self.allocator.free(self.gc_uris_buf orelse &.{});
+            if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
         pub inline fn uploadFile(
@@ -193,18 +258,37 @@ pub fn UploadPipeLine(comptime W: type) type {
             /// succeeds, the caller must leave the closing of the
             /// file handle to the `ctx_ptr`.
             file: std.fs.File,
-            /// Optionally provide the SHA256 sum digest; if `null`, the
-            /// digest will be calculated during upload.
-            precalclulated_digest: ?*const [Sha256.digest_length]u8,
             /// A struct/union/enum/opaque pointer implementing
             /// the `UploadCtx` interface.
+            /// The pointer must outlive the function call, until
+            /// its `close` callback is called.
             ctx_ptr: anytype,
-        ) std.mem.Allocator.Error!void {
-            const data = UploadCtx.Data{
-                .file = file,
-                .precalculated_digest = if (precalclulated_digest) |digest| digest.* else null,
+            extra: struct {
+                /// Pre-calculated size of the file; if `null`,
+                /// the size will be determined during this function call.
+                file_size: ?u64 = null,
+            },
+        ) (std.mem.Allocator.Error || std.fs.File.StatError)!void {
+            const file_size: u64 = if (extra.file_size) |size| size else blk: {
+                const stat = try file.stat();
+                break :blk stat.size;
             };
-            _ = try self.queue.pushValue(self.allocator, UploadCtx.init(data, ctx_ptr));
+
+            const chunk_count: ChunkCount = @intCast((file_size / chunk_size) + 1);
+
+            self.queue.mutex.lock();
+            defer self.queue.mutex.unlock();
+
+            var start: u64 = 0;
+            for (0..chunk_count) |_| {
+                const data = UploadCtx.Data{
+                    .file = file,
+                    .file_size = file_size,
+                    .start = start,
+                };
+                start += chunk_size;
+                _ = self.queue.pushValueAssumeCapacityLocked(UploadCtx.init(data, ctx_ptr));
+            }
         }
 
         fn uploadPipeLineThread(upp: *Self) void {
@@ -214,20 +298,21 @@ pub fn UploadPipeLine(comptime W: type) type {
             defer client.deinit();
 
             while (true) {
-                const up_ctx: *UploadCtx = upp.queue.popBorrowed() orelse {
+                const up_ctx: UploadCtx = upp.queue.popValue() orelse {
                     if (upp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                defer upp.queue.destroyBorrowed(up_ctx);
                 defer up_ctx.close();
                 const data = up_ctx.data;
 
-                const file_size = if (data.file.stat()) |stat| 2 * stat.size else |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
+                const file_size = data.file_size;
+                if (data.start != 0) {
+                    std.log.err("TODO: actually chunk the file", .{});
+                    continue;
+                }
 
-                const file_digest: [Sha256.digest_length]u8 = data.precalculated_digest orelse digest: {
+                const file_digest: [Sha256.digest_length]u8 = digest: {
                     const Sha256HasherReader = struct {
                         hasher: *Sha256,
                         inner: Inner,
@@ -268,26 +353,12 @@ pub fn UploadPipeLine(comptime W: type) type {
                 defer for (requests.slice()) |*req| req.deinit();
 
                 if (upp.server_info.google_cloud) |gc| {
-                    // just used to do the equivalent of a `bufPrint` on segments of the buffer.
-                    var uri_buf = util.BoundedBufferArray(u8){ .buffer = upp.gc_uris_buf.? };
-                    const uri_writer = uri_buf.writer();
+                    const gc_prealloc = upp.gc_prealloc.?;
+                    var iter = gc_prealloc.bucketObjectUriIterator(gc, &file_digest);
 
-                    for (gc.bucket_names) |bucket_name| {
-                        const uri = blk: {
-                            const start = uri_buf.len;
-                            uri_writer.print(ServerInfo.GoogleCloud.bucket_object_uri_fmt, .{
-                                .bucket = bucket_name,
-                                .object = digestBytesToString(file_digest),
-                            }) catch |err| switch (err) {
-                                error.Overflow => unreachable,
-                            };
-                            const end = uri_buf.len;
-
-                            const uri_str = uri_buf.buffer[start..end];
-                            break :blk std.Uri.parse(uri_str) catch unreachable;
-                        };
-
-                        const req = client.request(.PUT, uri, upp.gc_headers, .{}) catch |err| switch (err) {
+                    while (iter.next()) |uri_str| {
+                        const uri = std.Uri.parse(uri_str) catch unreachable;
+                        const req = client.request(.PUT, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
                             error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
@@ -302,13 +373,13 @@ pub fn UploadPipeLine(comptime W: type) type {
                 var bytes_uploaded: u64 = 0;
                 const WritersCtx = struct {
                     requests: []std.http.Client.Request,
-                    up_ctx: *UploadCtx,
+                    up_ctx: UploadCtx,
                     bytes_uploaded: *u64,
                     file_size: u64,
 
                     const WriterCtx = struct {
                         inner: Inner,
-                        up_ctx: *UploadCtx,
+                        up_ctx: UploadCtx,
                         bytes_uploaded: *u64,
                         file_size: u64,
 
@@ -613,131 +684,10 @@ pub const EncDecQueue = struct {
     };
 };
 
-/// Purely for testing
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .thread_safe = true,
-    }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var queue = EncDecQueue{
-        .allocator = allocator,
-    };
-    defer queue.deinit();
-
-    const gc_auth_token = try std.process.getEnvVarOwned(allocator, "ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY");
-    defer allocator.free(gc_auth_token);
-
-    const server_info = ServerInfo{
-        .google_cloud = .{
-            .auth_token = SensitiveBytes.init(gc_auth_token),
-            .bucket_names = &[_][]const u8{
-                "ec1.blocktube.net",
-                "ec2.blocktube.net",
-                "ec3.blocktube.net",
-                "ec4.blocktube.net",
-                "ec5.blocktube.net",
-                "ec6.blocktube.net",
-            },
-        },
-        .shard_size = 3,
-    };
-
-    var upload_pipeline: UploadPipeLine(u8) = undefined;
-    try upload_pipeline.init(allocator, .{
-        .queue_capacity = 8,
-        .server_info = server_info,
-    });
-    defer upload_pipeline.deinit(.finish_remaining_uploads);
-
-    var ect_prng = std.rand.DefaultPrng.init(1234);
-
-    var must_stop = std.atomic.Atomic(bool).init(false);
-    const th = try std.Thread.spawn(.{}, encodeDecodeThread, .{EncodeDecodeThreadArgs{
-        .allocator = allocator,
-        .random = ect_prng.random(),
-
-        .cmd_queue = &queue,
-
-        .must_stop = &must_stop,
-
-        .server_info = server_info,
-    }});
-    defer th.join();
-    defer must_stop.store(true, .Monotonic);
-
-    var line_buffer = std.ArrayList(u8).init(allocator);
-    defer line_buffer.deinit();
-
-    while (true) {
-        line_buffer.clearRetainingCapacity();
-        try std.io.getStdIn().reader().streamUntilDelimiter(line_buffer.writer(), '\n', 1 << 21);
-        var tokenizer = std.mem.tokenizeAny(u8, line_buffer.items, &std.ascii.whitespace);
-
-        const cmd = tokenizer.next() orelse {
-            std.log.err("Missing command", .{});
-            continue;
-        };
-        assert(cmd.len != 0);
-        if (std.mem.startsWith(u8, "quit", cmd)) break; // all of "quit", "qui", "qu", "q" are treated the same
-
-        if (std.mem.eql(u8, cmd, "encode")) {
-            const input_path = tokenizer.next() orelse continue;
-
-            std.log.err("Queueing file '{s}' for encoding and upload", .{input_path});
-            const input = try std.fs.cwd().openFile(input_path, .{});
-            errdefer input.close();
-
-            var progress = std.Progress{};
-            const root_node = progress.start("Upload", 100);
-            root_node.activate();
-
-            const WaitCtx = struct {
-                progress: *std.Progress.Node,
-                close_re: std.Thread.ResetEvent = .{},
-
-                pub inline fn update(self: *@This(), percentage: u8) void {
-                    self.progress.setCompletedItems(percentage);
-                    self.progress.context.maybeRefresh();
-                }
-                pub inline fn close(self: *@This(), file: std.fs.File) void {
-                    file.close();
-                    self.close_re.set();
-                    while (self.close_re.isSet()) {}
-                }
-            };
-            var wait_ctx = WaitCtx{
-                .progress = root_node,
-            };
-
-            try upload_pipeline.uploadFile(input, null, &wait_ctx);
-            wait_ctx.close_re.wait();
-            root_node.end();
-            wait_ctx.close_re.reset();
-
-            std.log.info("Finished encoding '{s}'", .{input_path});
-        } else if (std.mem.eql(u8, cmd, "decode")) {
-            const digest_str = tokenizer.next() orelse continue;
-            const digest: [Sha256.digest_length]u8 = digestStringToBytes(digest_str) catch |err| {
-                std.log.err("|{s}| Invalid digest", .{@errorName(err)});
-                continue;
-            };
-
-            const wip = try queue.queueFileForDecoding(digest);
-            defer queue.releaseDecodedFile(wip);
-
-            const info = wip.wait();
-            std.log.err("writing to {s}.out", .{digestBytesToString(digest)});
-            try std.fs.cwd().writeFile(&digestBytesToString(digest) ++ ".out".*, info.data);
-        }
-    }
-}
-
-fn digestBytesToString(bytes: [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
+pub fn digestBytesToString(bytes: [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
     return std.fmt.bytesToHex(bytes, .lower);
 }
-fn digestStringToBytes(str: []const u8) error{ InvalidDigestLength, InvalidCharacter }![Sha256.digest_length]u8 {
+pub fn digestStringToBytes(str: []const u8) error{ InvalidDigestLength, InvalidCharacter }![Sha256.digest_length]u8 {
     if (str.len != Sha256.digest_length * 2)
         return error.InvalidDigestLength;
     var digest = [_]u8{0} ** Sha256.digest_length;
