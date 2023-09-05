@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub fn SharedQueue(comptime T: type) type {
     return struct {
@@ -22,11 +23,7 @@ pub fn SharedQueue(comptime T: type) type {
         ) std.mem.Allocator.Error!Self {
             var self: Self = .{ .mutex = mutex };
             errdefer self.deinit(allocator);
-            if (capacity == 0) return self;
-
-            try self.unused_nodes.ensureTotalCapacityPrecise(allocator, capacity);
-            try self.node_store.setCapacity(allocator, capacity);
-
+            try self.ensureUnusedCapacityLocked(allocator, capacity);
             return self;
         }
 
@@ -40,6 +37,25 @@ pub fn SharedQueue(comptime T: type) type {
             self.* = .{ .mutex = mtx };
         }
 
+        pub fn ensureUnusedCapacity(self: *Self, allocator: std.mem.Allocator, additional_count: usize) std.mem.Allocator.Error!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.ensureUnusedCapacityLocked(allocator, additional_count);
+        }
+
+        /// Similar to `ensureUnusedCapacity`, but assumes `self.mutex` is locked
+        pub fn ensureUnusedCapacityLocked(self: *Self, allocator: std.mem.Allocator, additional_count: usize) std.mem.Allocator.Error!void {
+            const unused_count = self.unused_nodes.items.len;
+            if (unused_count >= additional_count) return;
+            const num_added = additional_count - unused_count;
+
+            try self.unused_nodes.ensureUnusedCapacity(allocator, num_added);
+            try self.node_store.setCapacity(allocator, self.node_store.len + num_added);
+            for (0..num_added) |_| {
+                self.unused_nodes.appendAssumeCapacity(self.node_store.addOne(undefined) catch unreachable);
+            }
+        }
+
         /// Clears all items from the queue without reallocating.
         /// All pointers returned from `pushStart` and passed to `pushFinish`
         /// become un-bound from `self.mutex`, as though they had been
@@ -47,6 +63,11 @@ pub fn SharedQueue(comptime T: type) type {
         pub fn clearItems(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
+            self.clearItemsLocked();
+        }
+
+        /// Similar to `clearItems`, but assumes `self.mutex` is locked.
+        pub fn clearItemsLocked(self: *Self) void {
             self.tail_queue = .{};
         }
 
@@ -59,10 +80,26 @@ pub fn SharedQueue(comptime T: type) type {
         /// This is useful for when the item to be pushed is a
         /// simple value, whose address isn't relevant to its initialisation.
         pub fn pushValue(self: *Self, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!*T {
-            const ptr = try @call(.always_inline, Self.pushStart, .{ self, allocator });
-            errdefer @call(.always_inline, Self.pushCancel, .{ self, value });
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.ensureUnusedCapacityLocked(allocator, 1);
+            return self.pushValueAssumeCapacityLocked(value);
+        }
+
+        /// Same as `pushValue`, assuming capacity.
+        pub fn pushValueAssumeCapacity(self: *Self, value: T) *T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.pushValueAssumeCapacityLocked(value);
+        }
+
+        /// Similar to `pushValueAssumeCapacity`, but assumes `self.mutex`
+        /// is already locked. Useful for adding a number of items
+        /// one immediately after the other.
+        pub fn pushValueAssumeCapacityLocked(self: *Self, value: T) *T {
+            const ptr = @call(.always_inline, Self.pushStartAssumeCapacityLocked, .{self});
             ptr.* = value;
-            @call(.always_inline, Self.pushFinish, .{ self, ptr });
+            @call(.always_inline, Self.pushFinishLocked, .{ self, ptr });
             return ptr;
         }
 
@@ -83,17 +120,21 @@ pub fn SharedQueue(comptime T: type) type {
         pub fn pushStart(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error!*T {
             self.mutex.lock();
             errdefer self.mutex.unlock();
+            try self.ensureUnusedCapacityLocked(allocator, 1);
+            return self.pushStartAssumeCapacityLocked();
+        }
 
-            const node = try self.newNode(allocator);
-            errdefer self.cacheNode(node);
+        /// Same as `pushStart`, assuming capacity.
+        pub fn pushStartAssumeCapacity(self: *Self) *T {
+            self.mutex.lock();
+            return self.pushStartAssumeCapacityLocked();
+        }
 
-            node.* = .{
-                .prev = null,
-                .next = null,
-                .data = undefined,
-            };
-
-            return &node.data;
+        /// Similar to `pushStartAssumeCapacity`, but assumes `self.mutex`
+        /// is already locked. Can be called multiple times before calling
+        /// calling `pushFinishAssumeMutex` an equivalent number of times.
+        pub fn pushStartAssumeCapacityLocked(self: *Self) *T {
+            return &self.newNodeAssumeCapacity().data;
         }
 
         /// Complete the process of pushing the item to the queue,
@@ -105,9 +146,14 @@ pub fn SharedQueue(comptime T: type) type {
         /// and whichever other thread receives the pointer by
         /// calling `popBorrowed`.
         pub fn pushFinish(self: *Self, data: *T) void {
-            const node = @fieldParentPtr(Node, "data", data);
-            self.tail_queue.prepend(node);
+            self.pushFinishLocked(data);
             self.mutex.unlock();
+        }
+
+        /// Similar to `pushFinish`, but doesn't unlock `self.mutex`.
+        pub fn pushFinishLocked(self: *Self, data: *T) void {
+            const node = @fieldParentPtr(Node, "data", data);
+            self.pushNode(node);
         }
 
         /// Cancel the process of pushing the item to the queue,
@@ -119,9 +165,32 @@ pub fn SharedQueue(comptime T: type) type {
         /// could fail between `pushStart` and `pushFinish`.
         /// This will invalidate the `data` pointer.
         pub fn pushCancel(self: *Self, data: *T) void {
+            self.pushCancelLocked(data);
+            self.mutex.unlock();
+        }
+
+        /// Similar to `pushCancel`, but doesn't unlock `self.mutex`.
+        pub fn pushCancelLocked(self: *Self, data: *T) void {
             const node = @fieldParentPtr(Node, "data", data);
             self.cacheNode(node);
-            self.mutex.unlock();
+        }
+
+        /// Equivalent to:
+        /// ```
+        /// const ptr = try self.popBorrowed();
+        /// const value = ptr.*;
+        /// self.destroyBorrowed(ptr);
+        /// ```
+        /// This is useful for when the item to be popped is a
+        /// simple value, whose address isn't relevant to its initialisation.
+        pub fn popValue(self: *Self) ?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const node = self.popNode() orelse return null;
+            defer self.cacheNode(node);
+
+            return node.data;
         }
 
         /// If the queue is empty, returns `null`. Otherwise, pop an item
@@ -136,7 +205,7 @@ pub fn SharedQueue(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            const node = self.tail_queue.pop() orelse return null;
+            const node = self.popNode() orelse return null;
             return &node.data;
         }
         pub fn destroyBorrowed(self: *Self, borrowed: *T) void {
@@ -148,14 +217,34 @@ pub fn SharedQueue(comptime T: type) type {
         }
 
         /// Assumes `self.mutex` is locked.
-        inline fn newNode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error!*Node {
-            if (self.unused_nodes.popOrNull()) |node| return node;
-            try self.unused_nodes.ensureTotalCapacity(allocator, self.node_store.len + 1);
-            return try self.node_store.addOne(allocator);
+        inline fn pushNode(self: *Self, node: *Node) void {
+            self.tail_queue.prepend(node);
         }
 
         /// Assumes `self.mutex` is locked.
-        /// `node` must be the result of a call to `newNode`.
+        inline fn popNode(self: *Self) ?*Node {
+            return self.tail_queue.pop();
+        }
+
+        /// Assumes `self.mutex` is locked.
+        inline fn newNode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error!*Node {
+            try self.ensureUnusedCapacityLocked(allocator, 1);
+            return self.newNodeAssumeCapacity();
+        }
+
+        /// Assumes `self.mutex` is locked.
+        inline fn newNodeAssumeCapacity(self: *Self) *Node {
+            const result = self.unused_nodes.pop();
+            result.* = .{
+                .prev = null,
+                .next = null,
+                .data = undefined,
+            };
+            return result;
+        }
+
+        /// Assumes `self.mutex` is locked.
+        /// `node` must be the result of a call to `newNode` or `newNodeAssumeCapacity`.
         inline fn cacheNode(self: *Self, node: *Node) void {
             // this is correct because `newNode` ensures capacity for 1 more node
             // each time a new one is allocated, meaning there is always capacity
@@ -166,13 +255,13 @@ pub fn SharedQueue(comptime T: type) type {
     };
 }
 
-test SharedQueue {
+test "SharedQueue smoke test" {
     var sq_mtx = std.Thread.Mutex{};
     var sq: SharedQueue(u8) = .{ .mutex = &sq_mtx };
     defer sq.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?u8, null), sq.popValue());
-    try sq.pushValue(std.testing.allocator, 1);
+    _ = try sq.pushValue(std.testing.allocator, 1);
     try std.testing.expectEqual(@as(?u8, 1), sq.popValue());
     try std.testing.expectEqual(@as(?u8, null), sq.popValue());
 
