@@ -15,6 +15,8 @@ pub const ServerInfo = struct {
     pub const GoogleCloud = struct {
         auth_token: SensitiveBytes,
         bucket_names: []const []const u8,
+
+        const bucket_object_uri_fmt = "https://storage.googleapis.com/{[bucket]s}/{[object]s}";
     };
 
     inline fn bucketCount(server_info: ServerInfo) usize {
@@ -83,8 +85,9 @@ pub fn UploadPipeLine(comptime W: type) type {
         allocator: std.mem.Allocator,
         server_info: ServerInfo,
         requests_buf: []std.http.Client.Request,
-        headers_buf: std.http.Headers,
         gc_authorization_str: ?[]const u8,
+        gc_headers: std.http.Headers,
+        gc_uris_buf: ?[]u8,
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
@@ -114,8 +117,9 @@ pub fn UploadPipeLine(comptime W: type) type {
                 .allocator = allocator,
                 .server_info = values.server_info,
                 .requests_buf = &.{},
-                .headers_buf = std.http.Headers.init(allocator),
                 .gc_authorization_str = null,
+                .gc_headers = undefined,
+                .gc_uris_buf = null,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
@@ -127,15 +131,31 @@ pub fn UploadPipeLine(comptime W: type) type {
             self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
             errdefer self.allocator.free(self.requests_buf);
 
-            self.headers_buf.owned = false;
-            // self.headers.append("Authorization", authorization) catch |err| break :oom err;
-            try self.headers_buf.append("Transfer-Encoding", "chunked");
-            try self.headers_buf.append("Authorization", "");
-
             if (values.server_info.google_cloud) |gc| {
                 self.gc_authorization_str = try std.fmt.allocPrint(allocator, "Bearer {s}", .{gc.auth_token.getSensitiveSlice()});
             }
             errdefer self.allocator.free(self.gc_authorization_str orelse &.{});
+
+            self.gc_headers = std.http.Headers.init(self.allocator);
+            errdefer self.gc_headers.deinit();
+            self.gc_headers.owned = false;
+            try self.gc_headers.append("Transfer-Encoding", "chunked");
+            if (self.gc_authorization_str) |auth_str| try self.gc_headers.append("Authorization", auth_str);
+
+            if (values.server_info.google_cloud) |gc| {
+                const dummy_digest_str: []const u8 = comptime &digestBytesToString("\xff".* ** Sha256.digest_length);
+
+                var total_bytes: usize = 0;
+                for (gc.bucket_names) |bucket_name| {
+                    total_bytes += std.fmt.count(ServerInfo.GoogleCloud.bucket_object_uri_fmt, .{
+                        .bucket = bucket_name,
+                        .object = dummy_digest_str,
+                    });
+                }
+
+                self.gc_uris_buf = try self.allocator.alloc(u8, total_bytes);
+            }
+            errdefer self.allocator.free(self.gc_uris_buf orelse &.{});
 
             self.queue = try SharedQueue(UploadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
@@ -162,8 +182,9 @@ pub fn UploadPipeLine(comptime W: type) type {
             self.queue.deinit(self.allocator);
             self.ec.deinit(self.allocator);
             self.allocator.free(self.requests_buf);
+            self.gc_headers.deinit();
             self.allocator.free(self.gc_authorization_str orelse &.{});
-            self.headers_buf.deinit();
+            self.allocator.free(self.gc_uris_buf orelse &.{});
         }
 
         pub inline fn uploadFile(
@@ -187,20 +208,12 @@ pub fn UploadPipeLine(comptime W: type) type {
         }
 
         fn uploadPipeLineThread(upp: *Self) void {
-            var arena_state = std.heap.ArenaAllocator.init(upp.allocator);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-
             var client = std.http.Client{
                 .allocator = upp.allocator,
             };
             defer client.deinit();
 
             while (true) {
-                for (0..3) |_| {
-                    if (arena_state.reset(.retain_capacity)) break;
-                } else assert(arena_state.reset(.free_all));
-
                 const up_ctx: *UploadCtx = upp.queue.popBorrowed() orelse {
                     if (upp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
@@ -255,25 +268,26 @@ pub fn UploadPipeLine(comptime W: type) type {
                 defer for (requests.slice()) |*req| req.deinit();
 
                 if (upp.server_info.google_cloud) |gc| {
-                    const authorization = upp.gc_authorization_str.?;
-
-                    assert(upp.headers_buf.getIndices("Authorization").?.len == 1);
-                    assert(upp.headers_buf.getIndices("Transfer-Encoding").?.len == 1);
-                    upp.headers_buf.list.items[upp.headers_buf.firstIndexOf("Authorization").?].value = authorization;
-                    upp.headers_buf.list.items[upp.headers_buf.firstIndexOf("Transfer-Encoding").?].value = "chunked";
-
-                    const headers = upp.headers_buf;
+                    // just used to do the equivalent of a `bufPrint` on segments of the buffer.
+                    var uri_buf = util.BoundedBufferArray(u8){ .buffer = upp.gc_uris_buf.? };
+                    const uri_writer = uri_buf.writer();
 
                     for (gc.bucket_names) |bucket_name| {
-                        const uri_str = std.fmt.allocPrint(arena, "https://storage.googleapis.com/{[bucket]s}/{[object]s}", .{
-                            .bucket = bucket_name,
-                            .object = digestBytesToString(file_digest),
-                        }) catch |err| switch (err) {
-                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                        };
-                        const uri = std.Uri.parse(uri_str) catch unreachable;
+                        const uri = blk: {
+                            const start = uri_buf.len;
+                            uri_writer.print(ServerInfo.GoogleCloud.bucket_object_uri_fmt, .{
+                                .bucket = bucket_name,
+                                .object = digestBytesToString(file_digest),
+                            }) catch |err| switch (err) {
+                                error.Overflow => unreachable,
+                            };
+                            const end = uri_buf.len;
 
-                        const req = client.request(.PUT, uri, headers, .{}) catch |err| switch (err) {
+                            const uri_str = uri_buf.buffer[start..end];
+                            break :blk std.Uri.parse(uri_str) catch unreachable;
+                        };
+
+                        const req = client.request(.PUT, uri, upp.gc_headers, .{}) catch |err| switch (err) {
                             error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };

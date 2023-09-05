@@ -88,7 +88,7 @@ pub fn BoundedBufferArrayAligned(comptime T: type, comptime alignment: comptime_
 
         pub fn addManyAsSliceAssumeCapacity(self: *Self, count: usize) []align(alignment) T {
             assert(self.len + count <= self.capacity());
-            const prev_len = self.items.len;
+            const prev_len = self.len;
             self.len += count;
             return self.slice()[prev_len..][0..count];
         }
@@ -159,6 +159,15 @@ pub fn BoundedBufferArrayAligned(comptime T: type, comptime alignment: comptime_
 
         pub inline fn pop(self: *Self) T {
             return self.popOrNull().?;
+        }
+
+        pub const Writer = std.io.Writer(*Self, error{Overflow}, appendWrite);
+        pub inline fn writer(self: *Self) Writer {
+            return .{ .context = self };
+        }
+        fn appendWrite(self: *Self, bytes: []const u8) error{Overflow}!usize {
+            try self.appendSlice(bytes);
+            return bytes.len;
         }
     };
 }
