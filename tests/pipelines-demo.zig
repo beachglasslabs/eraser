@@ -80,7 +80,9 @@ pub fn main() !void {
                 .progress = root_node,
             };
 
-            try upload_pipeline.uploadFile(input, &wait_ctx, .{});
+            try upload_pipeline.uploadFile(input, &wait_ctx, .{
+                .file_size = null,
+            });
             wait_ctx.close_re.wait();
             root_node.end();
             wait_ctx.close_re.reset();

@@ -38,6 +38,85 @@ pub fn safeMemcpy(dst: anytype, src: anytype) void {
     }
 }
 
+/// Allocator which always fails to allocate, and presumes
+/// resizing and freeing operations to be `unreachable`.
+pub const empty_allocator = std.mem.Allocator{
+    .ptr = undefined,
+    .vtable = vtable: {
+        const static = struct {
+            fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
+                _ = ret_addr;
+                _ = ptr_align;
+                _ = len;
+                _ = ctx;
+                return null;
+            }
+            fn resize(ctx: *anyopaque, buf: []u8, buf_align: u8, new_len: usize, ret_addr: usize) bool {
+                _ = ret_addr;
+                _ = new_len;
+                _ = buf_align;
+                _ = buf;
+                _ = ctx;
+                unreachable;
+            }
+            fn free(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+                _ = ret_addr;
+                _ = buf_align;
+                _ = buf;
+                _ = ctx;
+                unreachable;
+            }
+        };
+        break :vtable &std.mem.Allocator.VTable{
+            .alloc = static.alloc,
+            .resize = static.resize,
+            .free = static.free,
+        };
+    },
+};
+
+pub inline fn sha256DigestCalcReader(
+    hasher: *std.crypto.hash.blake2,
+    inner: anytype,
+) Sha256DigestCalcReader(@TypeOf(inner)) {
+    return .{
+        .inner = inner,
+        .hasher = hasher,
+    };
+}
+pub fn Sha256DigestCalcReader(comptime InnerReader: type) type {
+    return struct {
+        hasher: *Sha256,
+        inner: Inner,
+        const Self = @This();
+
+        pub const Inner = InnerReader;
+
+        pub const Reader = std.io.Reader(Self, Inner.Error, Self.read);
+        pub inline fn reader(self: Self) Reader {
+            return .{ .context = self };
+        }
+
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        fn read(self: Self, buf: []u8) Inner.Error!usize {
+            const count = try self.inner.read(buf);
+            self.hasher.update(buf[0..count]);
+            return count;
+        }
+    };
+}
+
+pub fn boundedFmt(
+    comptime fmt_str: []const u8,
+    args: anytype,
+    comptime reference_args: @TypeOf(args),
+) error{Overflow}!std.BoundedArray(u8, std.fmt.count(fmt_str, reference_args)) {
+    const len = comptime std.fmt.count(fmt_str, reference_args);
+    var result: std.BoundedArray(u8, len) = .{};
+    try result.writer().print(fmt_str, args);
+    return result;
+}
+
 pub fn BoundedBufferArray(comptime T: type) type {
     return BoundedBufferArrayAligned(T, @alignOf(T));
 }
@@ -48,6 +127,10 @@ pub fn BoundedBufferArrayAligned(comptime T: type, comptime alignment: comptime_
         const Self = @This();
 
         pub const Slice = []align(alignment) T;
+
+        pub inline fn clear(self: *Self) void {
+            self.len = 0;
+        }
 
         pub inline fn capacity(self: Self) usize {
             return self.buffer.len;
@@ -159,6 +242,10 @@ pub fn BoundedBufferArrayAligned(comptime T: type, comptime alignment: comptime_
 
         pub inline fn pop(self: *Self) T {
             return self.popOrNull().?;
+        }
+
+        pub fn unusedCapacitySlice(self: Self) []T {
+            return self.buffer[self.len..];
         }
 
         pub const Writer = std.io.Writer(*Self, error{Overflow}, appendWrite);

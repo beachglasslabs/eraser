@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("util.zig");
 
@@ -126,7 +127,6 @@ pub const UploadCtx = struct {
     pub const Data = struct {
         file: std.fs.File,
         file_size: u64,
-        start: u64,
     };
 
     pub inline fn init(data: Data, ctx_ptr: anytype) UploadCtx {
@@ -182,6 +182,10 @@ pub fn UploadPipeLine(comptime W: type) type {
         queue_mtx: std.Thread.Mutex,
         queue: SharedQueue(UploadCtx),
 
+        digests_buffer_mtx: std.Thread.Mutex,
+        digests_buffer: std.SegmentedList([Sha256.digest_length]u8, 0),
+        chunk_buffer: []u8,
+
         ec: ErasureCoder,
         thread: std.Thread,
         const Self = @This();
@@ -198,10 +202,14 @@ pub fn UploadPipeLine(comptime W: type) type {
             /// should be a thread-safe allocator
             allocator: std.mem.Allocator,
             values: struct {
+                chunk_buffer: usize = 150_000,
                 queue_capacity: usize,
                 server_info: ServerInfo,
             },
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
+            assert(values.chunk_buffer != 0);
+            assert(values.queue_capacity != 0);
+
             self.* = .{
                 .allocator = allocator,
                 .requests_buf = &.{},
@@ -211,6 +219,10 @@ pub fn UploadPipeLine(comptime W: type) type {
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue = undefined,
+
+                .digests_buffer_mtx = .{},
+                .digests_buffer = .{},
+                .chunk_buffer = &.{},
 
                 .ec = undefined,
                 .thread = undefined,
@@ -226,6 +238,9 @@ pub fn UploadPipeLine(comptime W: type) type {
 
             self.queue = try SharedQueue(UploadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
+
+            self.chunk_buffer = try allocator.alloc(u8, values.chunk_buffer);
+            errdefer allocator.free(self.chunk_buffer);
 
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
@@ -247,6 +262,10 @@ pub fn UploadPipeLine(comptime W: type) type {
             }
             self.thread.join();
             self.queue.deinit(self.allocator);
+
+            self.digests_buffer.deinit(self.allocator);
+            self.allocator.free(self.chunk_buffer);
+
             self.ec.deinit(self.allocator);
             self.allocator.free(self.requests_buf);
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
@@ -269,26 +288,38 @@ pub fn UploadPipeLine(comptime W: type) type {
                 file_size: ?u64 = null,
             },
         ) (std.mem.Allocator.Error || std.fs.File.StatError)!void {
-            const file_size: u64 = if (extra.file_size) |size| size else blk: {
-                const stat = try file.stat();
-                break :blk stat.size;
-            };
-
-            const chunk_count: ChunkCount = @intCast((file_size / chunk_size) + 1);
-
             self.queue.mutex.lock();
             defer self.queue.mutex.unlock();
 
-            var start: u64 = 0;
-            for (0..chunk_count) |_| {
-                const data = UploadCtx.Data{
-                    .file = file,
-                    .file_size = file_size,
-                    .start = start,
+            const file_size: u64 = file_size: {
+                const file_size = extra.file_size orelse {
+                    const stat = try file.stat();
+                    break :file_size stat.size;
                 };
-                start += chunk_size;
-                _ = self.queue.pushValueAssumeCapacityLocked(UploadCtx.init(data, ctx_ptr));
+                if (comptime @import("builtin").mode == .Debug) debug_check: {
+                    const stat = try file.stat();
+                    if (stat.size == file_size) break :debug_check;
+                    const msg = util.boundedFmt(
+                        "Given file size '{d}' differs from file size '{d}' obtained from stat",
+                        .{ file_size, stat.size },
+                        .{ std.math.maxInt(@TypeOf(file_size)), std.math.maxInt(@TypeOf(stat.size)) },
+                    ) catch unreachable;
+                    @panic(msg.constSlice());
+                }
+                break :file_size file_size;
+            };
+
+            {
+                self.digests_buffer_mtx.lock();
+                defer self.digests_buffer_mtx.unlock();
+                try self.digests_buffer.growCapacity(self.allocator, chunksForFileSize(file_size));
             }
+
+            const data = UploadCtx.Data{
+                .file = file,
+                .file_size = file_size,
+            };
+            _ = try self.queue.pushValueLocked(self.allocator, UploadCtx.init(data, ctx_ptr));
         }
 
         fn uploadPipeLineThread(upp: *Self) void {
@@ -306,55 +337,85 @@ pub fn UploadPipeLine(comptime W: type) type {
                 defer up_ctx.close();
                 const data = up_ctx.data;
 
+                const file = data.file;
                 const file_size = data.file_size;
-                if (data.start != 0) {
-                    std.log.err("TODO: actually chunk the file", .{});
-                    continue;
+                const chunk_count = chunksForFileSize(file_size);
+
+                {
+                    upp.digests_buffer_mtx.lock();
+                    defer upp.digests_buffer_mtx.unlock();
+                    upp.digests_buffer.clearRetainingCapacity();
                 }
 
-                const file_digest: [Sha256.digest_length]u8 = digest: {
-                    const Sha256HasherReader = struct {
-                        hasher: *Sha256,
-                        inner: Inner,
-                        const Self = @This();
+                const full_file_digest: [Sha256.digest_length]u8 = blk: {
+                    const buf = upp.chunk_buffer;
 
-                        const Inner = std.fs.File.Reader;
+                    var full_sha_hasher = Sha256.init(.{});
 
-                        const Reader = std.io.Reader(@This(), Inner.Error, @This().read);
-                        fn reader(self: @This()) Reader {
-                            return .{ .context = self };
+                    var chunk_sha_hasher = Sha256.init(.{});
+                    var chunk_byte_count: u64 = 0;
+
+                    while (true) {
+                        const original_byte_count = file.readAll(buf) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+
+                        // NOTE: although `upp.digests_buffer` is protected by a mutex,
+                        // at the time of writing this, the only other place that acquires
+                        // the mutex to read & modify it is `uploadFile`, and the the only
+                        // thing it does is `growCapacity`, which should not alter the
+                        // `.len` field in any way, so this should be safe from racing.
+                        const current_digests_added = upp.digests_buffer.len;
+
+                        if (original_byte_count == 0) {
+                            if (current_digests_added < chunk_count) @panic(
+                                "File reader returned fewer chunks than expected",
+                            );
+                            assert(current_digests_added == chunk_count);
+                            break;
+                        } else if (current_digests_added >= chunk_count) {
+                            @panic("File reader returned more chunks than expected");
                         }
-                        fn read(self: @This(), buf: []u8) Inner.Error!usize {
-                            const result = try self.inner.read(buf);
-                            self.hasher.update(buf[0..result]);
-                            return result;
+
+                        var byte_count = original_byte_count;
+                        full_sha_hasher.update(buf[0..byte_count]);
+
+                        if (chunk_byte_count + byte_count >= chunk_size) {
+                            upp.digests_buffer_mtx.lock();
+                            defer upp.digests_buffer_mtx.unlock();
+
+                            const amt = chunk_size - chunk_byte_count;
+                            if (amt != 0) {
+                                chunk_sha_hasher.update(buf[0..amt]);
+                                std.mem.copyForwards(u8, buf, buf[amt..]);
+                            }
+
+                            const chunk_sha = chunk_sha_hasher.finalResult();
+                            chunk_sha_hasher = Sha256.init(.{});
+                            {
+                                upp.digests_buffer_mtx.lock();
+                                defer upp.digests_buffer_mtx.unlock();
+                                upp.digests_buffer.append(util.empty_allocator, chunk_sha) catch unreachable; // should have capacity reserved during `uploadFile`
+                            }
+
+                            chunk_byte_count += byte_count;
+                            chunk_byte_count -= chunk_size;
+                            byte_count -= amt;
                         }
-                    };
-                    var hasher = Sha256.init(.{});
-                    const hasher_reader = Sha256HasherReader.reader(.{
-                        .hasher = &hasher,
-                        .inner = data.file.reader(),
-                    });
-                    const Fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 });
-                    var fifo: Fifo = Fifo.init();
-                    defer fifo.deinit();
 
-                    fifo.pump(hasher_reader, std.io.null_writer) catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
-                    data.file.seekTo(0) catch |err| @panic(switch (err) {
-                        inline else => |e| "Decide how to handle " ++ @errorName(e),
-                    });
+                        chunk_sha_hasher.update(buf[0..byte_count]);
+                    }
 
-                    break :digest hasher.finalResult();
+                    break :blk full_sha_hasher.finalResult();
                 };
+                _ = full_file_digest;
 
                 var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
                 defer for (requests.slice()) |*req| req.deinit();
 
                 if (upp.server_info.google_cloud) |gc| {
                     const gc_prealloc = upp.gc_prealloc.?;
-                    var iter = gc_prealloc.bucketObjectUriIterator(gc, &file_digest);
+                    var iter = gc_prealloc.bucketObjectUriIterator(gc, @panic("TODO"));
 
                     while (iter.next()) |uri_str| {
                         const uri = std.Uri.parse(uri_str) catch unreachable;
@@ -426,6 +487,29 @@ pub fn UploadPipeLine(comptime W: type) type {
             }
         }
     };
+}
+
+pub const ChunkHeaderVersion = enum(u32) {
+    @"0.0.1",
+
+    const latest: ChunkHeaderVersion = @enumFromInt(val: {
+        const fields = @typeInfo(ChunkHeaderVersion).Enum.fields;
+        break :val fields[fields.len - 1].value;
+    });
+};
+
+pub fn writeChunkHeader(
+    writer: anytype,
+    params: struct {
+        comptime version: ChunkHeaderVersion = ChunkHeaderVersion.latest,
+        /// Should be non-`null` for the first chunk.
+        full_sha: ?*const [Sha256.digest_length]u8,
+        /// Should be the SHA of the blob comprised of the next chunk's header and data.
+        next_chunk: *const [Sha256.digest_length]u8,
+    },
+) !void {
+    _ = params;
+    _ = writer;
 }
 
 pub const EncodeDecodeThreadArgs = struct {

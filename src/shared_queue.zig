@@ -93,6 +93,12 @@ pub fn SharedQueue(comptime T: type) type {
             return self.pushValueAssumeCapacityLocked(value);
         }
 
+        /// Similar to `pushValue`, but assumes `self.mutex` is locked.
+        pub fn pushValueLocked(self: *Self, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!*T {
+            try self.ensureUnusedCapacityLocked(allocator, 1);
+            return self.pushValueAssumeCapacityLocked(value);
+        }
+
         /// Similar to `pushValueAssumeCapacity`, but assumes `self.mutex`
         /// is already locked. Useful for adding a number of items
         /// one immediately after the other.

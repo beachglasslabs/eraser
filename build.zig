@@ -84,7 +84,7 @@ pub fn build(b: *Build) void {
     }
 }
 
-fn encodeAndDecode(
+inline fn encodeAndDecode(
     b: *Build,
     eraser_artifact: *Build.CompileStep,
     input: Build.LazyPath,
