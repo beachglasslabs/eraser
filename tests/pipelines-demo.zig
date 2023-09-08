@@ -38,12 +38,16 @@ pub fn main() !void {
     try upload_pipeline.init(allocator, pipeline_values);
     defer upload_pipeline.deinit(.finish_remaining_uploads);
 
+    var default_prng = std.rand.DefaultPrng.init(1243);
     var download_pipeline: eraser.DownloadPipeLine(u8) = undefined;
-    try download_pipeline.init(allocator, pipeline_values);
+    try download_pipeline.init(allocator, default_prng.random(), pipeline_values);
     defer download_pipeline.deinit(.finish_remaining_uploads);
 
     var line_buffer = std.ArrayList(u8).init(allocator);
     defer line_buffer.deinit();
+
+    const ChunkDigests = std.BoundedArray([Sha256.digest_length]u8, 6);
+    var last_chunk_digests: ?ChunkDigests = null;
 
     while (true) {
         line_buffer.clearRetainingCapacity();
@@ -56,9 +60,6 @@ pub fn main() !void {
         };
         assert(cmd.len != 0);
         if (std.mem.startsWith(u8, "quit", cmd)) break; // all of "quit", "qui", "qu", "q" are treated the same
-
-        const ChunkDigests = std.BoundedArray([Sha256.digest_length]u8, 6);
-        var last_chunk_digests: ?ChunkDigests = null;
 
         if (std.mem.eql(u8, cmd, "encode")) {
             const input_path = tokenizer.next() orelse continue;
@@ -111,17 +112,22 @@ pub fn main() !void {
             for (chunks.constSlice()) |*name| {
                 std.log.info("{s}", .{&eraser.digestBytesToString(name)});
             }
+            last_chunk_digests = chunks;
         } else if (std.mem.eql(u8, cmd, "decode")) {
-            const WaitCtx = struct {};
+            const WaitCtx = struct {
+                pub fn close(self: *@This()) void {
+                    _ = self;
+                }
+            };
 
             var wait_ctx = WaitCtx{};
 
             const inputs: ChunkDigests = blk: {
-                const first_digest = tokenizer.next() //
-                orelse break :blk last_chunk_digests //
-                orelse {
-                    std.log.err("No files uploaded this session", .{});
-                    continue;
+                const first_digest = tokenizer.next() orelse {
+                    break :blk last_chunk_digests orelse {
+                        std.log.err("No files uploaded this session", .{});
+                        continue;
+                    };
                 };
                 _ = first_digest;
                 @panic("TODO");

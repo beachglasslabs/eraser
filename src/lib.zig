@@ -178,7 +178,9 @@ pub const UploadCtx = struct {
         /// The upload context is being closed, so the file handle
         /// is returned. The context may store it elsewhere for
         /// further use, or simply close it.
-        close: struct { std.fs.File, ?[]const [Sha256.digest_length]u8 },
+        close: Close,
+
+        const Close = struct { std.fs.File, ?[]const [Sha256.digest_length]u8 };
     };
 };
 
@@ -194,7 +196,7 @@ pub fn UploadPipeLine(comptime W: type) type {
         queue: SharedQueue(UploadCtx),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
-        chunk_headers_buf: std.MultiArrayList(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
+        chunk_headers_buf: std.MultiArrayList(ChunkHeaderInfo),
         chunk_buffer: []u8,
 
         ec: ErasureCoder,
@@ -202,6 +204,7 @@ pub fn UploadPipeLine(comptime W: type) type {
         const Self = @This();
 
         const ErasureCoder = erasure.Coder(W);
+        const ChunkHeaderInfo = struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 };
 
         // TODO: should this use a more strict memory order?
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
@@ -339,7 +342,7 @@ pub fn UploadPipeLine(comptime W: type) type {
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                errdefer @compileError("No error pls, must up_ctx.close() at the end");
+                errdefer @compileError("No error please, must up_ctx.close() at the end");
 
                 const file = up_ctx.data.file;
                 const file_size = up_ctx.data.file_size;
@@ -388,11 +391,19 @@ pub fn UploadPipeLine(comptime W: type) type {
                     const chunk_idx: ChunkCount = @intCast(chunk_idx_uncasted);
                     const offset = chunkStartOffset(chunk_idx);
 
-                    const chunk_name: [Sha256.digest_length]u8 = blk: {
-                        upp.chunk_headers_buf_mtx.lock();
-                        const header = upp.chunk_headers_buf.items(.header)[chunk_idx];
-                        upp.chunk_headers_buf_mtx.unlock();
+                    upp.chunk_headers_buf_mtx.lock();
+                    const header: ChunkHeader = upp.chunk_headers_buf.items(.header)[chunk_idx];
+                    upp.chunk_headers_buf_mtx.unlock();
 
+                    const header_bytes = blk: {
+                        var header_bytes: std.BoundedArray(u8, max_chunk_header) = .{};
+                        writeChunkHeader(header_bytes.writer(), &header) catch |err| switch (err) {
+                            error.Overflow => unreachable,
+                        };
+                        break :blk header_bytes;
+                    };
+
+                    const chunk_name: [Sha256.digest_length]u8 = blk: {
                         const Fifo = std.fifo.LinearFifo(u8, .Slice);
                         var fifo: Fifo = Fifo.init(upp.chunk_buffer);
 
@@ -470,8 +481,27 @@ pub fn UploadPipeLine(comptime W: type) type {
                         .upload_size = file_size + (file_size / 2) + (file_size / 8), // TODO: use an actual precise calculation here, this is just a guesstimate
                     };
 
-                    var buffered = std.io.bufferedReader(file.reader());
-                    _ = upp.ec.encodeCtx(buffered.reader(), writers_ctx) catch |err| switch (err) {
+                    const HeaderedReader = struct {
+                        fbs: std.io.FixedBufferStream([]const u8),
+                        buffered_file: std.io.BufferedReader(4096, std.fs.File.Reader),
+
+                        const Reader = std.io.Reader(*@This(), std.fs.File.ReadError, read);
+                        inline fn reader(this: *@This()) Reader {
+                            return .{ .context = this };
+                        }
+                        fn read(this: *@This(), buf: []u8) !usize {
+                            if (this.fbs.pos < this.fbs.buffer.len) {
+                                return this.fbs.reader().read(buf);
+                            }
+                            return this.buffered_file.reader().read(buf);
+                        }
+                    };
+                    var headered = HeaderedReader{
+                        .fbs = std.io.fixedBufferStream(header_bytes.constSlice()),
+                        .buffered_file = std.io.bufferedReader(file.reader()),
+                    };
+                    // var buffered = std.io.bufferedReader(file.reader());
+                    _ = upp.ec.encodeCtx(headered.reader(), writers_ctx) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
 
@@ -501,15 +531,18 @@ pub const DownloadCtx = struct {
     actionFn: *const fn (ptr: *anyopaque, state: Action) void,
     data: Data,
 
-    pub const Data = struct {};
+    pub const Data = struct {
+        chunk_names: []const [Sha256.digest_length]u8,
+    };
 
     pub inline fn init(data: Data, ctx_ptr: anytype) DownloadCtx {
         const Ptr = @TypeOf(ctx_ptr);
         const gen = struct {
             fn actionFn(erased_ptr: *anyopaque, action: DownloadCtx.Action) void {
                 const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
-                _ = ptr;
-                switch (action) {}
+                switch (action) {
+                    .close => ptr.close(),
+                }
             }
         };
         return .{
@@ -519,7 +552,13 @@ pub const DownloadCtx = struct {
         };
     }
 
-    pub const Action = union(enum) {};
+    pub fn close(self: DownloadCtx) void {
+        self.actionFn(self.ptr, .{ .close = {} });
+    }
+
+    pub const Action = union(enum) {
+        close,
+    };
 };
 pub fn DownloadPipeLine(comptime W: type) type {
     return struct {
@@ -533,9 +572,10 @@ pub fn DownloadPipeLine(comptime W: type) type {
         queue: SharedQueue(DownloadCtx),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
-        chunk_headers_buf: std.ArrayListUnmanaged(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
+        chunk_headers_buf: std.ArrayListUnmanaged(ChunkHeader),
         chunk_buffer: []u8,
 
+        random: std.rand.Random,
         ec: ErasureCoder,
         thread: std.Thread,
         const Self = @This();
@@ -551,6 +591,8 @@ pub fn DownloadPipeLine(comptime W: type) type {
             self: *Self,
             /// should be a thread-safe allocator
             allocator: std.mem.Allocator,
+            /// should be thread-safe Pseudo-RNG
+            random: std.rand.Random,
             values: PipelineInitValues,
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
             assert(values.chunk_buffer != 0);
@@ -570,6 +612,7 @@ pub fn DownloadPipeLine(comptime W: type) type {
                 .chunk_headers_buf = .{},
                 .chunk_buffer = &.{},
 
+                .random = random,
                 .ec = undefined,
                 .thread = undefined,
             };
@@ -622,8 +665,14 @@ pub fn DownloadPipeLine(comptime W: type) type {
             digests: []const [Sha256.digest_length]u8,
             ctx_ptr: anytype,
         ) !void {
-            _ = digests;
-            const data = DownloadCtx.Data{};
+            {
+                self.chunk_headers_buf_mtx.lock();
+                defer self.chunk_headers_buf_mtx.unlock();
+                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, digests.len);
+            }
+            const data = DownloadCtx.Data{
+                .chunk_names = digests,
+            };
             _ = try self.queue.pushValue(self.allocator, DownloadCtx.init(data, ctx_ptr));
         }
 
@@ -632,12 +681,108 @@ pub fn DownloadPipeLine(comptime W: type) type {
             defer client.deinit();
 
             while (true) {
-                const up_ctx: DownloadCtx = dpp.queue.popValue() orelse {
+                const down_ctx: DownloadCtx = dpp.queue.popValue() orelse {
                     if (dpp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                _ = up_ctx;
+                errdefer @compileError("No error please, must down_ctx.close() at the end");
+
+                const index_set = erasure.sampleIndexSet(
+                    dpp.random,
+                    dpp.ec.shardCount(),
+                    dpp.ec.shardCount() - dpp.ec.shardSize(),
+                );
+
+                var maybe_file: ?std.fs.File = null;
+                defer if (maybe_file) |file| file.close();
+
+                for (down_ctx.data.chunk_names) |chunk_name| {
+                    var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
+                    defer for (requests.slice()) |*req| req.deinit();
+
+                    if (dpp.server_info.google_cloud) |gc| {
+                        const gc_prealloc = dpp.gc_prealloc.?;
+
+                        var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
+                        while (iter.next()) |uri_str| {
+                            const uri = std.Uri.parse(uri_str) catch unreachable;
+                            const req = client.request(.GET, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                            };
+                            requests.appendAssumingCapacity(req);
+                        }
+                    }
+
+                    {
+                        dpp.chunk_headers_buf_mtx.lock();
+                        defer dpp.chunk_headers_buf_mtx.unlock();
+                        dpp.chunk_headers_buf.clearRetainingCapacity();
+                    }
+                    for (requests.slice()) |*req| {
+                        req.start() catch |err| @panic(switch (err) {
+                            inline else => |e| "Decide how to handle " ++ @errorName(e),
+                        });
+                        req.finish() catch |err| @panic(switch (err) {
+                            inline else => |e| "Decide how to handle " ++ @errorName(e),
+                        });
+                        req.wait() catch |err| switch (err) {
+                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+
+                        dpp.chunk_headers_buf_mtx.lock();
+                        defer dpp.chunk_headers_buf_mtx.unlock();
+                        const header = readChunkHeader(req.reader()) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                        dpp.chunk_headers_buf.appendAssumeCapacity(header);
+                    }
+
+                    const ReadersCtx = struct {
+                        requests: []std.http.Client.Request,
+                        down_ctx: DownloadCtx,
+
+                        const ReaderCtx = struct {
+                            inner: Inner,
+                            down_ctx: DownloadCtx,
+
+                            const Inner = std.http.Client.Request.Reader;
+                            const Error = Inner.Error;
+                            fn read(self: @This(), buf: []u8) Error!usize {
+                                const result = try self.inner.read(buf);
+                                return result;
+                            }
+                        };
+                        pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.Error, ReaderCtx.read) {
+                            return .{ .context = .{
+                                .inner = ctx.requests[reader_idx].reader(),
+                                .down_ctx = ctx.down_ctx,
+                            } };
+                        }
+                    };
+                    const readers_ctx = ReadersCtx{
+                        .requests = requests.slice(),
+                        .down_ctx = down_ctx,
+                    };
+
+                    const file = maybe_file orelse blk: {
+                        dpp.chunk_headers_buf_mtx.lock();
+                        defer dpp.chunk_headers_buf_mtx.unlock();
+                        const first_header = dpp.chunk_headers_buf.items[0];
+                        break :blk std.fs.cwd().createFile(&("out/".* ++ digestBytesToString(&first_header.full_file_digest.?)), .{}) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                    };
+
+                    var buffered = std.io.bufferedWriter(file.writer());
+                    _ = dpp.ec.decodeCtx(index_set, buffered.writer(), readers_ctx) catch |err| switch (err) {
+                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    };
+                }
+
+                down_ctx.close();
             }
         }
     };
@@ -805,6 +950,7 @@ const max_chunk_header: comptime_int = blk: {
     }) catch |err| @compileError(@errorName(err));
     break :blk counter.bytes_written;
 };
+
 pub fn writeChunkHeader(
     writer: anytype,
     header: *const ChunkHeader,
@@ -837,10 +983,10 @@ pub const ReadChunkHeaderError = error{
     InvalidFirstChunkFlag,
 };
 
-pub fn readChunkHeader(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream} || ReadChunkHeaderError)!void {
+pub fn readChunkHeader(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream} || ReadChunkHeaderError)!ChunkHeader {
     // read version
     const version: ChunkHeaderVersion = blk: {
-        const bytes = try reader.readBytesNoEof(4);
+        const bytes = try reader.readBytesNoEof(6);
         break :blk ChunkHeaderVersion.fromBytes(bytes);
     };
     switch (version.order(ChunkHeaderVersion.latest)) {
