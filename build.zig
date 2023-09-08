@@ -19,7 +19,9 @@ pub fn build(b: *Build) void {
 
     // everything else
 
-    const eraser_mod = b.addModule("eraser", .{ .source_file = Build.LazyPath.relative("src/lib.zig") });
+    const eraser_mod = b.addModule("eraser", .{
+        .source_file = Build.LazyPath.relative("src/lib.zig"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "eraser",

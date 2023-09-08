@@ -10,11 +10,14 @@ pub const SensitiveBytes = @import("SensitiveBytes.zig");
 pub const SharedQueue = @import("shared_queue.zig").SharedQueue;
 
 pub const chunk_size: comptime_int = 15 * bytes_per_megabyte;
-const bytes_per_megabyte = 1e7;
+const bytes_per_megabyte = 10_000_000;
 
 const ChunkCount = std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size);
 inline fn chunksForFileSize(size: u64) std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size) {
     return @intCast(size / chunk_size + 1);
+}
+inline fn chunkStartOffset(chunk_idx: ChunkCount) u64 {
+    return @as(u64, chunk_idx) * chunk_size;
 }
 
 pub const ServerInfo = struct {
@@ -33,7 +36,7 @@ pub const ServerInfo = struct {
             full_size += std.fmt.count(authorization_value_fmt, .{ .auth_token = gc.auth_token.getSensitiveSlice() });
 
             for (gc.bucket_names) |bucket_name| {
-                const max_digest_str: []const u8 = comptime &digestBytesToString("\xff".* ** Sha256.digest_length);
+                const max_digest_str: []const u8 = comptime &digestBytesToString("\xff" ** Sha256.digest_length);
                 full_size += std.fmt.count(bucket_object_uri_fmt, .{
                     .bucket = bucket_name,
                     .object = max_digest_str,
@@ -99,7 +102,7 @@ pub const ServerInfo = struct {
                     const start = iter.bytes.len;
                     iter.bytes.writer().print(bucket_object_uri_fmt, .{
                         .bucket = bucket,
-                        .object = iter.object,
+                        .object = &digestBytesToString(iter.object),
                     }) catch |err| switch (err) {
                         error.Overflow => unreachable,
                     };
@@ -182,8 +185,8 @@ pub fn UploadPipeLine(comptime W: type) type {
         queue_mtx: std.Thread.Mutex,
         queue: SharedQueue(UploadCtx),
 
-        digests_buffer_mtx: std.Thread.Mutex,
-        digests_buffer: std.SegmentedList([Sha256.digest_length]u8, 0),
+        chunk_headers_buf_mtx: std.Thread.Mutex,
+        chunk_headers_buf: std.ArrayListUnmanaged(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
         chunk_buffer: []u8,
 
         ec: ErasureCoder,
@@ -220,8 +223,8 @@ pub fn UploadPipeLine(comptime W: type) type {
                 .queue_mtx = .{},
                 .queue = undefined,
 
-                .digests_buffer_mtx = .{},
-                .digests_buffer = .{},
+                .chunk_headers_buf_mtx = .{},
+                .chunk_headers_buf = .{},
                 .chunk_buffer = &.{},
 
                 .ec = undefined,
@@ -263,7 +266,7 @@ pub fn UploadPipeLine(comptime W: type) type {
             self.thread.join();
             self.queue.deinit(self.allocator);
 
-            self.digests_buffer.deinit(self.allocator);
+            self.chunk_headers_buf.deinit(self.allocator);
             self.allocator.free(self.chunk_buffer);
 
             self.ec.deinit(self.allocator);
@@ -310,9 +313,9 @@ pub fn UploadPipeLine(comptime W: type) type {
             };
 
             {
-                self.digests_buffer_mtx.lock();
-                defer self.digests_buffer_mtx.unlock();
-                try self.digests_buffer.growCapacity(self.allocator, chunksForFileSize(file_size));
+                self.chunk_headers_buf_mtx.lock();
+                defer self.chunk_headers_buf_mtx.unlock();
+                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, chunksForFileSize(file_size));
             }
 
             const data = UploadCtx.Data{
@@ -341,96 +344,142 @@ pub fn UploadPipeLine(comptime W: type) type {
                 const file_size = data.file_size;
                 const chunk_count = chunksForFileSize(file_size);
 
-                const full_file_digest: [Sha256.digest_length]u8 = blk: {
-                    upp.digests_buffer_mtx.lock();
-                    defer upp.digests_buffer_mtx.unlock();
-                    upp.digests_buffer.clearRetainingCapacity();
+                init_chunk_headers: {
+                    upp.chunk_headers_buf_mtx.lock();
+                    defer upp.chunk_headers_buf_mtx.unlock();
+                    upp.chunk_headers_buf.clearRetainingCapacity();
 
                     var hasher = chunkedSha256Hasher(file.reader(), chunk_count);
                     while (true) {
                         const maybe_chunk_sha = hasher.next(upp.chunk_buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        const chunk_sha = maybe_chunk_sha orelse continue;
-                        upp.digests_buffer.append(util.empty_allocator, chunk_sha) catch unreachable; // should have capacity reserved during `uploadFile`
+                        const chunk_sha = maybe_chunk_sha orelse break;
+
+                        if (upp.chunk_headers_buf.items.len != 0) {
+                            const prev = &upp.chunk_headers_buf.items[upp.chunk_headers_buf.items.len - 1];
+                            prev.header.next_chunk_blob_digest = chunk_sha;
+                        }
+                        // should have capacity reserved during `uploadFile`
+                        upp.chunk_headers_buf.appendAssumeCapacity(.{
+                            .header = ChunkHeader{
+                                .next_chunk_blob_digest = undefined,
+                                .current_chunk_digest = chunk_sha,
+                                .full_file_digest = null,
+                            },
+                            .header_plus_blob_digest = undefined,
+                        });
                     }
-                    break :blk hasher.fullHash().?;
-                };
-                _ = full_file_digest;
 
-                var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
-                defer for (requests.slice()) |*req| req.deinit();
+                    const first = &upp.chunk_headers_buf.items[0];
+                    first.header.full_file_digest = hasher.fullHash().?;
 
-                if (upp.server_info.google_cloud) |gc| {
-                    const gc_prealloc = upp.gc_prealloc.?;
-                    var iter = gc_prealloc.bucketObjectUriIterator(gc, @panic("TODO"));
+                    const last = &upp.chunk_headers_buf.items[upp.chunk_headers_buf.items.len - 1];
+                    last.header.next_chunk_blob_digest = first.header.current_chunk_digest;
+                    break :init_chunk_headers;
+                }
 
-                    while (iter.next()) |uri_str| {
-                        const uri = std.Uri.parse(uri_str) catch unreachable;
-                        const req = client.request(.PUT, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                var bytes_uploaded: u64 = 0;
+
+                for (1..1 + chunk_count) |reverse_idx| {
+                    const chunk_idx: ChunkCount = @intCast(chunk_count - reverse_idx);
+                    const offset = chunkStartOffset(chunk_idx);
+
+                    const chunk_name: [Sha256.digest_length]u8 = blk: {
+                        upp.chunk_headers_buf_mtx.lock();
+                        const header = upp.chunk_headers_buf.items[chunk_idx].header;
+                        upp.chunk_headers_buf_mtx.unlock();
+
+                        const Fifo = std.fifo.LinearFifo(u8, .Slice);
+                        var fifo: Fifo = Fifo.init(upp.chunk_buffer);
+
+                        file.seekTo(offset) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                        const chunk_name = header.calcName(file.reader(), &fifo) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                        file.seekTo(0) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+
+                        break :blk chunk_name;
+                    };
+
+                    var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
+                    defer for (requests.slice()) |*req| req.deinit();
+
+                    if (upp.server_info.google_cloud) |gc| {
+                        const gc_prealloc = upp.gc_prealloc.?;
+
+                        var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
+                        while (iter.next()) |uri_str| {
+                            const uri = std.Uri.parse(uri_str) catch unreachable;
+                            const req = client.request(.PUT, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                            };
+                            requests.appendAssumingCapacity(req);
+                        }
+                    }
+
+                    for (requests.slice()) |*req| req.start() catch |err| @panic(switch (err) {
+                        inline else => |e| "Decide how to handle " ++ @errorName(e),
+                    });
+
+                    const WritersCtx = struct {
+                        requests: []std.http.Client.Request,
+                        up_ctx: UploadCtx,
+                        bytes_uploaded: *u64,
+                        upload_size: u64,
+
+                        const WriterCtx = struct {
+                            inner: Inner,
+                            up_ctx: UploadCtx,
+                            bytes_uploaded: *u64,
+                            upload_size: u64,
+
+                            const Inner = std.http.Client.Request.Writer;
+                            const Error = Inner.Error;
+                            fn write(self: @This(), bytes: []const u8) Error!usize {
+                                const written = try self.inner.write(bytes);
+                                self.bytes_uploaded.* += written;
+                                self.up_ctx.update(@intCast((self.bytes_uploaded.* * 100) / self.upload_size));
+                                return written;
+                            }
+                        };
+                        pub inline fn getWriter(ctx: @This(), writer_idx: u7) std.io.Writer(WriterCtx, WriterCtx.Error, WriterCtx.write) {
+                            return .{ .context = .{
+                                .inner = ctx.requests[writer_idx].writer(),
+                                .up_ctx = ctx.up_ctx,
+                                .bytes_uploaded = ctx.bytes_uploaded,
+                                .upload_size = ctx.upload_size,
+                            } };
+                        }
+                    };
+                    const writers_ctx = WritersCtx{
+                        .requests = requests.slice(),
+                        .up_ctx = up_ctx,
+                        .bytes_uploaded = &bytes_uploaded,
+                        .upload_size = file_size + (file_size / 2) + (file_size / 8), // TODO: use an actual precise calculation here, this is just a guesstimate
+                    };
+
+                    var buffered = std.io.bufferedReader(file.reader());
+                    _ = upp.ec.encodeCtx(buffered.reader(), writers_ctx) catch |err| switch (err) {
+                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    };
+
+                    for (requests.slice()) |*req| req.finish() catch |err| @panic(switch (err) {
+                        inline else => |e| "Decide how to handle " ++ @errorName(e),
+                    });
+
+                    for (@as([]std.http.Client.Request, requests.slice())) |*req| {
+                        req.wait() catch |err| switch (err) {
                             error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        requests.appendAssumingCapacity(req);
                     }
-                }
-
-                for (requests.slice()) |*req| req.start() catch |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
-
-                var bytes_uploaded: u64 = 0;
-                const WritersCtx = struct {
-                    requests: []std.http.Client.Request,
-                    up_ctx: UploadCtx,
-                    bytes_uploaded: *u64,
-                    file_size: u64,
-
-                    const WriterCtx = struct {
-                        inner: Inner,
-                        up_ctx: UploadCtx,
-                        bytes_uploaded: *u64,
-                        file_size: u64,
-
-                        const Inner = std.http.Client.Request.Writer;
-                        const Error = Inner.Error;
-                        fn write(self: @This(), bytes: []const u8) Error!usize {
-                            const written = try self.inner.write(bytes);
-                            self.bytes_uploaded.* += written;
-                            self.up_ctx.update(@intCast((self.bytes_uploaded.* * 100) / self.file_size));
-                            return written;
-                        }
-                    };
-                    pub inline fn getWriter(ctx: @This(), idx: u7) std.io.Writer(WriterCtx, WriterCtx.Error, WriterCtx.write) {
-                        return .{ .context = .{
-                            .inner = ctx.requests[idx].writer(),
-                            .up_ctx = ctx.up_ctx,
-                            .bytes_uploaded = ctx.bytes_uploaded,
-                            .file_size = ctx.file_size,
-                        } };
-                    }
-                };
-                const writers_ctx = WritersCtx{
-                    .requests = requests.slice(),
-                    .up_ctx = up_ctx,
-                    .bytes_uploaded = &bytes_uploaded,
-                    .file_size = file_size,
-                };
-
-                var buffered = std.io.bufferedReader(data.file.reader());
-                _ = upp.ec.encodeCtx(buffered.reader(), writers_ctx) catch |err| switch (err) {
-                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                };
-
-                for (requests.slice()) |*req| req.finish() catch |err| @panic(switch (err) {
-                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                });
-
-                for (@as([]std.http.Client.Request, requests.slice())) |*req| {
-                    req.wait() catch |err| switch (err) {
-                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                    };
+                    up_ctx.update(100);
                 }
             }
         }
@@ -472,11 +521,13 @@ pub fn ChunkedSha256Hasher(comptime ReaderType: type) type {
                 const byte_count = try self.reader.readAll(buf);
 
                 if (byte_count == 0) {
-                    if (self.chunks_hashed < self.chunk_count) @panic(
+                    if (self.chunks_hashed == self.chunk_count) break;
+                    defer self.chunks_hashed += 1;
+                    if (self.chunks_hashed + 1 < self.chunk_count) @panic(
                         "Reader returned fewer chunks than expected",
                     );
-                    assert(self.chunks_hashed == self.chunk_count);
-                    break;
+                    assert(self.chunks_hashed + 1 == self.chunk_count);
+                    return self.chunk_hasher.finalResult();
                 } else if (self.chunks_hashed >= self.chunk_count) {
                     @panic("Reader returned more chunks than expected");
                 }
@@ -511,27 +562,162 @@ pub fn ChunkedSha256Hasher(comptime ReaderType: type) type {
     };
 }
 
-pub const ChunkHeaderVersion = enum(u32) {
-    @"0.0.1",
+pub const ChunkHeaderVersion = extern struct {
+    major: u16,
+    minor: u16,
+    patch: u16,
 
-    const latest: ChunkHeaderVersion = @enumFromInt(val: {
-        const fields = @typeInfo(ChunkHeaderVersion).Enum.fields;
-        break :val fields[fields.len - 1].value;
-    });
+    const latest: ChunkHeaderVersion = .{ .major = 0, .minor = 0, .patch = 1 };
+
+    pub fn order(self: ChunkHeaderVersion, other: ChunkHeaderVersion) std.math.Order {
+        const major = std.math.order(self.major, other.major);
+        const minor = std.math.order(self.minor, other.minor);
+        const patch = std.math.order(self.patch, other.patch);
+
+        return switch (major) {
+            .lt => .lt,
+            .gt => .gt,
+            .eq => switch (minor) {
+                .lt => .lt,
+                .gt => .gt,
+                .eq => switch (patch) {
+                    .lt => .lt,
+                    .gt => .gt,
+                    .eq => .eq,
+                },
+            },
+        };
+    }
+
+    inline fn toBytes(chv: ChunkHeaderVersion) [6]u8 {
+        const le = ChunkHeaderVersion{
+            .major = std.mem.nativeToLittle(u16, chv.major),
+            .minor = std.mem.nativeToLittle(u16, chv.minor),
+            .patch = std.mem.nativeToLittle(u16, chv.patch),
+        };
+        return @bitCast(le);
+    }
+    inline fn fromBytes(bytes: [6]u8) ChunkHeaderVersion {
+        const le: ChunkHeaderVersion = @bitCast(bytes);
+        return ChunkHeaderVersion{
+            .major = std.mem.littleToNative(u16, le.major),
+            .minor = std.mem.littleToNative(u16, le.minor),
+            .patch = std.mem.littleToNative(u16, le.patch),
+        };
+    }
 };
 
+pub const ChunkHeader = struct {
+    version: ChunkHeaderVersion = ChunkHeaderVersion.latest,
+    /// Should be the SHA of the blob comprised of the next chunk's header and data.
+    /// If this is for the last chunk, it should simply be the SHA of the last chunk.
+    next_chunk_blob_digest: [Sha256.digest_length]u8,
+    /// Should be the SHA of the current chunk's data.
+    current_chunk_digest: [Sha256.digest_length]u8,
+    /// Should be non-`null` for the first chunk.
+    full_file_digest: ?[Sha256.digest_length]u8,
+
+    /// Calculate the name of this chunk (SHA256 digest of the header + the chunk data).
+    pub fn calcName(
+        header: *const ChunkHeader,
+        /// Should be the reader passed to `readChunkHeader` to calculate the values of `header`, seeked
+        /// back to the initial position before the `header` was calculated; that is to say, it should
+        /// return the same data it returned during the aforementioned call to `readChunkHeader`.
+        reader: anytype,
+        /// `std.fifo.LinearFifo(u8, ...)`
+        /// Used to pump the `reader` data through the SHA256 hash function
+        fifo: anytype,
+    ) @TypeOf(reader).Error![Sha256.digest_length]u8 {
+        var hasher = Sha256.init(.{});
+        const hasher_writer = util.sha256DigestCalcWriter(&hasher, std.io.null_writer).writer();
+        writeChunkHeader(hasher_writer, header) catch |err| switch (err) {};
+
+        var limited = std.io.limitedReader(reader, chunk_size);
+        try fifo.pump(limited.reader(), hasher_writer);
+
+        return hasher.finalResult();
+    }
+};
+
+const max_chunk_header: comptime_int = blk: {
+    var counter = std.io.countingWriter(std.io.null_writer);
+    writeChunkHeader(counter.writer(), &ChunkHeader{
+        .next_chunk_blob_digest = .{0xFF} ** Sha256.digest_length,
+        .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
+        .full_file_digest = .{0xFF} ** Sha256.digest_length,
+    }) catch |err| @compileError(@errorName(err));
+    break :blk counter.bytes_written;
+};
 pub fn writeChunkHeader(
     writer: anytype,
-    params: struct {
-        comptime version: ChunkHeaderVersion = ChunkHeaderVersion.latest,
-        /// Should be non-`null` for the first chunk.
-        full_sha: ?*const [Sha256.digest_length]u8,
-        /// Should be the SHA of the blob comprised of the next chunk's header and data.
-        next_chunk: *const [Sha256.digest_length]u8,
-    },
-) !void {
-    _ = params;
-    _ = writer;
+    header: *const ChunkHeader,
+) @TypeOf(writer).Error!void {
+    assert(header.version.order(ChunkHeaderVersion.latest) == .eq);
+
+    // write version
+    try writer.writeAll(comptime &ChunkHeaderVersion.latest.toBytes());
+
+    // write the SHA of the next chunk's header and data
+    try writer.writeAll(&header.next_chunk_blob_digest);
+
+    // write the SHA of the current' chunk's data
+    try writer.writeAll(&header.current_chunk_digest);
+
+    // write first chunk flag
+    try writer.writeByte(@intFromBool(header.full_file_digest != null));
+
+    // if this is the first chunk, write the full file SHA
+    if (header.full_file_digest) |*digest| {
+        try writer.writeAll(digest);
+    }
+
+    // TODO: write 'The sha(A + B) and sha(sha(A + B) + sha(C + D))'?
+    // TODO: ask Ed what that means *exactly*
+}
+
+pub const ReadChunkHeaderError = error{
+    UnrecognizedHeaderVersion,
+    InvalidFirstChunkFlag,
+};
+
+pub fn readChunkHeader(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream} || ReadChunkHeaderError)!void {
+    // read version
+    const version: ChunkHeaderVersion = blk: {
+        const bytes = try reader.readBytesNoEof(4);
+        break :blk ChunkHeaderVersion.fromBytes(bytes);
+    };
+    switch (version.order(ChunkHeaderVersion.latest)) {
+        .gt => return error.UnrecognizedHeaderVersion,
+        .lt => @panic("This should not yet be possible"),
+        .eq => {},
+    }
+
+    // read the SHA of the next chunk's header and data
+    const next_chunk_blob_digest = try reader.readBytesNoEof(Sha256.digest_length);
+
+    // read the SHA of the current chunk's data
+    const current_chunk_digest = try reader.readBytesNoEof(Sha256.digest_length);
+
+    // read the first chunk flag
+    const first_chunk_flag: bool = switch (try reader.readByte()) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidFirstChunkFlag,
+    };
+
+    // if this is the first chunk, read the full file SHA
+    const full_file_digest: ?[Sha256.digest_length]u8 = if (first_chunk_flag) blk: {
+        break :blk try reader.readBytesNoEof(Sha256.digest_length);
+    } else null;
+
+    // TODO: see the TODO in `writeChunkHeader` about 'The sha(A + B) and sha(sha(A + B) + sha(C + D))'
+
+    return .{
+        .version = version,
+        .next_chunk_blob_digest = next_chunk_blob_digest,
+        .current_chunk_digest = current_chunk_digest,
+        .full_file_digest = full_file_digest,
+    };
 }
 
 pub const EncodeDecodeThreadArgs = struct {
@@ -790,8 +976,8 @@ pub const EncDecQueue = struct {
     };
 };
 
-pub fn digestBytesToString(bytes: [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
-    return std.fmt.bytesToHex(bytes, .lower);
+pub fn digestBytesToString(bytes: *const [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
+    return std.fmt.bytesToHex(bytes.*, .lower);
 }
 pub fn digestStringToBytes(str: []const u8) error{ InvalidDigestLength, InvalidCharacter }![Sha256.digest_length]u8 {
     if (str.len != Sha256.digest_length * 2)

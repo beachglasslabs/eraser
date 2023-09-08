@@ -76,7 +76,7 @@ pub const empty_allocator = std.mem.Allocator{
 };
 
 pub inline fn sha256DigestCalcReader(
-    hasher: *std.crypto.hash.blake2,
+    hasher: *std.crypto.hash.sha2.Sha256,
     inner: anytype,
 ) Sha256DigestCalcReader(@TypeOf(inner)) {
     return .{
@@ -101,6 +101,36 @@ pub fn Sha256DigestCalcReader(comptime InnerReader: type) type {
         fn read(self: Self, buf: []u8) Inner.Error!usize {
             const count = try self.inner.read(buf);
             self.hasher.update(buf[0..count]);
+            return count;
+        }
+    };
+}
+pub inline fn sha256DigestCalcWriter(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    inner: anytype,
+) Sha256DigestCalcWriter(@TypeOf(inner)) {
+    return .{
+        .inner = inner,
+        .hasher = hasher,
+    };
+}
+pub fn Sha256DigestCalcWriter(comptime InnerWriter: type) type {
+    return struct {
+        hasher: *Sha256,
+        inner: Inner,
+        const Self = @This();
+
+        pub const Inner = InnerWriter;
+
+        pub const Writer = std.io.Writer(Self, Inner.Error, Self.write);
+        pub inline fn writer(self: Self) Writer {
+            return .{ .context = self };
+        }
+
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        fn write(self: Self, bytes: []const u8) Inner.Error!usize {
+            const count = try self.inner.write(bytes);
+            self.hasher.update(bytes[0..count]);
             return count;
         }
     };
