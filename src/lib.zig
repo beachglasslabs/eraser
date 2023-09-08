@@ -20,6 +20,12 @@ inline fn chunkStartOffset(chunk_idx: ChunkCount) u64 {
     return @as(u64, chunk_idx) * chunk_size;
 }
 
+pub const PipelineInitValues = struct {
+    chunk_buffer: usize = 150_000,
+    queue_capacity: usize,
+    server_info: ServerInfo,
+};
+
 pub const ServerInfo = struct {
     shard_size: u7,
     google_cloud: ?GoogleCloud = null,
@@ -139,7 +145,7 @@ pub const UploadCtx = struct {
                 const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
                 switch (action) {
                     .update => |percentage| ptr.update(percentage),
-                    .close => |fd| ptr.close(fd),
+                    .close => |close_data| ptr.close(close_data[0], close_data[1]),
                 }
             }
         };
@@ -160,8 +166,10 @@ pub const UploadCtx = struct {
     /// or the process to upload the file has failed
     /// irrecoverably.
     /// Gives the file handle back to the inner context.
-    pub inline fn close(self: UploadCtx) void {
-        self.actionFn(self.ptr, .{ .close = self.data.file });
+    /// If the upload was successful, returns the list of
+    /// names the file was turned into.
+    pub inline fn close(self: UploadCtx, digests: ?[]const [Sha256.digest_length]u8) void {
+        self.actionFn(self.ptr, .{ .close = .{ self.data.file, digests } });
     }
 
     pub const Action = union(enum) {
@@ -170,7 +178,7 @@ pub const UploadCtx = struct {
         /// The upload context is being closed, so the file handle
         /// is returned. The context may store it elsewhere for
         /// further use, or simply close it.
-        close: std.fs.File,
+        close: struct { std.fs.File, ?[]const [Sha256.digest_length]u8 },
     };
 };
 
@@ -186,7 +194,7 @@ pub fn UploadPipeLine(comptime W: type) type {
         queue: SharedQueue(UploadCtx),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
-        chunk_headers_buf: std.ArrayListUnmanaged(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
+        chunk_headers_buf: std.MultiArrayList(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
         chunk_buffer: []u8,
 
         ec: ErasureCoder,
@@ -204,11 +212,7 @@ pub fn UploadPipeLine(comptime W: type) type {
             self: *Self,
             /// should be a thread-safe allocator
             allocator: std.mem.Allocator,
-            values: struct {
-                chunk_buffer: usize = 150_000,
-                queue_capacity: usize,
-                server_info: ServerInfo,
-            },
+            values: PipelineInitValues,
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
             assert(values.chunk_buffer != 0);
             assert(values.queue_capacity != 0);
@@ -326,9 +330,7 @@ pub fn UploadPipeLine(comptime W: type) type {
         }
 
         fn uploadPipeLineThread(upp: *Self) void {
-            var client = std.http.Client{
-                .allocator = upp.allocator,
-            };
+            var client = std.http.Client{ .allocator = upp.allocator };
             defer client.deinit();
 
             while (true) {
@@ -337,17 +339,16 @@ pub fn UploadPipeLine(comptime W: type) type {
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                defer up_ctx.close();
-                const data = up_ctx.data;
+                errdefer @compileError("No error pls, must up_ctx.close() at the end");
 
-                const file = data.file;
-                const file_size = data.file_size;
+                const file = up_ctx.data.file;
+                const file_size = up_ctx.data.file_size;
                 const chunk_count = chunksForFileSize(file_size);
 
                 init_chunk_headers: {
                     upp.chunk_headers_buf_mtx.lock();
                     defer upp.chunk_headers_buf_mtx.unlock();
-                    upp.chunk_headers_buf.clearRetainingCapacity();
+                    upp.chunk_headers_buf.shrinkRetainingCapacity(0);
 
                     var hasher = chunkedSha256Hasher(file.reader(), chunk_count);
                     while (true) {
@@ -356,9 +357,10 @@ pub fn UploadPipeLine(comptime W: type) type {
                         };
                         const chunk_sha = maybe_chunk_sha orelse break;
 
-                        if (upp.chunk_headers_buf.items.len != 0) {
-                            const prev = &upp.chunk_headers_buf.items[upp.chunk_headers_buf.items.len - 1];
-                            prev.header.next_chunk_blob_digest = chunk_sha;
+                        if (upp.chunk_headers_buf.len != 0) {
+                            const headers = upp.chunk_headers_buf.items(.header);
+                            const prev = &headers[upp.chunk_headers_buf.len - 1];
+                            prev.next_chunk_blob_digest = chunk_sha;
                         }
                         // should have capacity reserved during `uploadFile`
                         upp.chunk_headers_buf.appendAssumeCapacity(.{
@@ -371,23 +373,24 @@ pub fn UploadPipeLine(comptime W: type) type {
                         });
                     }
 
-                    const first = &upp.chunk_headers_buf.items[0];
-                    first.header.full_file_digest = hasher.fullHash().?;
+                    const headers = upp.chunk_headers_buf.items(.header);
+                    const first = &headers[0];
+                    first.full_file_digest = hasher.fullHash().?;
 
-                    const last = &upp.chunk_headers_buf.items[upp.chunk_headers_buf.items.len - 1];
-                    last.header.next_chunk_blob_digest = first.header.current_chunk_digest;
+                    const last = &headers[upp.chunk_headers_buf.len - 1];
+                    last.next_chunk_blob_digest = first.current_chunk_digest;
                     break :init_chunk_headers;
                 }
 
                 var bytes_uploaded: u64 = 0;
 
-                for (1..1 + chunk_count) |reverse_idx| {
-                    const chunk_idx: ChunkCount = @intCast(chunk_count - reverse_idx);
+                for (0..chunk_count) |chunk_idx_uncasted| {
+                    const chunk_idx: ChunkCount = @intCast(chunk_idx_uncasted);
                     const offset = chunkStartOffset(chunk_idx);
 
                     const chunk_name: [Sha256.digest_length]u8 = blk: {
                         upp.chunk_headers_buf_mtx.lock();
-                        const header = upp.chunk_headers_buf.items[chunk_idx].header;
+                        const header = upp.chunk_headers_buf.items(.header)[chunk_idx];
                         upp.chunk_headers_buf_mtx.unlock();
 
                         const Fifo = std.fifo.LinearFifo(u8, .Slice);
@@ -403,6 +406,9 @@ pub fn UploadPipeLine(comptime W: type) type {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
 
+                        upp.chunk_headers_buf_mtx.lock();
+                        upp.chunk_headers_buf.items(.header_plus_blob_digest)[chunk_idx] = chunk_name;
+                        upp.chunk_headers_buf_mtx.unlock();
                         break :blk chunk_name;
                     };
 
@@ -481,6 +487,157 @@ pub fn UploadPipeLine(comptime W: type) type {
                     }
                     up_ctx.update(100);
                 }
+
+                upp.chunk_headers_buf_mtx.lock();
+                up_ctx.close(upp.chunk_headers_buf.items(.header_plus_blob_digest));
+                upp.chunk_headers_buf_mtx.unlock();
+            }
+        }
+    };
+}
+
+pub const DownloadCtx = struct {
+    ptr: *anyopaque,
+    actionFn: *const fn (ptr: *anyopaque, state: Action) void,
+    data: Data,
+
+    pub const Data = struct {};
+
+    pub inline fn init(data: Data, ctx_ptr: anytype) DownloadCtx {
+        const Ptr = @TypeOf(ctx_ptr);
+        const gen = struct {
+            fn actionFn(erased_ptr: *anyopaque, action: DownloadCtx.Action) void {
+                const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
+                _ = ptr;
+                switch (action) {}
+            }
+        };
+        return .{
+            .ptr = ctx_ptr,
+            .actionFn = gen.actionFn,
+            .data = data,
+        };
+    }
+
+    pub const Action = union(enum) {};
+};
+pub fn DownloadPipeLine(comptime W: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        requests_buf: []std.http.Client.Request,
+        server_info: ServerInfo,
+        gc_prealloc: ?ServerInfo.GoogleCloud.PreAllocated,
+
+        must_stop: std.atomic.Atomic(bool),
+        queue_mtx: std.Thread.Mutex,
+        queue: SharedQueue(DownloadCtx),
+
+        chunk_headers_buf_mtx: std.Thread.Mutex,
+        chunk_headers_buf: std.ArrayListUnmanaged(struct { header: ChunkHeader, header_plus_blob_digest: [Sha256.digest_length]u8 }),
+        chunk_buffer: []u8,
+
+        ec: ErasureCoder,
+        thread: std.Thread,
+        const Self = @This();
+
+        const ErasureCoder = erasure.Coder(W);
+
+        // TODO: should this use a more strict memory order?
+        const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
+        const must_stop_load_mo: std.builtin.AtomicOrder = .Monotonic;
+
+        pub fn init(
+            /// contents will be entirely oerwritten
+            self: *Self,
+            /// should be a thread-safe allocator
+            allocator: std.mem.Allocator,
+            values: PipelineInitValues,
+        ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
+            assert(values.chunk_buffer != 0);
+            assert(values.queue_capacity != 0);
+
+            self.* = .{
+                .allocator = allocator,
+                .requests_buf = &.{},
+                .server_info = values.server_info,
+                .gc_prealloc = null,
+
+                .must_stop = std.atomic.Atomic(bool).init(false),
+                .queue_mtx = .{},
+                .queue = undefined,
+
+                .chunk_headers_buf_mtx = .{},
+                .chunk_headers_buf = .{},
+                .chunk_buffer = &.{},
+
+                .ec = undefined,
+                .thread = undefined,
+            };
+
+            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
+            errdefer self.allocator.free(self.requests_buf);
+
+            if (values.server_info.google_cloud) |gc| {
+                self.gc_prealloc = try gc.preAllocated(self.allocator);
+            }
+            errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
+
+            self.queue = try SharedQueue(DownloadCtx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            errdefer self.queue.deinit(self.allocator);
+
+            self.chunk_buffer = try allocator.alloc(u8, values.chunk_buffer);
+            errdefer allocator.free(self.chunk_buffer);
+
+            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
+            errdefer self.ec.deinit(self.allocator);
+
+            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, downloadPipeLineThread, .{self});
+        }
+
+        pub fn deinit(
+            self: *Self,
+            remaining_queue_fate: enum {
+                finish_remaining_uploads,
+                cancel_remaining_uploads,
+            },
+        ) void {
+            self.must_stop.store(true, must_stop_store_mo);
+            switch (remaining_queue_fate) {
+                .finish_remaining_uploads => {},
+                .cancel_remaining_uploads => self.queue.clearItems(),
+            }
+            self.thread.join();
+            self.queue.deinit(self.allocator);
+
+            self.chunk_headers_buf.deinit(self.allocator);
+            self.allocator.free(self.chunk_buffer);
+
+            self.ec.deinit(self.allocator);
+            self.allocator.free(self.requests_buf);
+            if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
+        }
+
+        pub fn downloadFile(
+            self: *Self,
+            digests: []const [Sha256.digest_length]u8,
+            ctx_ptr: anytype,
+        ) !void {
+            _ = digests;
+            const data = DownloadCtx.Data{};
+            _ = try self.queue.pushValue(self.allocator, DownloadCtx.init(data, ctx_ptr));
+        }
+
+        fn downloadPipeLineThread(dpp: *Self) void {
+            var client = std.http.Client{ .allocator = dpp.allocator };
+            defer client.deinit();
+
+            while (true) {
+                const up_ctx: DownloadCtx = dpp.queue.popValue() orelse {
+                    if (dpp.must_stop.load(must_stop_load_mo)) break;
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                _ = up_ctx;
             }
         }
     };
