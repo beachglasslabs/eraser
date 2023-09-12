@@ -54,87 +54,122 @@ pub fn main() !void {
         try std.io.getStdIn().reader().streamUntilDelimiter(line_buffer.writer(), '\n', 1 << 21);
         var tokenizer = std.mem.tokenizeAny(u8, line_buffer.items, &std.ascii.whitespace);
 
-        const cmd = tokenizer.next() orelse {
+        const Command = enum {
+            q,
+            quit,
+
+            encode,
+            decode,
+        };
+        const cmd_str = tokenizer.next() orelse {
             std.log.err("Missing command", .{});
             continue;
         };
-        assert(cmd.len != 0);
-        if (std.mem.startsWith(u8, "quit", cmd)) break; // all of "quit", "qui", "qu", "q" are treated the same
+        assert(cmd_str.len != 0);
+        switch (std.meta.stringToEnum(Command, cmd_str) orelse {
+            std.log.err("Unrecognized command '{s}'", .{cmd_str});
+            continue;
+        }) {
+            .q, .quit => break,
+            .encode => {
+                const input_path = tokenizer.next() orelse continue;
 
-        if (std.mem.eql(u8, cmd, "encode")) {
-            const input_path = tokenizer.next() orelse continue;
+                std.log.info("Queueing file '{s}' for encoding and upload", .{input_path});
+                const input = try std.fs.cwd().openFile(input_path, .{});
+                errdefer input.close();
 
-            std.log.err("Queueing file '{s}' for encoding and upload", .{input_path});
-            const input = try std.fs.cwd().openFile(input_path, .{});
-            errdefer input.close();
+                var progress = std.Progress{};
+                const root_node = progress.start("Upload", 100);
+                root_node.activate();
 
-            var progress = std.Progress{};
-            const root_node = progress.start("Upload", 100);
-            root_node.activate();
+                const WaitCtx = struct {
+                    progress: *std.Progress.Node,
+                    close_re: std.Thread.ResetEvent = .{},
+                    chunks: ?ChunkDigests = null,
 
-            const WaitCtx = struct {
-                progress: *std.Progress.Node,
-                close_re: std.Thread.ResetEvent = .{},
-                chunks: ?ChunkDigests = null,
-
-                pub inline fn update(self: *@This(), percentage: u8) void {
-                    self.progress.setCompletedItems(percentage);
-                    self.progress.context.maybeRefresh();
-                }
-                pub inline fn close(self: *@This(), file: std.fs.File, chunks: ?[]const [Sha256.digest_length]u8) void {
-                    self.progress.setCompletedItems(100);
-                    self.progress.context.maybeRefresh();
-                    if (chunks) |list| {
-                        self.chunks = ChunkDigests.fromSlice(list) catch |err| @panic(@errorName(err));
+                    pub inline fn update(self: *@This(), percentage: u8) void {
+                        self.progress.setCompletedItems(percentage);
+                        self.progress.context.maybeRefresh();
                     }
-                    file.close();
-                    self.close_re.set();
-                    while (self.close_re.isSet()) {}
-                }
-            };
-            var wait_ctx = WaitCtx{
-                .progress = root_node,
-            };
-
-            try upload_pipeline.uploadFile(input, &wait_ctx, .{
-                .file_size = null,
-            });
-            wait_ctx.close_re.wait();
-            root_node.end();
-            wait_ctx.close_re.reset();
-
-            const chunks = wait_ctx.chunks orelse {
-                std.log.err("Failed to fully encode file", .{});
-                continue;
-            };
-
-            std.log.info("Finished encoding '{s}' into chunks:", .{input_path});
-            for (chunks.constSlice()) |*name| {
-                std.log.info("{s}", .{&eraser.digestBytesToString(name)});
-            }
-            last_chunk_digests = chunks;
-        } else if (std.mem.eql(u8, cmd, "decode")) {
-            const WaitCtx = struct {
-                pub fn close(self: *@This()) void {
-                    _ = self;
-                }
-            };
-
-            var wait_ctx = WaitCtx{};
-
-            const inputs: ChunkDigests = blk: {
-                const first_digest = tokenizer.next() orelse {
-                    break :blk last_chunk_digests orelse {
-                        std.log.err("No files uploaded this session", .{});
-                        continue;
-                    };
+                    pub inline fn close(self: *@This(), file: std.fs.File, chunks: ?[]const [Sha256.digest_length]u8) void {
+                        self.progress.setCompletedItems(100);
+                        self.progress.context.maybeRefresh();
+                        if (chunks) |list| {
+                            self.chunks = ChunkDigests.fromSlice(list) catch |err| @panic(@errorName(err));
+                        }
+                        file.close();
+                        self.close_re.set();
+                        while (self.close_re.isSet()) {}
+                    }
                 };
-                _ = first_digest;
-                @panic("TODO");
-            };
-            try download_pipeline.downloadFile(inputs.constSlice(), &wait_ctx);
-        } else {
-            std.log.err("Unrecognized command '{s}'", .{cmd});
+                var wait_ctx = WaitCtx{
+                    .progress = root_node,
+                };
+
+                try upload_pipeline.uploadFile(input, &wait_ctx, .{
+                    .file_size = null,
+                });
+                wait_ctx.close_re.wait();
+                root_node.end();
+                wait_ctx.close_re.reset();
+
+                const chunks = wait_ctx.chunks orelse {
+                    std.log.err("Failed to fully encode file", .{});
+                    continue;
+                };
+                last_chunk_digests = chunks;
+
+                std.log.info("Finished encoding '{s}' into chunks:\n{}", .{ input_path, struct {
+                    chunks: []const [Sha256.digest_length]u8,
+
+                    pub fn format(
+                        self: @This(),
+                        comptime _: []const u8,
+                        _: std.fmt.FormatOptions,
+                        writer: anytype,
+                    ) @TypeOf(writer).Error!void {
+                        for (self.chunks) |*name| {
+                            try writer.print("{s}\n", .{&eraser.digestBytesToString(name)});
+                        }
+                    }
+                }{ .chunks = chunks.constSlice() } });
+            },
+            .decode => {
+                std.log.info("", .{});
+                const inputs: ChunkDigests = blk: {
+                    const first_digest = tokenizer.next() orelse {
+                        break :blk last_chunk_digests orelse {
+                            std.log.err("No files uploaded this session", .{});
+                            continue;
+                        };
+                    };
+                    _ = first_digest;
+                    @panic("TODO");
+                };
+
+                var progress = std.Progress{};
+                const root_node = progress.start("Upload", 100);
+                root_node.activate();
+
+                const WaitCtx = struct {
+                    progress: *std.Progress.Node,
+                    close_re: std.Thread.ResetEvent = .{},
+
+                    pub fn update(self: *@This(), percentage: u8) void {
+                        self.progress.setCompletedItems(percentage);
+                        self.progress.context.maybeRefresh();
+                    }
+                    pub fn close(self: *@This()) void {
+                        _ = self;
+                    }
+                };
+
+                var wait_ctx = WaitCtx{
+                    .progress = root_node,
+                };
+
+                try download_pipeline.downloadFile(inputs.constSlice(), &wait_ctx);
+            },
         }
     }
 }

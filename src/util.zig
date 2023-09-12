@@ -75,6 +75,28 @@ pub const empty_allocator = std.mem.Allocator{
     },
 };
 
+pub inline fn redirectingReader(reader: anytype, writer: anytype) RedirectingReader(@TypeOf(reader), @TypeOf(writer)) {
+    return .{ .inner = reader, .writer = writer };
+}
+pub fn RedirectingReader(comptime InnerReader: type, comptime Writer: type) type {
+    return struct {
+        inner: InnerReader,
+        writer: Writer,
+        const Self = @This();
+
+        pub const Reader = std.io.Reader(Self, Self.Error, Self.read);
+        const Error = InnerReader.Error || Writer.Error;
+        pub inline fn reader(self: Self) Reader {
+            return .{ .context = self };
+        }
+
+        fn read(self: Self, buf: []u8) Error!usize {
+            const count = try self.inner.read(buf);
+            try self.writer.writeAll(buf[0..count]);
+        }
+    };
+}
+
 pub inline fn sha256DigestCalcReader(
     hasher: *std.crypto.hash.sha2.Sha256,
     inner: anytype,
