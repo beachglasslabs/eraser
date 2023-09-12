@@ -352,7 +352,7 @@ pub fn UploadPipeLine(comptime W: type) type {
                     defer upp.chunk_headers_buf_mtx.unlock();
                     const digests = upp.chunk_headers_buf.items(.header_plus_blob_digest);
                     assert(digests.len <= chunk_count);
-                    up_ctx.close(if (digests.len != chunk_count) digests else null);
+                    up_ctx.close(if (digests.len == chunk_count) digests else null);
                 }
 
                 init_chunk_headers: {
@@ -478,11 +478,15 @@ pub fn UploadPipeLine(comptime W: type) type {
                             } };
                         }
                     };
+
                     const writers_ctx = WritersCtx{
                         .requests = requests.slice(),
                         .up_ctx = up_ctx,
                         .bytes_uploaded = &bytes_uploaded,
-                        .upload_size = up_data.file_size + (up_data.file_size / 2) + (up_data.file_size / 8), // TODO: use an actual precise calculation here, this is just a guesstimate
+                        .upload_size = size: {
+                            const shard_size = @as(u64, up_data.file_size) / upp.ec.shardsRequired();
+                            break :size shard_size * upp.ec.shardCount();
+                        },
                     };
 
                     var buffered = std.io.bufferedReader(up_data.file.reader());
@@ -683,7 +687,7 @@ pub fn DownloadPipeLine(comptime W: type) type {
                 const excluded_index_set = erasure.sampleIndexSet(
                     dpp.random,
                     dpp.ec.shardCount(),
-                    dpp.ec.shardCount() - dpp.ec.shardSize(),
+                    dpp.ec.shardCount() - dpp.ec.shardsRequired(),
                 );
                 var current_index: u8 = 0;
 

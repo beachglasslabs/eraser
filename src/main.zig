@@ -181,7 +181,7 @@ fn decodeCommand(
     var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
     const random = prng.random();
 
-    const excluded_shards = erasure.sampleIndexSet(random, ec.shardCount(), ec.shardCount() - ec.shardSize());
+    const excluded_shards = erasure.sampleIndexSet(random, ec.shardCount(), ec.shardCount() - ec.shardsRequired());
     std.log.info("excluding shards {}", .{excluded_shards});
 
     const data_file = try std.fs.cwd().createFile(data_filename, .{});

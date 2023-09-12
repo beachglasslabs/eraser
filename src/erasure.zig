@@ -107,7 +107,7 @@ pub fn Coder(comptime T: type) type {
         pub inline fn shardCount(self: Self) u7 {
             return @intCast(self.bf_mat.matrix.numRows());
         }
-        pub inline fn shardSize(self: Self) u7 {
+        pub inline fn shardsRequired(self: Self) u7 {
             return @intCast(self.bf_mat.matrix.numCols());
         }
 
@@ -121,7 +121,7 @@ pub fn Coder(comptime T: type) type {
         }
 
         pub inline fn dataBlockSize(self: Self) u8 {
-            return calcDataBlockSize(self.chunkSize(), self.shardSize());
+            return calcDataBlockSize(self.chunkSize(), self.shardsRequired());
         }
 
         pub inline fn encode(
@@ -154,10 +154,10 @@ pub fn Coder(comptime T: type) type {
                 const rs = try readDataBlock(T, data_block, in_fifo_reader);
                 try writeCodeBlock(T, self.encoder_bf_mat_bin, data_block, out_fifo_writers_ctx, .{
                     .shard_count = self.shardCount(),
-                    .shard_size = self.shardSize(),
+                    .shard_size = self.shardsRequired(),
                 });
                 switch (rs) {
-                    .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardSize()),
+                    .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardsRequired()),
                     .done => {
                         var buffer = [_]u8{0} ** word_size;
                         std.mem.writeIntBig(T, &buffer, data_block[data_block.len - 1]);
@@ -177,7 +177,7 @@ pub fn Coder(comptime T: type) type {
             /// `[]const std.io.Reader(...)`
             in_fifos: anytype,
         ) !usize {
-            assert(in_fifos.len == self.shardSize());
+            assert(in_fifos.len == self.shardsRequired());
             const Ctx = struct {
                 slice: @TypeOf(in_fifos),
                 pub inline fn getReader(ctx: @This(), idx: anytype) @TypeOf(in_fifos[0]) {
@@ -197,7 +197,7 @@ pub fn Coder(comptime T: type) type {
             /// should be defined.
             in_fifos_ctx: anytype,
         ) !usize {
-            assert(excluded_shards.count() == self.shardCount() - self.shardSize());
+            assert(excluded_shards.count() == self.shardCount() - self.shardsRequired());
 
             const decoder_bin = blk: {
                 const decoder_sub_buf = self.decoder_sub_mat_buf[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet{})];
@@ -520,7 +520,7 @@ test Coder {
                 const excluded_shards = sampleIndexSet(
                     random,
                     ec.shardCount(),
-                    ec.shardCount() - ec.shardSize(),
+                    ec.shardCount() - ec.shardsRequired(),
                 );
 
                 const ReadersCtx = struct {
