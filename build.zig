@@ -20,7 +20,7 @@ pub fn build(b: *Build) void {
     // everything else
 
     const eraser_mod = b.addModule("eraser", .{
-        .source_file = Build.LazyPath.relative("src/lib.zig"),
+        .source_file = Build.LazyPath.relative("src/pipelines.zig"),
     });
 
     const exe = b.addExecutable(.{
