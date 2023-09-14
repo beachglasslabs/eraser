@@ -75,7 +75,6 @@ pub fn PipeLine(comptime W: type) type {
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
         chunk_headers_buf: std.ArrayListUnmanaged(chunk.Header),
-        chunk_buffer: []u8,
 
         random: std.rand.Random,
         ec: ErasureCoder,
@@ -97,7 +96,6 @@ pub fn PipeLine(comptime W: type) type {
             random: std.rand.Random,
             values: PipelineInitValues,
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
-            assert(values.chunk_buffer != 0);
             assert(values.queue_capacity != 0);
 
             self.* = .{
@@ -112,7 +110,6 @@ pub fn PipeLine(comptime W: type) type {
 
                 .chunk_headers_buf_mtx = .{},
                 .chunk_headers_buf = .{},
-                .chunk_buffer = &.{},
 
                 .random = random,
                 .ec = undefined,
@@ -129,9 +126,6 @@ pub fn PipeLine(comptime W: type) type {
 
             self.queue = try SharedQueue(Ctx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
-
-            self.chunk_buffer = try allocator.alloc(u8, values.chunk_buffer);
-            errdefer allocator.free(self.chunk_buffer);
 
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
@@ -155,7 +149,6 @@ pub fn PipeLine(comptime W: type) type {
             self.queue.deinit(self.allocator);
 
             self.chunk_headers_buf.deinit(self.allocator);
-            self.allocator.free(self.chunk_buffer);
 
             self.ec.deinit(self.allocator);
             self.allocator.free(self.requests_buf);

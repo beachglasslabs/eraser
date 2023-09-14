@@ -21,7 +21,8 @@ pub const DownloadPipeLine = download.PipeLine;
 pub fn digestBytesToString(bytes: *const [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
     return std.fmt.bytesToHex(bytes.*, .lower);
 }
-pub fn digestStringToBytes(str: *const [Sha256.digest_length * 2]u8) error{ InvalidDigestLength, InvalidCharacter }![Sha256.digest_length]u8 {
+pub const DigestStringToBytesError = error{ InvalidDigestLength, InvalidCharacter };
+pub fn digestStringToBytes(str: *const [Sha256.digest_length * 2]u8) DigestStringToBytesError![Sha256.digest_length]u8 {
     var digest = [_]u8{0} ** Sha256.digest_length;
     const digest_slice = std.fmt.hexToBytes(&digest, str) catch |err| switch (err) {
         error.InvalidLength => unreachable,

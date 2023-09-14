@@ -82,7 +82,7 @@ pub fn PipeLine(comptime W: type) type {
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
         chunk_headers_buf: std.MultiArrayList(ChunkHeaderInfo),
-        chunk_buffer: []u8,
+        chunk_buffer: *[chunk.size]u8,
 
         ec: ErasureCoder,
         thread: std.Thread,
@@ -102,7 +102,6 @@ pub fn PipeLine(comptime W: type) type {
             allocator: std.mem.Allocator,
             values: PipelineInitValues,
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
-            assert(values.chunk_buffer != 0);
             assert(values.queue_capacity != 0);
 
             self.* = .{
@@ -117,7 +116,7 @@ pub fn PipeLine(comptime W: type) type {
 
                 .chunk_headers_buf_mtx = .{},
                 .chunk_headers_buf = .{},
-                .chunk_buffer = &.{},
+                .chunk_buffer = undefined,
 
                 .ec = undefined,
                 .thread = undefined,
@@ -134,7 +133,7 @@ pub fn PipeLine(comptime W: type) type {
             self.queue = try SharedQueue(Ctx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            self.chunk_buffer = try allocator.alloc(u8, values.chunk_buffer);
+            self.chunk_buffer = try allocator.create([chunk.size]u8);
             errdefer allocator.free(self.chunk_buffer);
 
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
@@ -242,12 +241,18 @@ pub fn PipeLine(comptime W: type) type {
                     defer upp.chunk_headers_buf_mtx.unlock();
                     upp.chunk_headers_buf.shrinkRetainingCapacity(0);
 
-                    var hasher = chunk.chunkedSha256Hasher(up_data.file.reader(), chunk_count);
+                    var full_hasher = Sha256.init(.{});
                     while (true) {
-                        const maybe_chunk_sha = hasher.next(upp.chunk_buffer) catch |err| switch (err) {
+                        const chunk_data_len = up_data.file.reader().readAll(upp.chunk_buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        const chunk_sha = maybe_chunk_sha orelse break;
+                        const chunk_data = upp.chunk_buffer[0..chunk_data_len];
+                        if (chunk_data.len == 0) break;
+                        full_hasher.update(chunk_data);
+
+                        var chunk_hasher = Sha256.init(.{});
+                        chunk_hasher.update(chunk_data);
+                        const chunk_sha = chunk_hasher.finalResult();
 
                         if (upp.chunk_headers_buf.len != 0) {
                             const headers = upp.chunk_headers_buf.items(.header);
@@ -267,7 +272,7 @@ pub fn PipeLine(comptime W: type) type {
 
                     const headers = upp.chunk_headers_buf.items(.header);
                     const first = &headers[0];
-                    first.full_file_digest = hasher.fullHash().?;
+                    first.full_file_digest = full_hasher.finalResult();
 
                     const last = &headers[upp.chunk_headers_buf.len - 1];
                     last.next_chunk_blob_digest = first.current_chunk_digest;
@@ -276,7 +281,7 @@ pub fn PipeLine(comptime W: type) type {
 
                 var bytes_uploaded: u64 = 0;
 
-                for (0..chunk_count) |chunk_idx_uncasted| {
+                for (0..upp.chunk_headers_buf.len, 0..chunk_count) |_, chunk_idx_uncasted| {
                     const chunk_idx: chunk.Count = @intCast(chunk_idx_uncasted);
                     const offset = chunk.startOffset(chunk_idx);
 

@@ -7,15 +7,17 @@ const pipelines = @import("../pipelines.zig");
 const digestBytesToString = pipelines.digestBytesToString;
 const digestStringToBytes = pipelines.digestStringToBytes;
 
-pub const chunk_size: comptime_int = 15 * bytes_per_megabyte;
+const chunk = @This();
+
+pub const size: comptime_int = 15 * bytes_per_megabyte;
 const bytes_per_megabyte = 10_000_000;
 
-pub const Count = std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size);
-pub inline fn countForFileSize(size: u64) std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk_size) {
-    return @intCast(size / chunk_size + 1);
+pub const Count = std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk.size);
+pub inline fn countForFileSize(file_size: u64) std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk.size) {
+    return @intCast(file_size / chunk.size + 1);
 }
 pub inline fn startOffset(chunk_idx: Count) u64 {
-    return @as(u64, chunk_idx) * chunk_size;
+    return @as(u64, chunk_idx) * size;
 }
 
 pub const Header = struct {
@@ -43,7 +45,7 @@ pub const Header = struct {
         const hasher_writer = util.sha256DigestCalcWriter(&hasher, std.io.null_writer).writer();
         writeHeader(hasher_writer, header) catch |err| switch (err) {};
 
-        var limited = std.io.limitedReader(reader, chunk_size);
+        var limited = std.io.limitedReader(reader, size);
         try fifo.pump(limited.reader(), hasher_writer);
 
         return hasher.finalResult();
@@ -214,83 +216,6 @@ const min_header: comptime_int = blk: {
     }) catch |err| @compileError(@errorName(err));
     break :blk counter.bytes_written;
 };
-
-pub inline fn chunkedSha256Hasher(reader: anytype, chunk_count: Count) ChunkedSha256Hasher(@TypeOf(reader)) {
-    return .{
-        .reader = reader,
-        .chunk_count = chunk_count,
-        .chunk_size = chunk_size,
-    };
-}
-
-pub fn ChunkedSha256Hasher(comptime ReaderType: type) type {
-    return struct {
-        reader: ReaderType,
-        chunk_count: Count,
-        comptime chunk_size: u64 = chunk_size,
-
-        full_hasher: Sha256 = Sha256.init(.{}),
-        chunk_hasher: Sha256 = Sha256.init(.{}),
-        chunk_byte_count: u64 = 0,
-        chunks_hashed: Count = 0,
-        const Self = @This();
-
-        pub fn fullHash(self: *Self) ?[Sha256.digest_length]u8 {
-            if (self.chunks_hashed < self.chunk_count) return null;
-            assert(self.chunks_hashed == self.chunk_count);
-            return self.full_hasher.finalResult();
-        }
-
-        pub fn next(
-            self: *Self,
-            /// Buffer used to read into from the reader.
-            buf: []u8,
-        ) !?[Sha256.digest_length]u8 {
-            assert(buf.len != 0);
-            while (true) {
-                const byte_count = try self.reader.readAll(buf);
-
-                if (byte_count == 0) {
-                    if (self.chunks_hashed == self.chunk_count) break;
-                    defer self.chunks_hashed += 1;
-                    if (self.chunks_hashed + 1 < self.chunk_count) @panic(
-                        "Reader returned fewer chunks than expected",
-                    );
-                    assert(self.chunks_hashed + 1 == self.chunk_count);
-                    return self.chunk_hasher.finalResult();
-                } else if (self.chunks_hashed >= self.chunk_count) {
-                    @panic("Reader returned more chunks than expected");
-                }
-
-                self.full_hasher.update(buf[0..byte_count]);
-                self.chunk_byte_count += byte_count;
-                if (self.chunk_byte_count < self.chunk_size) {
-                    self.chunk_hasher.update(buf[0..byte_count]);
-                    continue;
-                }
-
-                const amt = chunk_size - (self.chunk_byte_count - byte_count);
-                self.chunk_byte_count -= chunk_size;
-
-                if (amt != 0) {
-                    self.chunk_hasher.update(buf[0..amt]);
-                    std.mem.copyForwards(u8, buf, buf[amt..]);
-                }
-
-                const chunk_sha = self.chunk_hasher.finalResult();
-                self.chunk_hasher = Sha256.init(.{});
-
-                const remaining_bytes = byte_count - amt;
-                if (remaining_bytes != 0) {
-                    self.chunk_hasher.update(buf[0..remaining_bytes]);
-                }
-                self.chunks_hashed += 1;
-                return chunk_sha;
-            }
-            return null;
-        }
-    };
-}
 
 fn testChunkHeader(ch: Header) !void {
     var bytes = std.BoundedArray(u8, max_header){};
