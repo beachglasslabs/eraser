@@ -1,18 +1,13 @@
 const chunk = @import("chunk.zig");
 const erasure = @import("../erasure.zig");
-
-const pipelines = @import("../pipelines.zig");
-const digestBytesToString = pipelines.digestBytesToString;
-
 const PipelineInitValues = @import("PipelineInitValues.zig");
-
 const ServerInfo = @import("ServerInfo.zig");
-const SensitiveBytes = @import("../SensitiveBytes.zig");
 const SharedQueue = @import("../shared_queue.zig").SharedQueue;
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
@@ -75,6 +70,7 @@ pub fn PipeLine(comptime W: type) type {
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
         chunk_headers_buf: std.ArrayListUnmanaged(chunk.Header),
+        chunk_buffer: *[chunk.size * 2]u8,
 
         random: std.rand.Random,
         ec: ErasureCoder,
@@ -110,6 +106,7 @@ pub fn PipeLine(comptime W: type) type {
 
                 .chunk_headers_buf_mtx = .{},
                 .chunk_headers_buf = .{},
+                .chunk_buffer = undefined,
 
                 .random = random,
                 .ec = undefined,
@@ -126,6 +123,9 @@ pub fn PipeLine(comptime W: type) type {
 
             self.queue = try SharedQueue(Ctx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
+
+            self.chunk_buffer = try allocator.create([chunk.size * 2]u8);
+            errdefer allocator.free(self.chunk_buffer);
 
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
@@ -149,6 +149,7 @@ pub fn PipeLine(comptime W: type) type {
             self.queue.deinit(self.allocator);
 
             self.chunk_headers_buf.deinit(self.allocator);
+            self.allocator.free(self.chunk_buffer);
 
             self.ec.deinit(self.allocator);
             self.allocator.free(self.requests_buf);
@@ -175,6 +176,9 @@ pub fn PipeLine(comptime W: type) type {
             var client = std.http.Client{ .allocator = dpp.allocator };
             defer client.deinit();
 
+            const decrypted_chunk_buffer: *[chunk.size]u8 = dpp.chunk_buffer[chunk.size * 0 ..][0..chunk.size];
+            const encrypted_chunk_buffer: *[chunk.size]u8 = dpp.chunk_buffer[chunk.size * 1 ..][0..chunk.size];
+
             while (true) {
                 const down_ctx: Ctx = dpp.queue.popValue() orelse {
                     if (dpp.must_stop.load(must_stop_load_mo)) break;
@@ -193,7 +197,7 @@ pub fn PipeLine(comptime W: type) type {
                 var maybe_file: ?std.fs.File = null;
                 defer if (maybe_file) |file| file.close();
 
-                for (down_ctx.data.chunk_names) |chunk_name| {
+                for (down_ctx.data.chunk_names, 0..) |chunk_name, chunk_idx| {
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 
@@ -221,6 +225,7 @@ pub fn PipeLine(comptime W: type) type {
                     // all this function does.
                     dpp.chunk_headers_buf.clearRetainingCapacity();
 
+                    var auth_tag: ?[Aes256Gcm.tag_length]u8 = null;
                     for (requests.slice()) |*req| {
                         req.start() catch |err| @panic(switch (err) {
                             inline else => |e| "Decide how to handle " ++ @errorName(e),
@@ -236,6 +241,25 @@ pub fn PipeLine(comptime W: type) type {
                         const header = chunk.readHeader(req.reader()) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
+
+                        if (chunk_idx == 0) blk: {
+                            const prev_auth_tag = auth_tag orelse {
+                                auth_tag = @as(@TypeOf(auth_tag.?), undefined);
+                                const tag_len = req.reader().readAll(&auth_tag.?) catch |err| switch (err) {
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+                                if (tag_len < auth_tag.?.len) @panic("Decide how to handle missing the tag");
+                                break :blk;
+                            };
+                            var current_auth_tag: @TypeOf(prev_auth_tag) = undefined;
+                            const tag_len = req.reader().readAll(&current_auth_tag) catch |err| switch (err) {
+                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                            };
+                            if (tag_len < current_auth_tag.len) @panic("Decide how to handle missing the tag");
+                            if (!std.mem.eql(u8, &prev_auth_tag, &current_auth_tag)) {
+                                @panic("Decide how to handle differing tags at the start of chunks");
+                            }
+                        }
 
                         dpp.chunk_headers_buf_mtx.lock();
                         defer dpp.chunk_headers_buf_mtx.unlock();
@@ -269,6 +293,20 @@ pub fn PipeLine(comptime W: type) type {
                         .down_ctx = down_ctx,
                     };
 
+                    var ecd_fbs = std.io.fixedBufferStream(encrypted_chunk_buffer);
+                    _ = dpp.ec.decodeCtx(excluded_index_set, ecd_fbs.writer(), readers_ctx) catch |err| switch (err) {
+                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        inline error.NoSpaceLeft => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    };
+                    const encrypted_chunk_data: []const u8 = ecd_fbs.getWritten();
+                    const test_ad = "";
+                    const test_npub = [_]u8{0xD} ** Aes256Gcm.nonce_length;
+                    const test_key = [_]u8{0xD} ** Aes256Gcm.key_length;
+                    Aes256Gcm.decrypt(decrypted_chunk_buffer[0..encrypted_chunk_data.len], encrypted_chunk_data, auth_tag.?, test_ad, test_npub, test_key) catch |err| switch (err) {
+                        inline error.AuthenticationFailed => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    };
+                    const decrypted_chunk_data: []const u8 = decrypted_chunk_buffer[0..encrypted_chunk_data.len];
+
                     const file = maybe_file orelse blk: {
                         const file = std.fs.cwd().createFile("decoded", .{}) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
@@ -276,12 +314,7 @@ pub fn PipeLine(comptime W: type) type {
                         maybe_file = file;
                         break :blk file;
                     };
-
-                    var buffered = std.io.bufferedWriter(file.writer());
-                    _ = dpp.ec.decodeCtx(excluded_index_set, buffered.writer(), readers_ctx) catch |err| switch (err) {
-                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                    };
-                    buffered.flush() catch |err| switch (err) {
+                    file.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                 }
