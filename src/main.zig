@@ -11,6 +11,7 @@ test {
     _ = Matrix;
     _ = BinaryFieldMatrix;
     _ = @import("SensitiveBytes.zig");
+    _ = @import("pipelines.zig");
 }
 
 const usage =

@@ -2,13 +2,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const util = @import("util.zig");
-
 pub const erasure = @import("erasure.zig");
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
 
 pub const ServerInfo = @import("pipelines/ServerInfo.zig");
 pub const PipelineInitValues = @import("pipelines/PipelineInitValues.zig");
+
+pub const chunk = @import("pipelines/chunk.zig");
 
 const upload = @import("pipelines/upload.zig");
 pub const UploadCtx = upload.Ctx;
@@ -31,4 +31,12 @@ pub fn digestStringToBytes(str: *const [Sha256.digest_length * 2]u8) DigestStrin
     };
     assert(digest.len == digest_slice.len);
     return digest;
+}
+
+comptime {
+    _ = @import("pipelines/chunk.zig");
+    _ = ServerInfo;
+    _ = PipelineInitValues;
+    _ = upload;
+    _ = download;
 }

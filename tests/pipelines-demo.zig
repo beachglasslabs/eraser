@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const eraser = @import("eraser");
 
@@ -34,13 +35,15 @@ pub fn main() !void {
         .server_info = server_info,
     };
 
+    var default_prng1 = std.rand.DefaultPrng.init(1243);
+    var default_prng2 = std.rand.DefaultPrng.init(1243);
+
     var upload_pipeline: eraser.UploadPipeLine(u8) = undefined;
-    try upload_pipeline.init(allocator, pipeline_values);
+    try upload_pipeline.init(allocator, default_prng1.random(), pipeline_values);
     defer upload_pipeline.deinit(.finish_remaining_uploads);
 
-    var default_prng = std.rand.DefaultPrng.init(1243);
     var download_pipeline: eraser.DownloadPipeLine(u8) = undefined;
-    try download_pipeline.init(allocator, default_prng.random(), pipeline_values);
+    try download_pipeline.init(allocator, default_prng2.random(), pipeline_values);
     defer download_pipeline.deinit(.finish_remaining_uploads);
 
     var line_buffer = std.ArrayList(u8).init(allocator);
@@ -48,6 +51,7 @@ pub fn main() !void {
 
     const ChunkDigests = std.BoundedArray([Sha256.digest_length]u8, 6);
     var last_chunk_digests: ?ChunkDigests = null;
+    var last_encryption_info: ?eraser.chunk.EncryptionInfo = null;
 
     while (true) {
         line_buffer.clearRetainingCapacity();
@@ -86,17 +90,24 @@ pub fn main() !void {
                     progress: *std.Progress.Node,
                     close_re: std.Thread.ResetEvent = .{},
                     chunks: ?ChunkDigests = null,
+                    encryption_info: ?eraser.chunk.EncryptionInfo = null,
 
                     pub inline fn update(self: *@This(), percentage: u8) void {
                         self.progress.setCompletedItems(percentage);
                         self.progress.context.maybeRefresh();
                     }
-                    pub inline fn close(self: *@This(), file: std.fs.File, chunks: ?[]const [Sha256.digest_length]u8) void {
+                    pub inline fn close(
+                        self: *@This(),
+                        file: std.fs.File,
+                        chunks: ?[]const [Sha256.digest_length]u8,
+                        encryption_info: ?*const eraser.chunk.EncryptionInfo,
+                    ) void {
                         self.progress.setCompletedItems(100);
                         self.progress.context.maybeRefresh();
-                        if (chunks) |list| {
-                            self.chunks = ChunkDigests.fromSlice(list) catch |err| @panic(@errorName(err));
-                        }
+
+                        if (chunks) |list| self.chunks = ChunkDigests.fromSlice(list) catch |err| @panic(@errorName(err));
+                        if (encryption_info) |ptr| self.encryption_info = ptr.*;
+
                         file.close();
                         self.close_re.set();
                         while (self.close_re.isSet()) {}
@@ -118,6 +129,7 @@ pub fn main() !void {
                     continue;
                 };
                 last_chunk_digests = chunks;
+                last_encryption_info = wait_ctx.encryption_info orelse @panic("How?");
 
                 std.log.info("Finished encoding '{s}' into chunks:\n{}", .{ input_path, struct {
                     chunks: []const [Sha256.digest_length]u8,
@@ -135,8 +147,17 @@ pub fn main() !void {
                 }{ .chunks = chunks.constSlice() } });
             },
             .decode => {
-                std.log.info("", .{});
-                const inputs: ChunkDigests = blk: {
+                const encryption_info: eraser.chunk.EncryptionInfo = blk: {
+                    const first_tok = tokenizer.next() orelse {
+                        break :blk last_encryption_info orelse {
+                            std.log.err("No files uploaded this session", .{});
+                            continue;
+                        };
+                    };
+                    _ = first_tok;
+                    @panic("TODO");
+                };
+                const chunk_digests: ChunkDigests = blk: {
                     const first_digest = tokenizer.next() orelse {
                         break :blk last_chunk_digests orelse {
                             std.log.err("No files uploaded this session", .{});
@@ -146,6 +167,8 @@ pub fn main() !void {
                     _ = first_digest;
                     @panic("TODO");
                 };
+
+                std.log.info("Queueing download", .{});
 
                 var progress = std.Progress{};
                 const root_node = progress.start("Upload", 100);
@@ -168,7 +191,7 @@ pub fn main() !void {
                     .progress = root_node,
                 };
 
-                try download_pipeline.downloadFile(inputs.constSlice(), &wait_ctx);
+                try download_pipeline.downloadFile(chunk_digests.constSlice(), &encryption_info, &wait_ctx);
             },
         }
     }
