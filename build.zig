@@ -10,12 +10,14 @@ pub fn build(b: *Build) void {
     const shard_count = b.option([]const u8, "shard-count", "Erasure shard count to specify for executables and tests");
     const shard_size = b.option([]const u8, "shard-size", "Erasure shard size to specify for executables and tests");
     const word_size = b.option([]const u8, "word-size", "Erasure word size to specify for executables and tests");
+    const confirm_clear_buckets = b.option(bool, "clear-buckets", "Confirm clearing all buckets of all objects (FOR TESTING PURPOSES ONLY).");
 
     // top level steps
     const run_step = b.step("run", "Run the app");
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
-    const run_libtest = b.step("pipeline-demo", "Run the library test executable");
+    const run_libtest_step = b.step("pipeline-demo", "Run the library test executable");
+    const clear_buckets_step = b.step("clear-buckets", "Clear all buckets of all objects (INVOKES `gcloud`, FOR TESTING PURPOSES ONLY).");
 
     // everything else
 
@@ -78,12 +80,25 @@ pub fn build(b: *Build) void {
     libtest_exe.addModule("eraser", eraser_mod);
 
     const libtest_run = b.addRunArtifact(libtest_exe);
-    run_libtest.dependOn(&libtest_run.step);
+    run_libtest_step.dependOn(&libtest_run.step);
     libtest_run.stdio = .inherit;
 
     if (b.option([]const u8, "gc-auth-key", "Google cloud auth key")) |auth_key| {
         libtest_run.setEnvironmentVariable("ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY", auth_key);
     }
+
+    clear_buckets_step.dependOn(step: {
+        if (!(confirm_clear_buckets orelse false))
+            break :step failureStep(b, error.FailedToConfirm, "Must specify `-Dclear-buckets` to confirm running step `clear-buckets`");
+
+        const clear_buckets_exe = b.addExecutable(.{
+            .name = "clear-buckets",
+            .root_source_file = Build.LazyPath.relative("scripts/clear-buckets.zig"),
+            .optimize = optimize,
+        });
+        const clear_buckets_run = b.addRunArtifact(clear_buckets_exe);
+        break :step &clear_buckets_run.step;
+    });
 }
 
 inline fn encodeAndDecode(
@@ -143,4 +158,39 @@ inline fn encodeAndDecode(
     }
 
     return output;
+}
+
+fn failureStep(
+    b: *Build,
+    err: anyerror,
+    msg: []const u8,
+) *Build.Step {
+    const log = std.log.default;
+    const msg_duped = b.dupe(msg);
+
+    const FailStep = struct {
+        step: Build.Step,
+        msg: []const u8,
+        err: anyerror,
+
+        fn make(step: *Build.Step, _: *std.Progress.Node) anyerror!void {
+            const failure = @fieldParentPtr(@This(), "step", step);
+            log.err("{s}", .{failure.msg});
+            return failure.err;
+        }
+    };
+
+    const failure: *FailStep = b.allocator.create(FailStep) catch |e| @panic(@errorName(e));
+    failure.* = .{
+        .step = Build.Step.init(.{
+            .id = .custom,
+            .name = b.fmt("Failure '{s}'", .{@errorName(err)}),
+            .owner = b,
+            .makeFn = FailStep.make,
+        }),
+        .msg = msg_duped,
+        .err = err,
+    };
+
+    return &failure.step;
 }

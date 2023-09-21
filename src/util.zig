@@ -38,6 +38,16 @@ pub fn safeMemcpy(dst: anytype, src: anytype) void {
     }
 }
 
+pub inline fn match2(a: anytype, b: anytype) u2 {
+    const Ta = @TypeOf(a);
+    const Tb = @TypeOf(b);
+    if (Ta == comptime_int) return match2(@as(u1, a), @as(Tb, b));
+    if (Tb == comptime_int) return match2(@as(Ta, a), @as(u1, b));
+    const Bits = packed struct { a: bool, b: bool };
+    const bits: Bits = .{ .a = @bitCast(a), .b = @bitCast(b) };
+    return @bitCast(bits);
+}
+
 /// Allocator which always fails to allocate, and presumes
 /// resizing and freeing operations to be `unreachable`.
 pub const empty_allocator = std.mem.Allocator{

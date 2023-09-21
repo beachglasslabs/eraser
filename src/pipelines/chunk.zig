@@ -11,11 +11,11 @@ const digestStringToBytes = pipelines.digestStringToBytes;
 const chunk = @This();
 
 pub const size: comptime_int = 15 * bytes_per_megabyte;
-const bytes_per_megabyte = 10_000_000;
+const bytes_per_megabyte = 1_000_000;
 
-pub const Count = std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk.size);
-pub inline fn countForFileSize(file_size: u64) std.math.IntFittingRange(1, std.math.maxInt(u64) / chunk.size) {
-    return @intCast(file_size / chunk.size + 1);
+pub const Count = std.math.IntFittingRange(1, std.math.divCeil(u64, std.math.maxInt(u64), chunk.size) catch unreachable);
+pub inline fn countForFileSize(file_size: u64) Count {
+    return @intCast(std.math.divCeil(u64, file_size, chunk.size) catch unreachable);
 }
 pub inline fn startOffset(chunk_idx: Count) u64 {
     return (@as(u64, chunk_idx) * size);
@@ -23,29 +23,47 @@ pub inline fn startOffset(chunk_idx: Count) u64 {
 
 pub const Header = struct {
     version: HeaderVersion = HeaderVersion.latest,
-    /// Should be the SHA of the current chunk's data.
+    /// Represents the SHA of the current chunk's unencrypted data.
     current_chunk_digest: [Sha256.digest_length]u8,
-    /// Should be the SHA of the blob comprised of the next chunk's header and data.
-    /// If this is for the last chunk, it should simply be the SHA of the last chunk.
-    next_chunk_blob_digest: [Sha256.digest_length]u8,
-    /// Grouping of possible data states based on if this is the header of the first
-    /// chunk, the last chunk, or a chunk in between the first and last chunks.
-    ordered_data: OrderedData,
+    /// Represents the SHA digest of the entire file. If this header does not represent
+    /// the first chunk, this field is null.
+    full_file_digest: ?[Sha256.digest_length]u8,
+    /// If there is no chunk after the one represented by this header, this field is null.
+    next: ?NextInfo,
 
-    pub const OrderedData = union(enum) {
-        first: First,
-        middle: Middle,
-        last: Last,
-
-        pub const First = struct {
-            full_file_digest: [Sha256.digest_length]u8,
-            next_encryption: EncryptionInfo,
-        };
-        pub const Middle = struct {
-            next_encryption: EncryptionInfo,
-        };
-        pub const Last = struct {};
+    pub const DataFlags = packed struct(u8) {
+        full_file_digest: bool,
+        next: bool,
+        unused: enum(u6) { unset = 0 } = .unset,
     };
+
+    pub const NextInfo = struct {
+        /// Represents the SHA of the blob comprised of the next chunk's header and data.
+        chunk_blob_digest: [Sha256.digest_length]u8,
+        /// Represents the encryption information of the next chunk.
+        encryption: EncryptionInfo,
+
+        pub inline fn write(next: *const NextInfo, writer: anytype) @TypeOf(writer).Error!void {
+            try writer.writeAll(&next.chunk_blob_digest);
+            try next.encryption.write(writer);
+        }
+
+        pub inline fn read(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!NextInfo {
+            const chunk_blob_digest = try reader.readBytesNoEof(Sha256.digest_length);
+            const encryption = try EncryptionInfo.read(reader);
+            return .{
+                .chunk_blob_digest = chunk_blob_digest,
+                .encryption = encryption,
+            };
+        }
+    };
+
+    pub inline fn dataFlags(header: *const Header) DataFlags {
+        return .{
+            .full_file_digest = header.full_file_digest != null,
+            .next = header.next != null,
+        };
+    }
 
     pub fn calcNameBuffer(header: *const Header, buffer: []const u8) [Sha256.digest_length]u8 {
         var hasher = Sha256.init(.{});
@@ -79,6 +97,27 @@ pub const Header = struct {
     pub inline fn byteCount(header: *const Header) std.math.IntFittingRange(min_header_size, max_header_size) {
         const result = writeHeader(std.io.null_writer, header) catch |err| switch (err) {};
         return @intCast(result);
+    }
+
+    pub fn format(
+        self: *const Header,
+        comptime fmt_str: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = options;
+        _ = fmt_str;
+        try writer.print("{{ ver: {}, curr: {s}", .{
+            self.version,
+            digestBytesToString(&self.current_chunk_digest),
+        });
+        if (self.full_file_digest) |*full_digest| {
+            try writer.print(", full: {s}", .{&digestBytesToString(full_digest)});
+        }
+        if (self.next) |*next| {
+            try writer.print(", next_blob: {s}, next_enc: {}", .{ digestBytesToString(&next.chunk_blob_digest), next.encryption });
+        }
+        try writer.writeAll("}");
     }
 };
 
@@ -139,21 +178,37 @@ pub const HeaderVersion = extern struct {
 };
 
 pub const EncryptionInfo = struct {
-    auth_tag: [Aes256Gcm.tag_length]u8,
+    tag: [Aes256Gcm.tag_length]u8,
     npub: [Aes256Gcm.nonce_length]u8,
     key: [Aes256Gcm.key_length]u8,
 
     pub inline fn write(info: *const EncryptionInfo, writer: anytype) @TypeOf(writer).Error!void {
-        try writer.writeAll(&info.auth_tag);
+        try writer.writeAll(&info.tag);
         try writer.writeAll(&info.npub);
         try writer.writeAll(&info.key);
     }
     pub inline fn read(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!EncryptionInfo {
         return .{
-            .auth_tag = try reader.readBytesNoEof(Aes256Gcm.tag_length),
+            .tag = try reader.readBytesNoEof(Aes256Gcm.tag_length),
             .npub = try reader.readBytesNoEof(Aes256Gcm.nonce_length),
             .key = try reader.readBytesNoEof(Aes256Gcm.key_length),
         };
+    }
+
+    pub fn format(
+        self: *const EncryptionInfo,
+        comptime fmt_str: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        try writer.writeAll(".{ ");
+        inline for (@typeInfo(EncryptionInfo).Struct.fields, 0..) |field, i| {
+            if (i != 0) try writer.writeAll(", ");
+            const field_ptr = &@field(self, field.name);
+            try writer.writeAll(comptime std.fmt.comptimePrint(".{} = ", .{std.zig.fmtId(field.name)}));
+            try std.fmt.formatType(std.fmt.fmtSliceHexLower(field_ptr), fmt_str, options, writer, std.fmt.default_max_depth);
+        }
+        try writer.writeAll(" }");
     }
 };
 
@@ -167,25 +222,17 @@ pub fn writeHeader(
     // write version
     try cwriter.writeAll(&header.version.toBytes());
 
+    // write data flags
+    try cwriter.writeByte(@bitCast(header.dataFlags()));
+
     // write the SHA of the current chunk's data
     try cwriter.writeAll(&header.current_chunk_digest);
 
-    // write the SHA of the header and data of the next chunk
-    try cwriter.writeAll(&header.next_chunk_blob_digest);
+    // write the full file SHA digest
+    if (header.full_file_digest) |*ptr| try cwriter.writeAll(ptr);
 
-    switch (header.ordered_data) {
-        .first => |*data| {
-            // write the SHA of the entire file
-            try cwriter.writeAll(&data.full_file_digest);
-            // write the encryption info of the next chunk
-            try data.next_encryption.write(cwriter);
-        },
-        .middle => |*data| {
-            // write the encryption info of the next chunk
-            try data.next_encryption.write(cwriter);
-        },
-        .last => {},
-    }
+    // write the encryption information for the next chunk
+    if (header.next) |*ptr| try ptr.write(cwriter);
 
     return @intCast(counter.bytes_written);
 }
@@ -195,18 +242,7 @@ pub const ReadHeaderError = error{
     InvalidFirstChunkFlag,
 };
 
-pub const ReadOrder = enum {
-    /// Specify when reading the first chunk
-    first,
-    /// Specify when reading any chunk after the first and before the last
-    middle,
-    /// Specify when reading the last chunk
-    last,
-};
-pub fn readHeader(
-    reader: anytype,
-    read_order: ReadOrder,
-) (@TypeOf(reader).Error || error{EndOfStream} || ReadHeaderError)!Header {
+pub fn readHeader(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream} || ReadHeaderError)!Header {
     // read version
     const version: HeaderVersion = blk: {
         const bytes = try reader.readBytesNoEof(6);
@@ -218,128 +254,95 @@ pub fn readHeader(
         .eq => {},
     }
 
-    // read the SHA of the current chunk's data
-    const current_chunk_digest = try reader.readBytesNoEof(Sha256.digest_length);
+    const data_flags: Header.DataFlags = @bitCast(try reader.readByte());
 
-    // read the SHA of the next chunk's header and data
-    const next_chunk_blob_digest = try reader.readBytesNoEof(Sha256.digest_length);
+    // read the SHA of the current chunk's unencrypted data
+    const current_chunk_digest: [Sha256.digest_length]u8 = try reader.readBytesNoEof(Sha256.digest_length);
 
-    const ordered_data: Header.OrderedData = switch (read_order) {
-        .first => .{ .first = .{
-            .full_file_digest = try reader.readBytesNoEof(Sha256.digest_length),
-            .next_encryption = try EncryptionInfo.read(reader),
-        } },
-        .middle => .{ .middle = .{
-            .next_encryption = try EncryptionInfo.read(reader),
-        } },
-        .last => .{ .last = .{} },
-    };
+    // read the SHA of the entire unencrypted file, if present
+    const full_file_digest: ?[Sha256.digest_length]u8 = if (data_flags.full_file_digest)
+        try reader.readBytesNoEof(Sha256.digest_length)
+    else
+        null;
+
+    // read the info about the next chunk, if present
+    const next: ?Header.NextInfo = if (data_flags.next)
+        try Header.NextInfo.read(reader)
+    else
+        null;
 
     return .{
         .version = version,
-        .next_chunk_blob_digest = next_chunk_blob_digest,
         .current_chunk_digest = current_chunk_digest,
-        .ordered_data = ordered_data,
+        .full_file_digest = full_file_digest,
+        .next = next,
     };
 }
 
 pub const max_header_size: comptime_int = writeHeader(std.io.null_writer, &Header{
-    .next_chunk_blob_digest = .{0xFF} ** Sha256.digest_length,
     .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
-    .ordered_data = data: {
-        // name of the largest field
-        const name_of_max = blk: {
-            const fields = @typeInfo(Header.OrderedData).Union.fields;
-            var max_idx = 0;
-            var max_size = @sizeOf(fields[0].type);
-            for (fields, 0..) |field, i| {
-                const field_size = @sizeOf(field.type);
-                if (max_size >= field_size) continue;
-                max_size = field_size;
-                max_idx = i;
-            }
-            break :blk fields[max_idx].name;
-        };
-
-        const max_encryption = EncryptionInfo{
-            .auth_tag = .{0xFF} ** Aes256Gcm.tag_length,
+    .full_file_digest = .{0xFF} ** Sha256.digest_length,
+    .next = .{
+        .chunk_blob_digest = .{0xFF} ** Sha256.digest_length,
+        .encryption = .{
+            .tag = .{0xFF} ** Aes256Gcm.tag_length,
             .npub = .{0xFF} ** Aes256Gcm.nonce_length,
             .key = .{0xFF} ** Aes256Gcm.key_length,
-        };
-        const data = switch (@field(std.meta.FieldEnum(Header.OrderedData), name_of_max)) {
-            .first => Header.OrderedData.First{
-                .full_file_digest = .{0xFF} ** Sha256.digest_length,
-                .next_encryption = max_encryption,
-            },
-            .middle => Header.OrderedData.Middle{
-                .next_encryption = max_encryption,
-            },
-            .last => Header.OrderedData.Last{},
-        };
-        break :data @unionInit(Header.OrderedData, name_of_max, data);
+        },
     },
 }) catch |err| @compileError(@errorName(err));
 
 pub const min_header_size: comptime_int = writeHeader(std.io.null_writer, &Header{
     .version = .{ .major = 0, .minor = 0, .patch = 0 },
-    .next_chunk_blob_digest = .{0} ** Sha256.digest_length,
     .current_chunk_digest = .{0} ** Sha256.digest_length,
-    .ordered_data = .{
-        .last = @as(Header.OrderedData.Last, blk: {
-            assert(@sizeOf(Header.OrderedData.Last) == 0); // nothing smaller than 0 bytes
-            break :blk .{};
-        }),
-    },
+    .full_file_digest = null,
+    .next = null,
 }) catch |err| @compileError(@errorName(err));
 
 test Header {
     try testChunkHeader(.{
-        .next_chunk_blob_digest = try comptime digestStringToBytes("aB" ** Sha256.digest_length),
         .current_chunk_digest = try comptime digestStringToBytes("Cd" ** Sha256.digest_length),
-        .ordered_data = .{ .first = .{
-            .full_file_digest = try comptime digestStringToBytes("eF" ** Sha256.digest_length),
-            .next_encryption = .{
-                .auth_tag = .{7} ** Aes256Gcm.tag_length,
+        .full_file_digest = null,
+        .next = .{
+            .chunk_blob_digest = try comptime digestStringToBytes("aB" ** Sha256.digest_length),
+            .encryption = .{
+                .tag = .{7} ** Aes256Gcm.tag_length,
                 .npub = .{15} ** Aes256Gcm.nonce_length,
                 .key = .{32} ** Aes256Gcm.key_length,
             },
-        } },
+        },
     });
     try testChunkHeader(.{
-        .next_chunk_blob_digest = try comptime digestStringToBytes("Ab" ** Sha256.digest_length),
         .current_chunk_digest = try comptime digestStringToBytes("cD" ** Sha256.digest_length),
-        .ordered_data = .{ .middle = .{
-            .next_encryption = .{
-                .auth_tag = .{7} ** Aes256Gcm.tag_length,
+        .full_file_digest = null,
+        .next = .{
+            .chunk_blob_digest = try comptime digestStringToBytes("Ab" ** Sha256.digest_length),
+            .encryption = .{
+                .tag = .{7} ** Aes256Gcm.tag_length,
                 .npub = .{15} ** Aes256Gcm.nonce_length,
                 .key = .{32} ** Aes256Gcm.key_length,
             },
-        } },
+        },
     });
     try testChunkHeader(.{
-        .next_chunk_blob_digest = try comptime digestStringToBytes("aB" ** Sha256.digest_length),
         .current_chunk_digest = try comptime digestStringToBytes("Cd" ** Sha256.digest_length),
-        .ordered_data = .{ .last = .{} },
+        .full_file_digest = null,
+        .next = null,
     });
 
     {
         var fbs = std.io.fixedBufferStream("");
-        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader(), .first));
-        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader(), .middle));
-        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader(), .last));
+        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader()));
+        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader()));
+        try std.testing.expectError(error.EndOfStream, readHeader(fbs.reader()));
     }
 }
 
 fn testChunkHeader(ch: Header) !void {
-    const read_order: ReadOrder = switch (ch.ordered_data) {
-        .first => .first,
-        .middle => .middle,
-        .last => .last,
-    };
     var bytes = std.BoundedArray(u8, max_header_size){};
     _ = try writeHeader(bytes.writer(), &ch);
 
     var fbs = std.io.fixedBufferStream(bytes.constSlice());
-    const actual = try readHeader(fbs.reader(), read_order);
+    const actual = try readHeader(fbs.reader());
     try std.testing.expectEqual(ch, actual);
 }

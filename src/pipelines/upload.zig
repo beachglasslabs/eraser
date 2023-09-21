@@ -21,14 +21,14 @@ pub const Ctx = struct {
         file_size: u64,
     };
 
-    pub inline fn init(data: Data, ctx_ptr: anytype) Ctx {
+    pub fn init(data: Data, ctx_ptr: anytype) Ctx {
         const Ptr = @TypeOf(ctx_ptr);
         const gen = struct {
             fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
                 const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
                 switch (action_data) {
                     .update => |percentage| ptr.update(percentage),
-                    .close => |close_data| ptr.close(close_data.file, close_data.digests, close_data.first_encryption),
+                    .close => |args| ptr.close(args.file, args.stored_file, args.first_encryption),
                 }
             }
         };
@@ -53,12 +53,12 @@ pub const Ctx = struct {
     /// names the file was turned into.
     pub inline fn close(
         self: Ctx,
-        digests: ?[]const [Sha256.digest_length]u8,
+        stored_file: ?*const StoredFile,
         first_encryption: ?*const chunk.EncryptionInfo,
     ) void {
         return self.action(.{ .close = .{
             .file = self.data.file,
-            .digests = digests,
+            .stored_file = stored_file,
             .first_encryption = first_encryption,
         } });
     }
@@ -76,10 +76,15 @@ pub const Ctx = struct {
 
         const Close = struct {
             file: std.fs.File,
-            digests: ?[]const [Sha256.digest_length]u8,
+            stored_file: ?*const StoredFile,
             first_encryption: ?*const chunk.EncryptionInfo,
         };
     };
+};
+
+pub const StoredFile = struct {
+    first_name: [Sha256.digest_length]u8,
+    chunk_count: chunk.Count,
 };
 
 pub fn PipeLine(comptime W: type) type {
@@ -105,7 +110,7 @@ pub fn PipeLine(comptime W: type) type {
         const header_plus_chunk_max_size = chunk.size + chunk.max_header_size;
 
         const ErasureCoder = erasure.Coder(W);
-        const ChunkHeaderInfo = struct { header: chunk.Header, chunk_name: [Sha256.digest_length]u8 };
+        const ChunkHeaderInfo = struct { header: chunk.Header };
 
         // TODO: should this use a more strict memory order?
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
@@ -158,7 +163,7 @@ pub fn PipeLine(comptime W: type) type {
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
 
-            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, uploadPipeLineThread, .{self});
+            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator, .stack_size = 16 * 1024 * 1024 }, uploadPipeLineThread, .{self});
         }
 
         pub fn deinit(
@@ -267,20 +272,15 @@ pub fn PipeLine(comptime W: type) type {
                 };
                 const up_data = up_ctx.data;
                 const chunk_count = chunk.countForFileSize(up_data.file_size);
-                var first_encryption: ?chunk.EncryptionInfo = .{
-                    .auth_tag = undefined,
-                    .npub = nonce_generator.new(),
-                    .key = test_key,
-                };
+                var stored_file: ?StoredFile = null;
+                var first_encryption: ?chunk.EncryptionInfo = null;
                 defer {
                     up_ctx.update(100);
 
                     upp.chunk_headers_buf_mtx.lock();
                     defer upp.chunk_headers_buf_mtx.unlock();
-                    const digests = upp.chunk_headers_buf.items(.chunk_name);
-                    assert(digests.len <= chunk_count);
                     up_ctx.close(
-                        if (digests.len == chunk_count) digests else null,
+                        if (stored_file) |*ptr| ptr else null,
                         if (first_encryption) |*ptr| ptr else null,
                     );
                 }
@@ -320,16 +320,9 @@ pub fn PipeLine(comptime W: type) type {
                         upp.chunk_headers_buf.appendAssumeCapacity(ChunkHeaderInfo{
                             .header = chunk.Header{
                                 .current_chunk_digest = chunk_digest,
-                                .next_chunk_blob_digest = undefined,
-                                .ordered_data = .{ .middle = .{
-                                    .next_encryption = .{
-                                        .auth_tag = undefined,
-                                        .npub = undefined,
-                                        .key = undefined,
-                                    },
-                                } },
+                                .full_file_digest = null,
+                                .next = null,
                             },
-                            .chunk_name = undefined,
                         });
                     }
                     switch (std.math.order(real_chunk_count, chunk_count)) {
@@ -346,25 +339,11 @@ pub fn PipeLine(comptime W: type) type {
                     const headers: []chunk.Header = upp.chunk_headers_buf.items(.header);
                     assert(headers.len != 0);
 
-                    // fully initialise the last chunk header
-                    const last = &headers[headers.len - 1];
-                    last.* = .{
-                        .version = last.version,
-                        .current_chunk_digest = last.current_chunk_digest,
-                        .next_chunk_blob_digest = last.current_chunk_digest,
-                        .ordered_data = .{ .last = .{} },
-                    };
-
-                    // partially initialise the first chunk header
-                    // if the first and last headers are the same, this doesn't overwrite any important data
-                    // or cause any conflicts, it only overwrites
-                    // `ordered_data = .{ .last = .{} }` with
-                    // `ordered_data = .{ .first = .{...} }`
-                    headers[0].ordered_data = .{
-                        .first = .{
-                            .full_file_digest = full_file_digest,
-                            .next_encryption = undefined,
-                        },
+                    const first = &headers[0];
+                    first.* = .{
+                        .current_chunk_digest = first.current_chunk_digest,
+                        .full_file_digest = full_file_digest,
+                        .next = null,
                     };
                 }
                 assert(upp.chunk_headers_buf.len == chunk_count);
@@ -425,24 +404,32 @@ pub fn PipeLine(comptime W: type) type {
                         defer upp.chunk_headers_buf_mtx.unlock();
 
                         const slice = upp.chunk_headers_buf.slice();
-                        const chunk_names: [][Sha256.digest_length]u8 = slice.items(.chunk_name);
-                        chunk_names[chunk_idx] = chunk_name;
 
                         if (chunk_idx != 0) { // initialise the `next_chunk_blob_digest` field of the previous chunk (it is the next in the iteration order)
                             const headers: []chunk.Header = slice.items(.header);
-                            headers[chunk_idx - 1].next_chunk_blob_digest = chunk_name;
-                            continue;
+                            headers[chunk_idx - 1].next = .{
+                                .chunk_blob_digest = chunk_name,
+                                .encryption = .{
+                                    .tag = auth_tag,
+                                    .npub = npub,
+                                    .key = test_key,
+                                },
+                            };
+                        } else {
+                            assert(first_encryption == null);
+                            first_encryption = .{
+                                .tag = auth_tag,
+                                .npub = npub,
+                                .key = test_key,
+                            };
+                            assert(stored_file == null);
+                            stored_file = .{
+                                .first_name = chunk_name,
+                                .chunk_count = chunk_count,
+                            };
                         }
                     }
 
-                    // should be done after this
-                    first_encryption = .{
-                        .auth_tag = auth_tag,
-                        .npub = npub,
-                        .key = test_key,
-                    };
-
-                    // TODO: append & send requests
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 

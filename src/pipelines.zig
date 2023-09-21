@@ -11,6 +11,7 @@ pub const PipelineInitValues = @import("pipelines/PipelineInitValues.zig");
 pub const chunk = @import("pipelines/chunk.zig");
 
 const upload = @import("pipelines/upload.zig");
+pub const StoredFile = upload.StoredFile;
 pub const UploadCtx = upload.Ctx;
 pub const UploadPipeLine = upload.PipeLine;
 

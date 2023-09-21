@@ -3,6 +3,7 @@ const erasure = @import("../erasure.zig");
 const PipelineInitValues = @import("PipelineInitValues.zig");
 const ServerInfo = @import("ServerInfo.zig");
 const SharedQueue = @import("../shared_queue.zig").SharedQueue;
+const StoredFile = @import("upload.zig").StoredFile;
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,7 +18,7 @@ pub const Ctx = struct {
     data: Data,
 
     pub const Data = struct {
-        chunk_names: []const [Sha256.digest_length]u8,
+        stored_file: StoredFile,
         encryption_info: chunk.EncryptionInfo,
     };
 
@@ -69,8 +70,6 @@ pub fn PipeLine(comptime W: type) type {
         queue_mtx: std.Thread.Mutex,
         queue: SharedQueue(Ctx),
 
-        chunk_headers_buf_mtx: std.Thread.Mutex,
-        chunk_headers_buf: std.ArrayListUnmanaged(chunk.Header),
         chunk_buffer: *[header_plus_chunk_max_size * 2]u8,
 
         random: std.rand.Random,
@@ -107,8 +106,6 @@ pub fn PipeLine(comptime W: type) type {
                 .queue_mtx = .{},
                 .queue = undefined,
 
-                .chunk_headers_buf_mtx = .{},
-                .chunk_headers_buf = .{},
                 .chunk_buffer = undefined,
 
                 .random = random,
@@ -151,7 +148,6 @@ pub fn PipeLine(comptime W: type) type {
             self.thread.join();
             self.queue.deinit(self.allocator);
 
-            self.chunk_headers_buf.deinit(self.allocator);
             self.allocator.free(self.chunk_buffer);
 
             self.ec.deinit(self.allocator);
@@ -161,17 +157,12 @@ pub fn PipeLine(comptime W: type) type {
 
         pub fn downloadFile(
             self: *Self,
-            digests: []const [Sha256.digest_length]u8,
+            stored_file: *const StoredFile,
             encryption_info: *const chunk.EncryptionInfo,
             ctx_ptr: anytype,
         ) !void {
-            {
-                self.chunk_headers_buf_mtx.lock();
-                defer self.chunk_headers_buf_mtx.unlock();
-                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, digests.len);
-            }
             const data = Ctx.Data{
-                .chunk_names = digests,
+                .stored_file = stored_file.*,
                 .encryption_info = encryption_info.*,
             };
             _ = try self.queue.pushValue(self.allocator, Ctx.init(data, ctx_ptr));
@@ -191,7 +182,6 @@ pub fn PipeLine(comptime W: type) type {
                     continue;
                 };
                 const down_data = down_ctx.data;
-                const chunk_count: chunk.Count = @intCast(down_data.chunk_names.len);
                 defer down_ctx.close();
 
                 const excluded_index_set = erasure.sampleIndexSet(
@@ -203,42 +193,38 @@ pub fn PipeLine(comptime W: type) type {
                 var maybe_file: ?std.fs.File = null;
                 defer if (maybe_file) |file| file.close();
 
-                var current_index: u8 = 0;
                 var next_encryption_info = down_data.encryption_info;
-                for (down_data.chunk_names, 0..) |chunk_name, chunk_idx| {
-                    const read_order: chunk.ReadOrder = blk: {
-                        if (chunk_idx == 0) break :blk .first;
-                        if (chunk_idx + 1 < chunk_count) break :blk .middle;
-                        assert(chunk_idx + 1 == chunk_count);
-                        break :blk .last;
-                    };
+                var current_chunk_name: ?[Sha256.digest_length]u8 = down_data.stored_file.first_name;
 
+                var chunks_encountered: chunk.Count = 0;
+                while (current_chunk_name) |chunk_name| {
+                    if (chunks_encountered == down_data.stored_file.chunk_count) {
+                        @panic("TODO handle: more chunks encountered than specified");
+                    }
+                    chunks_encountered += 1;
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 
-                    if (dpp.server_info.google_cloud) |gc| {
-                        const gc_prealloc = dpp.gc_prealloc.?;
+                    { // populate `requests`
+                        var current_index: u8 = 0;
 
-                        var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
+                        if (dpp.server_info.google_cloud) |gc| {
+                            const gc_prealloc = dpp.gc_prealloc.?;
 
-                        while (iter.next()) |uri_str| : (current_index += 1) {
-                            if (excluded_index_set.isSet(current_index)) continue;
+                            var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
 
-                            const uri = std.Uri.parse(uri_str) catch unreachable;
-                            const req = client.request(.GET, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
-                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            requests.appendAssumingCapacity(req);
+                            while (iter.next()) |uri_str| : (current_index += 1) {
+                                if (excluded_index_set.isSet(current_index)) continue;
+
+                                const uri = std.Uri.parse(uri_str) catch unreachable;
+                                const req = client.request(.GET, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+                                requests.appendAssumingCapacity(req);
+                            }
                         }
                     }
-
-                    // NOTE: this should be safe from any race condition, because
-                    // the only other place where this field is modified is in
-                    // `downloadFile`, where it calls `ensureTotalCapacity`, which
-                    // should not modify the `items.len` field at all, which is
-                    // all this function does.
-                    dpp.chunk_headers_buf.clearRetainingCapacity();
 
                     for (requests.slice()) |*req| {
                         req.start() catch |err| switch (err) {
@@ -285,30 +271,38 @@ pub fn PipeLine(comptime W: type) type {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         inline error.NoSpaceLeft => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
-                    const encrypted_chunk_data: []const u8 = ecd_fbs.getWritten();
+                    const encrypted_blob_data: []const u8 = ecd_fbs.getWritten();
 
-                    const auth_tag = next_encryption_info.auth_tag;
+                    const auth_tag = next_encryption_info.tag;
                     const npub = next_encryption_info.npub;
                     const key = next_encryption_info.key;
-                    Aes256Gcm.decrypt(decrypted_chunk_buffer[0..encrypted_chunk_data.len], encrypted_chunk_data, auth_tag, "", npub, key) catch |err| switch (err) {
+                    Aes256Gcm.decrypt(
+                        decrypted_chunk_buffer[0..encrypted_blob_data.len],
+                        encrypted_blob_data,
+                        auth_tag,
+                        "",
+                        npub,
+                        key,
+                    ) catch |err| switch (err) {
                         inline error.AuthenticationFailed => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
-                    const decrypted_blob_data: []const u8 = decrypted_chunk_buffer[0..encrypted_chunk_data.len];
+                    const decrypted_blob_data: []const u8 = decrypted_chunk_buffer[0..encrypted_blob_data.len];
                     var fbs = std.io.fixedBufferStream(decrypted_blob_data);
 
-                    const header = chunk.readHeader(fbs.reader(), read_order) catch |err| switch (err) {
+                    const header = chunk.readHeader(fbs.reader()) catch |err| switch (err) {
                         inline //
                         error.EndOfStream,
                         error.UnrecognizedHeaderVersion,
                         error.InvalidFirstChunkFlag,
                         => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
+                    assert(header.byteCount() == fbs.pos);
+                    const decrypted_chunk_data = decrypted_blob_data[header.byteCount()..];
 
-                    switch (header.ordered_data) {
-                        .first => |data| next_encryption_info = data.next_encryption,
-                        .middle => |data| next_encryption_info = data.next_encryption,
-                        .last => next_encryption_info = undefined,
-                    }
+                    current_chunk_name, next_encryption_info = if (header.next) |next|
+                        .{ next.chunk_blob_digest, next.encryption }
+                    else
+                        .{ null, undefined };
 
                     const file = maybe_file orelse blk: {
                         const file = std.fs.cwd().createFile("decoded", .{}) catch |err| switch (err) {
@@ -317,7 +311,7 @@ pub fn PipeLine(comptime W: type) type {
                         maybe_file = file;
                         break :blk file;
                     };
-                    file.writeAll(decrypted_blob_data[header.byteCount()..]) catch |err| switch (err) {
+                    file.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                 }

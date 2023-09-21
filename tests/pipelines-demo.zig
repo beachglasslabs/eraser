@@ -49,8 +49,7 @@ pub fn main() !void {
     var line_buffer = std.ArrayList(u8).init(allocator);
     defer line_buffer.deinit();
 
-    const ChunkDigests = std.BoundedArray([Sha256.digest_length]u8, 6);
-    var last_chunk_digests: ?ChunkDigests = null;
+    var last_first_chunk_name: ?eraser.StoredFile = null;
     var last_encryption_info: ?eraser.chunk.EncryptionInfo = null;
 
     while (true) {
@@ -59,6 +58,7 @@ pub fn main() !void {
         var tokenizer = std.mem.tokenizeAny(u8, line_buffer.items, &std.ascii.whitespace);
 
         const Command = enum {
+            help,
             q,
             quit,
 
@@ -70,10 +70,15 @@ pub fn main() !void {
             continue;
         };
         assert(cmd_str.len != 0);
-        switch (std.meta.stringToEnum(Command, cmd_str) orelse {
-            std.log.err("Unrecognized command '{s}'", .{cmd_str});
+        const cmd = std.meta.stringToEnum(Command, cmd_str) orelse {
+            std.log.err("Unrecognized command '{}'", .{std.zig.fmtEscapes(cmd_str)});
             continue;
-        }) {
+        };
+        switch (cmd) {
+            .help => {
+                std.log.err("TODO: implement help cmd", .{});
+                continue;
+            },
             .q, .quit => break,
             .encode => {
                 const input_path = tokenizer.next() orelse continue;
@@ -89,24 +94,24 @@ pub fn main() !void {
                 const WaitCtx = struct {
                     progress: *std.Progress.Node,
                     close_re: std.Thread.ResetEvent = .{},
-                    chunks: ?ChunkDigests = null,
+                    stored_file: ?eraser.StoredFile = null,
                     encryption_info: ?eraser.chunk.EncryptionInfo = null,
 
-                    pub inline fn update(self: *@This(), percentage: u8) void {
+                    pub fn update(self: *@This(), percentage: u8) void {
                         self.progress.setCompletedItems(percentage);
                         self.progress.context.maybeRefresh();
                     }
-                    pub inline fn close(
+                    pub fn close(
                         self: *@This(),
                         file: std.fs.File,
-                        chunks: ?[]const [Sha256.digest_length]u8,
+                        stored_file: ?*const eraser.StoredFile,
                         encryption_info: ?*const eraser.chunk.EncryptionInfo,
                     ) void {
                         self.progress.setCompletedItems(100);
                         self.progress.context.maybeRefresh();
 
-                        if (chunks) |list| self.chunks = ChunkDigests.fromSlice(list) catch |err| @panic(@errorName(err));
-                        if (encryption_info) |ptr| self.encryption_info = ptr.*;
+                        self.stored_file = if (stored_file) |sf| sf.* else null;
+                        self.encryption_info = if (encryption_info) |ptr| ptr.* else null;
 
                         file.close();
                         self.close_re.set();
@@ -124,27 +129,17 @@ pub fn main() !void {
                 root_node.end();
                 wait_ctx.close_re.reset();
 
-                const chunks = wait_ctx.chunks orelse {
+                const stored_file = wait_ctx.stored_file orelse {
                     std.log.err("Failed to fully encode file", .{});
                     continue;
                 };
-                last_chunk_digests = chunks;
+                last_first_chunk_name = stored_file;
                 last_encryption_info = wait_ctx.encryption_info orelse @panic("How?");
 
-                std.log.info("Finished encoding '{s}' into chunks:\n{}", .{ input_path, struct {
-                    chunks: []const [Sha256.digest_length]u8,
-
-                    pub fn format(
-                        self: @This(),
-                        comptime _: []const u8,
-                        _: std.fmt.FormatOptions,
-                        writer: anytype,
-                    ) @TypeOf(writer).Error!void {
-                        for (self.chunks) |*name| {
-                            try writer.print("{s}\n", .{&eraser.digestBytesToString(name)});
-                        }
-                    }
-                }{ .chunks = chunks.constSlice() } });
+                std.log.info("Finished encoding '{s}', first chunk name: {s}", .{
+                    input_path,
+                    eraser.digestBytesToString(&stored_file.first_name),
+                });
             },
             .decode => {
                 const encryption_info: eraser.chunk.EncryptionInfo = blk: {
@@ -157,18 +152,45 @@ pub fn main() !void {
                     _ = first_tok;
                     @panic("TODO");
                 };
-                const chunk_digests: ChunkDigests = blk: {
-                    const first_digest = tokenizer.next() orelse {
-                        break :blk last_chunk_digests orelse {
+                const stored_file: eraser.StoredFile = sf: {
+                    const first_chunk_name: [Sha256.digest_length]u8 = name: {
+                        const first_digest = tokenizer.next() orelse break :sf last_first_chunk_name orelse {
                             std.log.err("No files uploaded this session", .{});
                             continue;
                         };
+                        const digest_str_len = Sha256.digest_length * 2;
+                        if (first_digest.len != digest_str_len) {
+                            std.log.err("Expected digest string ({d} bytes), found '{}' ({d} bytes)", .{
+                                digest_str_len,
+                                std.zig.fmtEscapes(first_digest),
+                                first_digest.len,
+                            });
+                            continue;
+                        }
+                        break :name eraser.digestStringToBytes(first_digest[0..digest_str_len]) catch |err| {
+                            std.log.err("({s}) Invalid digest string '{}', must be a sequence of two digit hex codes", .{
+                                @errorName(err),
+                                std.zig.fmtEscapes(first_digest),
+                            });
+                            continue;
+                        };
                     };
-                    _ = first_digest;
-                    @panic("TODO");
+                    const chunk_count_str = tokenizer.next() orelse {
+                        std.log.err("Expected first chunk name followed by chunk count", .{});
+                        continue;
+                    };
+                    const chunk_count = std.fmt.parseInt(eraser.chunk.Count, chunk_count_str, 10) catch |err| {
+                        std.log.err("({s}) Expected chunk count, found '{}'", .{
+                            @errorName(err),
+                            std.zig.fmtEscapes(chunk_count_str),
+                        });
+                        continue;
+                    };
+                    break :sf eraser.StoredFile{
+                        .first_name = first_chunk_name,
+                        .chunk_count = chunk_count,
+                    };
                 };
-
-                std.log.info("Queueing download", .{});
 
                 var progress = std.Progress{};
                 const root_node = progress.start("Upload", 100);
@@ -191,7 +213,7 @@ pub fn main() !void {
                     .progress = root_node,
                 };
 
-                try download_pipeline.downloadFile(chunk_digests.constSlice(), &encryption_info, &wait_ctx);
+                try download_pipeline.downloadFile(&stored_file, &encryption_info, &wait_ctx);
             },
         }
     }

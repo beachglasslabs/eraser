@@ -97,8 +97,6 @@ pub fn main() !void {
 
     if (object_list.count() == 0) return;
 
-    std.log.info("Deleting objects:\n{s}", .{list_objects_stdout.items});
-
     const delete_objs_argv = try std.mem.concat(arena, []const u8, &.{ &.{ "gcloud", "storage", "rm" }, object_list.keys() });
     defer arena.free(delete_objs_argv);
 
