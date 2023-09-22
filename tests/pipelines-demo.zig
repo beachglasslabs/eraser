@@ -30,27 +30,32 @@ pub fn main() !void {
         .shard_size = 3,
     };
 
-    const pipeline_values = eraser.PipelineInitValues{
+    var default_prng = std.rand.DefaultPrng.init(1243);
+    var thread_safe_prng = eraser.threadSafeRng(default_prng.random());
+    const random = thread_safe_prng.random();
+
+    const UpPipeline = eraser.UploadPipeLine(u8, std.fs.File);
+    var upload_pipeline: UpPipeline = undefined;
+    try upload_pipeline.init(.{
+        .allocator = allocator,
+        .random = random,
         .queue_capacity = 8,
         .server_info = server_info,
-    };
-
-    var default_prng1 = std.rand.DefaultPrng.init(1243);
-    var default_prng2 = std.rand.DefaultPrng.init(1243);
-
-    var upload_pipeline: eraser.UploadPipeLine(u8) = undefined;
-    try upload_pipeline.init(allocator, default_prng1.random(), pipeline_values);
+    });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
 
     var download_pipeline: eraser.DownloadPipeLine(u8) = undefined;
-    try download_pipeline.init(allocator, default_prng2.random(), pipeline_values);
+    try download_pipeline.init(allocator, random, .{
+        .queue_capacity = 8,
+        .server_info = server_info,
+    });
     defer download_pipeline.deinit(.finish_remaining_uploads);
 
     var line_buffer = std.ArrayList(u8).init(allocator);
     defer line_buffer.deinit();
 
-    var last_first_chunk_name: ?eraser.StoredFile = null;
-    var last_encryption_info: ?eraser.chunk.EncryptionInfo = null;
+    var prev_first_chunk_name: ?eraser.StoredFile = null;
+    var prev_encryption_info: ?eraser.chunk.EncryptionInfo = null;
 
     while (true) {
         line_buffer.clearRetainingCapacity();
@@ -122,8 +127,10 @@ pub fn main() !void {
                     .progress = root_node,
                 };
 
-                try upload_pipeline.uploadFile(input, &wait_ctx, .{
-                    .file_size = null,
+                try upload_pipeline.uploadFile(.{
+                    .ctx = UpPipeline.makeCtx(&wait_ctx),
+                    .src = input,
+                    .full_size = null,
                 });
                 wait_ctx.close_re.wait();
                 root_node.end();
@@ -133,8 +140,8 @@ pub fn main() !void {
                     std.log.err("Failed to fully encode file", .{});
                     continue;
                 };
-                last_first_chunk_name = stored_file;
-                last_encryption_info = wait_ctx.encryption_info orelse @panic("How?");
+                prev_first_chunk_name = stored_file;
+                prev_encryption_info = wait_ctx.encryption_info orelse @panic("How?");
 
                 std.log.info("Finished encoding '{s}', first chunk name: {s}", .{
                     input_path,
@@ -144,7 +151,7 @@ pub fn main() !void {
             .decode => {
                 const encryption_info: eraser.chunk.EncryptionInfo = blk: {
                     const first_tok = tokenizer.next() orelse {
-                        break :blk last_encryption_info orelse {
+                        break :blk prev_encryption_info orelse {
                             std.log.err("No files uploaded this session", .{});
                             continue;
                         };
@@ -154,7 +161,7 @@ pub fn main() !void {
                 };
                 const stored_file: eraser.StoredFile = sf: {
                     const first_chunk_name: [Sha256.digest_length]u8 = name: {
-                        const first_digest = tokenizer.next() orelse break :sf last_first_chunk_name orelse {
+                        const first_digest = tokenizer.next() orelse break :sf prev_first_chunk_name orelse {
                             std.log.err("No files uploaded this session", .{});
                             continue;
                         };

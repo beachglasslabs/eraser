@@ -1,9 +1,9 @@
 const chunk = @import("chunk.zig");
-const erasure = @import("../erasure.zig");
-const PipelineInitValues = @import("PipelineInitValues.zig");
+const eraser = @import("../pipelines.zig");
+const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
 const SharedQueue = @import("../shared_queue.zig").SharedQueue;
-const StoredFile = @import("upload.zig").StoredFile;
+const StoredFile = eraser.StoredFile;
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -12,7 +12,12 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
-pub const Ctx = struct {
+const PipelineInitValues = struct {
+    queue_capacity: usize,
+    server_info: ServerInfo,
+};
+
+const Ctx = struct {
     ptr: *anyopaque,
     actionFn: *const fn (ptr: *anyopaque, state: Action) void,
     data: Data,

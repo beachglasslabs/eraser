@@ -1,8 +1,9 @@
 const chunk = @import("chunk.zig");
-const erasure = @import("../erasure.zig");
-const PipelineInitValues = @import("PipelineInitValues.zig");
+const eraser = @import("../pipelines.zig");
+const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
 const SharedQueue = @import("../shared_queue.zig").SharedQueue;
+const StoredFile = eraser.StoredFile;
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -11,83 +12,14 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
-pub const Ctx = struct {
-    ptr: *anyopaque,
-    actionFn: *const fn (ptr: *anyopaque, state: Action) void,
-    data: Data,
-
-    pub const Data = struct {
-        file: std.fs.File,
-        file_size: u64,
-    };
-
-    pub fn init(data: Data, ctx_ptr: anytype) Ctx {
-        const Ptr = @TypeOf(ctx_ptr);
-        const gen = struct {
-            fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
-                const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
-                switch (action_data) {
-                    .update => |percentage| ptr.update(percentage),
-                    .close => |args| ptr.close(args.file, args.stored_file, args.first_encryption),
-                }
-            }
-        };
-        return .{
-            .ptr = ctx_ptr,
-            .actionFn = gen.actionFn,
-            .data = data,
-        };
-    }
-
-    /// Informs the context of the percentage of progress.
-    pub inline fn update(self: Ctx, percentage: u8) void {
-        return self.action(.{ .update = percentage });
-    }
-
-    /// After returns, the `UploadCtx` will be destroyed,
-    /// meaning either the file has been fully uploaded,
-    /// or the process to upload the file has failed
-    /// irrecoverably.
-    /// Gives the file handle back to the inner context.
-    /// If the upload was successful, returns the list of
-    /// names the file was turned into.
-    pub inline fn close(
-        self: Ctx,
-        stored_file: ?*const StoredFile,
-        first_encryption: ?*const chunk.EncryptionInfo,
-    ) void {
-        return self.action(.{ .close = .{
-            .file = self.data.file,
-            .stored_file = stored_file,
-            .first_encryption = first_encryption,
-        } });
-    }
-
-    inline fn action(self: Ctx, data: Action) void {
-        return self.actionFn(self.ptr, data);
-    }
-    pub const Action = union(enum) {
-        /// percentage of progress
-        update: u8,
-        /// The upload context is being closed, so the file handle
-        /// is returned. The context may store it elsewhere for
-        /// further use, or simply close it.
-        close: Close,
-
-        const Close = struct {
-            file: std.fs.File,
-            stored_file: ?*const StoredFile,
-            first_encryption: ?*const chunk.EncryptionInfo,
-        };
-    };
-};
-
-pub const StoredFile = struct {
-    first_name: [Sha256.digest_length]u8,
-    chunk_count: chunk.Count,
-};
-
-pub fn PipeLine(comptime W: type) type {
+pub fn PipeLine(
+    comptime W: type,
+    /// `Src.Reader`         = `std.io.Reader(...)`
+    /// `Src.SeekableStream` = `std.io.SeekableStream(...)`
+    /// `Src.reader`         = `fn (Src) Src.Reader`
+    /// `Src.seekableStream` = `fn (Src) Src.SeekableStream`
+    comptime Src: type,
+) type {
     return struct {
         allocator: std.mem.Allocator,
         requests_buf: []std.http.Client.Request,
@@ -96,7 +28,7 @@ pub fn PipeLine(comptime W: type) type {
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
-        queue: SharedQueue(Ctx),
+        queue: SharedQueue(QueueItem),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
         chunk_headers_buf: std.MultiArrayList(ChunkHeaderInfo),
@@ -110,6 +42,11 @@ pub fn PipeLine(comptime W: type) type {
         const header_plus_chunk_max_size = chunk.size + chunk.max_header_size;
 
         const ErasureCoder = erasure.Coder(W);
+        const QueueItem = struct {
+            ctx: Ctx,
+            src: Src,
+            full_size: u64,
+        };
         const ChunkHeaderInfo = struct { header: chunk.Header };
 
         // TODO: should this use a more strict memory order?
@@ -119,16 +56,21 @@ pub fn PipeLine(comptime W: type) type {
         pub fn init(
             /// contents will be entirely oerwritten
             self: *Self,
-            /// should be a thread-safe allocator
-            allocator: std.mem.Allocator,
-            /// should be thread-safe Pseudo-RNG
-            random: std.rand.Random,
-            values: PipelineInitValues,
+            values: struct {
+                /// should be a thread-safe allocator
+                allocator: std.mem.Allocator,
+                /// should be thread-safe Pseudo-RNG
+                random: std.rand.Random,
+                /// initial capacity of the queue
+                queue_capacity: usize,
+                /// server provider configuration
+                server_info: ServerInfo,
+            },
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
             assert(values.queue_capacity != 0);
 
             self.* = .{
-                .allocator = allocator,
+                .allocator = values.allocator,
                 .requests_buf = &.{},
                 .server_info = values.server_info,
                 .gc_prealloc = null,
@@ -141,7 +83,7 @@ pub fn PipeLine(comptime W: type) type {
                 .chunk_headers_buf = .{},
                 .chunk_buffer = undefined,
 
-                .random = random,
+                .random = values.random,
                 .ec = undefined,
                 .thread = undefined,
             };
@@ -154,11 +96,11 @@ pub fn PipeLine(comptime W: type) type {
             }
             errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
-            self.queue = try SharedQueue(Ctx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            self.chunk_buffer = try allocator.create([header_plus_chunk_max_size * 2]u8);
-            errdefer allocator.free(self.chunk_buffer);
+            self.chunk_buffer = try self.allocator.create([header_plus_chunk_max_size * 2]u8);
+            errdefer self.allocator.free(self.chunk_buffer);
 
             self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
             errdefer self.ec.deinit(self.allocator);
@@ -189,56 +131,116 @@ pub fn PipeLine(comptime W: type) type {
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
+        pub inline fn makeCtx(
+            /// Must implement the functions:
+            /// `fn update(ctx_ptr: @This(), percentage: u8) void`
+            /// `fn close(ctx_ptr: @This(), src: Src, stored_file: StoredFile, encryption: chunk.EncryptionInfo) void`
+            ctx_ptr: anytype,
+        ) Ctx {
+            const Ptr = @TypeOf(ctx_ptr);
+            const gen = struct {
+                fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
+                    const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
+                    switch (action_data) {
+                        .update => |percentage| ptr.update(percentage),
+                        .close => |args| ptr.close(args.src, args.stored_file, args.first_encryption),
+                    }
+                }
+            };
+            return .{
+                .ptr = ctx_ptr,
+                .actionFn = gen.actionFn,
+            };
+        }
+
         pub inline fn uploadFile(
             self: *Self,
-            /// Should be a read-enabled file handle; if this call
-            /// succeeds, the caller must leave the closing of the
-            /// file handle to the `ctx_ptr`.
-            file: std.fs.File,
-            /// A struct/union/enum/opaque pointer implementing
-            /// the `UploadCtx` interface.
-            /// The pointer must outlive the function call, until
-            /// its `close` callback is called.
-            ctx_ptr: anytype,
-            extra: struct {
-                /// Pre-calculated size of the file; if `null`,
+            params: struct {
+                /// Result of `self.makeCtx(ctx_ptr)`, where `ctx_ptr` must either outlive
+                /// the pipeline, or only become invalid after `ctx.close()` is called.
+                ctx: Ctx,
+                /// The content source. Must be copy-able by value - if it is a pointer
+                /// or handle of some sort, it must outlive the pipeline, or it must only
+                /// become invalid after being passed to `ctx_ptr.close`.
+                /// Must provide `src.seekableStream()` and `src.reader()`.
+                src: Src,
+                /// Pre-calculated size of the contents; if `null`,
                 /// the size will be determined during this function call.
-                file_size: ?u64 = null,
+                full_size: ?u64 = null,
             },
-        ) (std.mem.Allocator.Error || std.fs.File.StatError)!void {
+        ) (std.mem.Allocator.Error || Src.SeekableStream.GetSeekPosError)!void {
+            const src = params.src;
+            const ctx = params.ctx;
+
             self.queue.mutex.lock();
             defer self.queue.mutex.unlock();
 
-            const file_size: u64 = file_size: {
-                const file_size = extra.file_size orelse {
-                    const stat = try file.stat();
-                    break :file_size stat.size;
+            const full_size: u64 = size: {
+                const reported_full_size = params.full_size orelse {
+                    break :size try src.seekableStream().getEndPos();
                 };
                 if (comptime @import("builtin").mode == .Debug) debug_check: {
-                    const stat = try file.stat();
-                    if (stat.size == file_size) break :debug_check;
+                    const real_full_size = try src.seekableStream().getEndPos();
+                    if (real_full_size == reported_full_size) break :debug_check;
                     const msg = util.boundedFmt(
                         "Given file size '{d}' differs from file size '{d}' obtained from stat",
-                        .{ file_size, stat.size },
-                        .{ std.math.maxInt(@TypeOf(file_size)), std.math.maxInt(@TypeOf(stat.size)) },
+                        .{ reported_full_size, real_full_size },
+                        .{ std.math.maxInt(@TypeOf(reported_full_size)), std.math.maxInt(@TypeOf(real_full_size)) },
                     ) catch unreachable;
                     @panic(msg.constSlice());
                 }
-                break :file_size file_size;
+                break :size reported_full_size;
             };
 
             {
                 self.chunk_headers_buf_mtx.lock();
                 defer self.chunk_headers_buf_mtx.unlock();
-                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, chunk.countForFileSize(file_size));
+                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, chunk.countForFileSize(full_size));
             }
 
-            const data = Ctx.Data{
-                .file = file,
-                .file_size = file_size,
-            };
-            _ = try self.queue.pushValueLocked(self.allocator, Ctx.init(data, ctx_ptr));
+            try src.seekableStream().seekTo(0);
+            _ = try self.queue.pushValueLocked(self.allocator, QueueItem{
+                .ctx = ctx,
+                .src = src,
+                .full_size = full_size,
+            });
         }
+
+        const Ctx = struct {
+            ptr: *anyopaque,
+            actionFn: *const fn (ptr: *anyopaque, state: Action) void,
+
+            pub inline fn update(self: Ctx, percentage: u8) void {
+                return self.action(.{ .update = percentage });
+            }
+
+            pub inline fn close(
+                self: Ctx,
+                src: Src,
+                stored_file: ?*const StoredFile,
+                first_encryption: ?*const chunk.EncryptionInfo,
+            ) void {
+                return self.action(.{ .close = .{
+                    .src = src,
+                    .stored_file = stored_file,
+                    .first_encryption = first_encryption,
+                } });
+            }
+
+            inline fn action(self: Ctx, data: Action) void {
+                return self.actionFn(self.ptr, data);
+            }
+            pub const Action = union(enum) {
+                update: u8,
+                close: Close,
+
+                const Close = struct {
+                    src: Src,
+                    stored_file: ?*const StoredFile,
+                    first_encryption: ?*const chunk.EncryptionInfo,
+                };
+            };
+        };
 
         fn uploadPipeLineThread(upp: *Self) void {
             var client = std.http.Client{ .allocator = upp.allocator };
@@ -265,21 +267,28 @@ pub fn PipeLine(comptime W: type) type {
             var nonce_generator = NonceGenerator{ .random = upp.random };
 
             while (true) {
-                const up_ctx: Ctx = upp.queue.popValue() orelse {
+                const up_data: QueueItem = upp.queue.popValue() orelse {
                     if (upp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                const up_data = up_ctx.data;
-                const chunk_count = chunk.countForFileSize(up_data.file_size);
+
+                const up_ctx = up_data.ctx;
+                const chunk_count = chunk.countForFileSize(up_data.full_size);
+
+                const reader = up_data.src.reader();
+                const seeker = up_data.src.seekableStream();
+
                 var stored_file: ?StoredFile = null;
                 var first_encryption: ?chunk.EncryptionInfo = null;
+
                 defer {
                     up_ctx.update(100);
 
                     upp.chunk_headers_buf_mtx.lock();
                     defer upp.chunk_headers_buf_mtx.unlock();
                     up_ctx.close(
+                        up_data.src,
                         if (stored_file) |*ptr| ptr else null,
                         if (first_encryption) |*ptr| ptr else null,
                     );
@@ -290,16 +299,16 @@ pub fn PipeLine(comptime W: type) type {
                 // and this doesn't touch the capacity, which is only ever touched by the other thread.
                 upp.chunk_headers_buf.shrinkRetainingCapacity(0);
 
-                { // first step of chunk headers initialisation
+                { // full SHA calculation & first step of chunk headers initialisation
                     var full_hasher = Sha256.init(.{});
 
-                    up_data.file.seekTo(0) catch |err| switch (err) {
+                    seeker.seekTo(0) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                     var real_chunk_count: chunk.Count = 0;
                     while (true) {
                         const chunk_buffer: *[chunk.size]u8 = upp.chunk_buffer[chunk.max_header_size..][0..chunk.size];
-                        const bytes_read = up_data.file.readAll(chunk_buffer) catch |err| switch (err) {
+                        const bytes_read = reader.readAll(chunk_buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         const chunk_data = chunk_buffer[0..bytes_read];
@@ -374,7 +383,10 @@ pub fn PipeLine(comptime W: type) type {
                     // the entire unencrypted header bytes and data bytes of the current block
                     const decrypted_chunk_blob: []const u8 = blk: {
                         const buffer_subsection = decrypted_chunk_buffer[header_byte_size..][0..chunk.size];
-                        const bytes_len = up_data.file.preadAll(buffer_subsection, chunk_offset) catch |err| switch (err) {
+                        seeker.seekTo(chunk_offset) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        };
+                        const bytes_len = reader.readAll(buffer_subsection) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         break :blk decrypted_chunk_buffer[0 .. header_byte_size + bytes_len];
@@ -487,7 +499,7 @@ pub fn PipeLine(comptime W: type) type {
                         .up_ctx = up_ctx,
                         .bytes_uploaded = &bytes_uploaded,
                         .upload_size = size: {
-                            const shard_size = @as(u64, up_data.file_size) / upp.ec.shardsRequired();
+                            const shard_size = @as(u64, up_data.full_size) / upp.ec.shardsRequired();
                             break :size shard_size * upp.ec.shardCount();
                         },
                     };

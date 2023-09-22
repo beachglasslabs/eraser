@@ -6,17 +6,18 @@ pub const erasure = @import("erasure.zig");
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
 
 pub const ServerInfo = @import("pipelines/ServerInfo.zig");
-pub const PipelineInitValues = @import("pipelines/PipelineInitValues.zig");
 
 pub const chunk = @import("pipelines/chunk.zig");
 
+pub const StoredFile = struct {
+    first_name: [Sha256.digest_length]u8,
+    chunk_count: chunk.Count,
+};
+
 const upload = @import("pipelines/upload.zig");
-pub const StoredFile = upload.StoredFile;
-pub const UploadCtx = upload.Ctx;
 pub const UploadPipeLine = upload.PipeLine;
 
 const download = @import("pipelines/download.zig");
-pub const DownloadCtx = download.Ctx;
 pub const DownloadPipeLine = download.PipeLine;
 
 pub fn digestBytesToString(bytes: *const [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
@@ -34,10 +35,28 @@ pub fn digestStringToBytes(str: *const [Sha256.digest_length * 2]u8) DigestStrin
     return digest;
 }
 
+pub inline fn threadSafeRng(inner: std.rand.Random) ThreadSafeRandom {
+    return .{ .inner = inner };
+}
+
+pub const ThreadSafeRandom = struct {
+    mtx: std.Thread.Mutex = .{},
+    inner: std.rand.Random,
+
+    pub inline fn random(tsr: *ThreadSafeRandom) std.rand.Random {
+        return std.rand.Random.init(tsr, ThreadSafeRandom.fillImpl);
+    }
+
+    fn fillImpl(tsr: *ThreadSafeRandom, buf: []u8) void {
+        tsr.mtx.lock();
+        defer tsr.mtx.unlock();
+        tsr.inner.bytes(buf);
+    }
+};
+
 comptime {
     _ = @import("pipelines/chunk.zig");
     _ = ServerInfo;
-    _ = PipelineInitValues;
     _ = upload;
     _ = download;
 }
