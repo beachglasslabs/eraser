@@ -20,6 +20,19 @@ pub fn PipeLine(
     /// `Src.seekableStream` = `fn (Src) Src.SeekableStream`
     comptime Src: type,
 ) type {
+    const SrcNs = switch (@typeInfo(Src)) {
+        .Struct, .Union, .Enum => Src,
+        .Pointer => |pointer| if (pointer.size != .One)
+            struct {}
+        else switch (@typeInfo(pointer.child)) {
+            .Struct, .Union, .Enum, .Opaque => switch (pointer.child) {
+                anyopaque => struct {},
+                else => |T| T,
+            },
+            else => struct {},
+        },
+        else => struct {},
+    };
     return struct {
         allocator: std.mem.Allocator,
         requests_buf: []std.http.Client.Request,
@@ -168,7 +181,7 @@ pub fn PipeLine(
                 /// the size will be determined during this function call.
                 full_size: ?u64 = null,
             },
-        ) (std.mem.Allocator.Error || Src.SeekableStream.GetSeekPosError)!void {
+        ) (std.mem.Allocator.Error || SrcNs.SeekableStream.GetSeekPosError)!void {
             const src = params.src;
             const ctx = params.ctx;
 

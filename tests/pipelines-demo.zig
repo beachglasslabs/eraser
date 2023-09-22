@@ -34,7 +34,47 @@ pub fn main() !void {
     var thread_safe_prng = eraser.threadSafeRng(default_prng.random());
     const random = thread_safe_prng.random();
 
-    const UpPipeline = eraser.UploadPipeLine(u8, std.fs.File);
+    const FilePReaderSrc = struct {
+        file: std.fs.File,
+        curr_pos: u64,
+        end_pos: u64,
+
+        pub const Reader = std.io.Reader(*@This(), std.fs.File.PReadError, read);
+        pub inline fn reader(self: *@This()) Reader {
+            return .{ .context = self };
+        }
+        fn read(self: *@This(), buf: []u8) std.fs.File.PReadError!usize {
+            const result = try self.file.pread(buf, self.curr_pos);
+            self.curr_pos += result;
+            return result;
+        }
+
+        pub const SeekableStream = std.io.SeekableStream(
+            *@This(),
+            error{},
+            error{},
+            seekTo,
+            seekBy,
+            getPos,
+            getEndPos,
+        );
+        pub inline fn seekableStream(self: *@This()) SeekableStream {
+            return .{ .context = self };
+        }
+        fn seekBy(self: *@This(), off: i64) error{}!void {
+            if (off < 0)
+                self.curr_pos -= std.math.absCast(off)
+            else
+                self.curr_pos += off;
+        }
+        // zig fmt: off
+        fn seekTo(self: *@This(), pos: u64) error{}!void { self.curr_pos = pos; }
+        fn getPos(self: *@This()) error{}!u64 { return self.curr_pos; }
+        fn getEndPos(self: *@This()) error{}!u64 { return self.end_pos; }
+        // zig fmt: on
+    };
+
+    const UpPipeline = eraser.UploadPipeLine(u8, *FilePReaderSrc);
     var upload_pipeline: UpPipeline = undefined;
     try upload_pipeline.init(.{
         .allocator = allocator,
@@ -89,8 +129,6 @@ pub fn main() !void {
                 const input_path = tokenizer.next() orelse continue;
 
                 std.log.info("Queueing file '{s}' for encoding and upload", .{input_path});
-                const input = try std.fs.cwd().openFile(input_path, .{});
-                errdefer input.close();
 
                 var progress = std.Progress{};
                 const root_node = progress.start("Upload", 100);
@@ -108,7 +146,7 @@ pub fn main() !void {
                     }
                     pub fn close(
                         self: *@This(),
-                        file: std.fs.File,
+                        src: *FilePReaderSrc,
                         stored_file: ?*const eraser.StoredFile,
                         encryption_info: ?*const eraser.chunk.EncryptionInfo,
                     ) void {
@@ -118,7 +156,7 @@ pub fn main() !void {
                         self.stored_file = if (stored_file) |sf| sf.* else null;
                         self.encryption_info = if (encryption_info) |ptr| ptr.* else null;
 
-                        file.close();
+                        src.file.close();
                         self.close_re.set();
                         while (self.close_re.isSet()) {}
                     }
@@ -127,14 +165,26 @@ pub fn main() !void {
                     .progress = root_node,
                 };
 
-                try upload_pipeline.uploadFile(.{
-                    .ctx = UpPipeline.makeCtx(&wait_ctx),
-                    .src = input,
-                    .full_size = null,
-                });
-                wait_ctx.close_re.wait();
-                root_node.end();
-                wait_ctx.close_re.reset();
+                {
+                    const file = try std.fs.cwd().openFile(input_path, .{});
+                    errdefer file.close();
+
+                    var input: FilePReaderSrc = FilePReaderSrc{
+                        .file = file,
+                        .curr_pos = 0,
+                        .end_pos = try file.getEndPos(),
+                    };
+
+                    try upload_pipeline.uploadFile(.{
+                        .ctx = UpPipeline.makeCtx(&wait_ctx),
+                        .src = &input,
+                        .full_size = null,
+                    });
+
+                    wait_ctx.close_re.wait();
+                    root_node.end();
+                    wait_ctx.close_re.reset();
+                }
 
                 const stored_file = wait_ctx.stored_file orelse {
                     std.log.err("Failed to fully encode file", .{});
