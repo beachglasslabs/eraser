@@ -10,6 +10,7 @@ pub const ServerInfo = @import("pipelines/ServerInfo.zig");
 pub const chunk = @import("pipelines/chunk.zig");
 
 pub const StoredFile = struct {
+    encryption: chunk.Encryption,
     first_name: [Sha256.digest_length]u8,
     chunk_count: chunk.Count,
 };

@@ -74,8 +74,7 @@ pub fn main() !void {
         // zig fmt: on
     };
 
-    const UpPipeline = eraser.UploadPipeLine(u8, *FilePReaderSrc);
-    var upload_pipeline: UpPipeline = undefined;
+    var upload_pipeline: eraser.UploadPipeLine(u8, *FilePReaderSrc) = undefined;
     try upload_pipeline.init(.{
         .allocator = allocator,
         .random = random,
@@ -84,7 +83,7 @@ pub fn main() !void {
     });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
 
-    var download_pipeline: eraser.DownloadPipeLine(u8) = undefined;
+    var download_pipeline: eraser.DownloadPipeLine(u8, std.fs.File.Writer) = undefined;
     try download_pipeline.init(allocator, random, .{
         .queue_capacity = 8,
         .server_info = server_info,
@@ -95,7 +94,6 @@ pub fn main() !void {
     defer line_buffer.deinit();
 
     var prev_first_chunk_name: ?eraser.StoredFile = null;
-    var prev_encryption_info: ?eraser.chunk.EncryptionInfo = null;
 
     while (true) {
         line_buffer.clearRetainingCapacity();
@@ -138,7 +136,7 @@ pub fn main() !void {
                     progress: *std.Progress.Node,
                     close_re: std.Thread.ResetEvent = .{},
                     stored_file: ?eraser.StoredFile = null,
-                    encryption_info: ?eraser.chunk.EncryptionInfo = null,
+                    encryption_info: ?eraser.chunk.Encryption = null,
 
                     pub fn update(self: *@This(), percentage: u8) void {
                         self.progress.setCompletedItems(percentage);
@@ -148,13 +146,11 @@ pub fn main() !void {
                         self: *@This(),
                         src: *FilePReaderSrc,
                         stored_file: ?*const eraser.StoredFile,
-                        encryption_info: ?*const eraser.chunk.EncryptionInfo,
                     ) void {
                         self.progress.setCompletedItems(100);
                         self.progress.context.maybeRefresh();
 
                         self.stored_file = if (stored_file) |sf| sf.* else null;
-                        self.encryption_info = if (encryption_info) |ptr| ptr.* else null;
 
                         src.file.close();
                         self.close_re.set();
@@ -175,8 +171,7 @@ pub fn main() !void {
                         .end_pos = try file.getEndPos(),
                     };
 
-                    try upload_pipeline.uploadFile(.{
-                        .ctx = UpPipeline.makeCtx(&wait_ctx),
+                    try upload_pipeline.uploadFile(&wait_ctx, .{
                         .src = &input,
                         .full_size = null,
                     });
@@ -191,7 +186,6 @@ pub fn main() !void {
                     continue;
                 };
                 prev_first_chunk_name = stored_file;
-                prev_encryption_info = wait_ctx.encryption_info orelse @panic("How?");
 
                 std.log.info("Finished encoding '{s}', first chunk name: {s}", .{
                     input_path,
@@ -199,16 +193,6 @@ pub fn main() !void {
                 });
             },
             .decode => {
-                const encryption_info: eraser.chunk.EncryptionInfo = blk: {
-                    const first_tok = tokenizer.next() orelse {
-                        break :blk prev_encryption_info orelse {
-                            std.log.err("No files uploaded this session", .{});
-                            continue;
-                        };
-                    };
-                    _ = first_tok;
-                    @panic("TODO");
-                };
                 const stored_file: eraser.StoredFile = sf: {
                     const first_chunk_name: [Sha256.digest_length]u8 = name: {
                         const first_digest = tokenizer.next() orelse break :sf prev_first_chunk_name orelse {
@@ -244,6 +228,7 @@ pub fn main() !void {
                         continue;
                     };
                     break :sf eraser.StoredFile{
+                        .encryption = @panic("TODO"),
                         .first_name = first_chunk_name,
                         .chunk_count = chunk_count,
                     };
@@ -261,8 +246,10 @@ pub fn main() !void {
                         self.progress.setCompletedItems(percentage);
                         self.progress.context.maybeRefresh();
                     }
-                    pub fn close(self: *@This()) void {
-                        _ = self;
+                    pub fn close(self: *@This(), dst: std.fs.File.Writer) void {
+                        _ = dst;
+                        self.close_re.set();
+                        while (self.close_re.isSet()) {}
                     }
                 };
 
@@ -270,7 +257,17 @@ pub fn main() !void {
                     .progress = root_node,
                 };
 
-                try download_pipeline.downloadFile(&stored_file, &encryption_info, &wait_ctx);
+                const output_file = try std.fs.cwd().createFile("decoded", .{});
+                defer output_file.close();
+
+                try download_pipeline.downloadFile(&wait_ctx, .{
+                    .writer = output_file.writer(),
+                    .stored_file = &stored_file,
+                });
+
+                wait_ctx.close_re.wait();
+                root_node.end();
+                wait_ctx.close_re.reset();
             },
         }
     }

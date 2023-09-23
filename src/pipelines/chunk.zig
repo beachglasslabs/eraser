@@ -41,7 +41,7 @@ pub const Header = struct {
         /// Represents the SHA of the blob comprised of the next chunk's header and data.
         chunk_blob_digest: [Sha256.digest_length]u8,
         /// Represents the encryption information of the next chunk.
-        encryption: EncryptionInfo,
+        encryption: Encryption,
 
         pub inline fn write(next: *const NextInfo, writer: anytype) @TypeOf(writer).Error!void {
             try writer.writeAll(&next.chunk_blob_digest);
@@ -50,7 +50,7 @@ pub const Header = struct {
 
         pub inline fn read(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!NextInfo {
             const chunk_blob_digest = try reader.readBytesNoEof(Sha256.digest_length);
-            const encryption = try EncryptionInfo.read(reader);
+            const encryption = try Encryption.read(reader);
             return .{
                 .chunk_blob_digest = chunk_blob_digest,
                 .encryption = encryption,
@@ -177,17 +177,17 @@ pub const HeaderVersion = extern struct {
     }
 };
 
-pub const EncryptionInfo = struct {
+pub const Encryption = struct {
     tag: [Aes256Gcm.tag_length]u8,
     npub: [Aes256Gcm.nonce_length]u8,
     key: [Aes256Gcm.key_length]u8,
 
-    pub inline fn write(info: *const EncryptionInfo, writer: anytype) @TypeOf(writer).Error!void {
+    pub inline fn write(info: *const Encryption, writer: anytype) @TypeOf(writer).Error!void {
         try writer.writeAll(&info.tag);
         try writer.writeAll(&info.npub);
         try writer.writeAll(&info.key);
     }
-    pub inline fn read(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!EncryptionInfo {
+    pub inline fn read(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!Encryption {
         return .{
             .tag = try reader.readBytesNoEof(Aes256Gcm.tag_length),
             .npub = try reader.readBytesNoEof(Aes256Gcm.nonce_length),
@@ -196,13 +196,13 @@ pub const EncryptionInfo = struct {
     }
 
     pub fn format(
-        self: *const EncryptionInfo,
+        self: *const Encryption,
         comptime fmt_str: []const u8,
         options: std.fmt.FormatOptions,
         writer: anytype,
     ) @TypeOf(writer).Error!void {
         try writer.writeAll(".{ ");
-        inline for (@typeInfo(EncryptionInfo).Struct.fields, 0..) |field, i| {
+        inline for (@typeInfo(Encryption).Struct.fields, 0..) |field, i| {
             if (i != 0) try writer.writeAll(", ");
             const field_ptr = &@field(self, field.name);
             try writer.writeAll(comptime std.fmt.comptimePrint(".{} = ", .{std.zig.fmtId(field.name)}));

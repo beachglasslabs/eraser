@@ -144,34 +144,10 @@ pub fn PipeLine(
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
-        pub inline fn makeCtx(
-            /// Must implement the functions:
-            /// `fn update(ctx_ptr: @This(), percentage: u8) void`
-            /// `fn close(ctx_ptr: @This(), src: Src, stored_file: StoredFile, encryption: chunk.EncryptionInfo) void`
-            ctx_ptr: anytype,
-        ) Ctx {
-            const Ptr = @TypeOf(ctx_ptr);
-            const gen = struct {
-                fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
-                    const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
-                    switch (action_data) {
-                        .update => |percentage| ptr.update(percentage),
-                        .close => |args| ptr.close(args.src, args.stored_file, args.first_encryption),
-                    }
-                }
-            };
-            return .{
-                .ptr = ctx_ptr,
-                .actionFn = gen.actionFn,
-            };
-        }
-
         pub inline fn uploadFile(
             self: *Self,
+            ctx_ptr: anytype,
             params: struct {
-                /// Result of `self.makeCtx(ctx_ptr)`, where `ctx_ptr` must either outlive
-                /// the pipeline, or only become invalid after `ctx.close()` is called.
-                ctx: Ctx,
                 /// The content source. Must be copy-able by value - if it is a pointer
                 /// or handle of some sort, it must outlive the pipeline, or it must only
                 /// become invalid after being passed to `ctx_ptr.close`.
@@ -183,7 +159,7 @@ pub fn PipeLine(
             },
         ) (std.mem.Allocator.Error || SrcNs.SeekableStream.GetSeekPosError)!void {
             const src = params.src;
-            const ctx = params.ctx;
+            const ctx = Ctx.init(ctx_ptr);
 
             self.queue.mutex.lock();
             defer self.queue.mutex.unlock();
@@ -223,6 +199,28 @@ pub fn PipeLine(
             ptr: *anyopaque,
             actionFn: *const fn (ptr: *anyopaque, state: Action) void,
 
+            inline fn init(
+                /// Must implement the functions:
+                /// `fn update(ctx_ptr: @This(), percentage: u8) void`
+                /// `fn close(ctx_ptr: @This(), src: Src, stored_file: StoredFile, encryption: chunk.EncryptionInfo) void`
+                ctx_ptr: anytype,
+            ) Ctx {
+                const Ptr = @TypeOf(ctx_ptr);
+                const gen = struct {
+                    fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
+                        const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
+                        switch (action_data) {
+                            .update => |percentage| ptr.update(percentage),
+                            .close => |args| ptr.close(args.src, args.stored_file),
+                        }
+                    }
+                };
+                return .{
+                    .ptr = ctx_ptr,
+                    .actionFn = gen.actionFn,
+                };
+            }
+
             pub inline fn update(self: Ctx, percentage: u8) void {
                 return self.action(.{ .update = percentage });
             }
@@ -231,12 +229,10 @@ pub fn PipeLine(
                 self: Ctx,
                 src: Src,
                 stored_file: ?*const StoredFile,
-                first_encryption: ?*const chunk.EncryptionInfo,
             ) void {
                 return self.action(.{ .close = .{
                     .src = src,
                     .stored_file = stored_file,
-                    .first_encryption = first_encryption,
                 } });
             }
 
@@ -250,7 +246,6 @@ pub fn PipeLine(
                 const Close = struct {
                     src: Src,
                     stored_file: ?*const StoredFile,
-                    first_encryption: ?*const chunk.EncryptionInfo,
                 };
             };
         };
@@ -293,7 +288,6 @@ pub fn PipeLine(
                 const seeker = up_data.src.seekableStream();
 
                 var stored_file: ?StoredFile = null;
-                var first_encryption: ?chunk.EncryptionInfo = null;
 
                 defer {
                     up_ctx.update(100);
@@ -303,7 +297,6 @@ pub fn PipeLine(
                     up_ctx.close(
                         up_data.src,
                         if (stored_file) |*ptr| ptr else null,
-                        if (first_encryption) |*ptr| ptr else null,
                     );
                 }
 
@@ -441,14 +434,13 @@ pub fn PipeLine(
                                 },
                             };
                         } else {
-                            assert(first_encryption == null);
-                            first_encryption = .{
-                                .tag = auth_tag,
-                                .npub = npub,
-                                .key = test_key,
-                            };
                             assert(stored_file == null);
                             stored_file = .{
+                                .encryption = .{
+                                    .tag = auth_tag,
+                                    .npub = npub,
+                                    .key = test_key,
+                                },
                                 .first_name = chunk_name,
                                 .chunk_count = chunk_count,
                             };

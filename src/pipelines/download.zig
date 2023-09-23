@@ -3,7 +3,7 @@ const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
 const SharedQueue = @import("../shared_queue.zig").SharedQueue;
-const StoredFile = eraser.StoredFile;
+const EncryptedFile = eraser.StoredFile;
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,54 +17,10 @@ const PipelineInitValues = struct {
     server_info: ServerInfo,
 };
 
-const Ctx = struct {
-    ptr: *anyopaque,
-    actionFn: *const fn (ptr: *anyopaque, state: Action) void,
-    data: Data,
-
-    pub const Data = struct {
-        stored_file: StoredFile,
-        encryption_info: chunk.EncryptionInfo,
-    };
-
-    pub inline fn init(data: Data, ctx_ptr: anytype) Ctx {
-        const Ptr = @TypeOf(ctx_ptr);
-        const gen = struct {
-            fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
-                const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
-                switch (action_data) {
-                    .update => |percentage| ptr.update(percentage),
-                    .close => ptr.close(),
-                }
-            }
-        };
-        return .{
-            .ptr = ctx_ptr,
-            .actionFn = gen.actionFn,
-            .data = data,
-        };
-    }
-
-    pub inline fn update(self: Ctx, percentage: u8) void {
-        return self.action(.{ .update = percentage });
-    }
-
-    pub inline fn close(self: Ctx) void {
-        return self.action(.{ .close = {} });
-    }
-
-    inline fn action(self: Ctx, data: Action) void {
-        return self.actionFn(self.ptr, data);
-    }
-
-    pub const Action = union(enum) {
-        /// percentage of progress
-        update: u8,
-        close,
-    };
-};
-
-pub fn PipeLine(comptime W: type) type {
+pub fn PipeLine(
+    comptime W: type,
+    comptime DstWriter: type,
+) type {
     return struct {
         allocator: std.mem.Allocator,
         requests_buf: []std.http.Client.Request,
@@ -73,7 +29,7 @@ pub fn PipeLine(comptime W: type) type {
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
-        queue: SharedQueue(Ctx),
+        queue: SharedQueue(QueueItem),
 
         chunk_buffer: *[header_plus_chunk_max_size * 2]u8,
 
@@ -89,6 +45,12 @@ pub fn PipeLine(comptime W: type) type {
         // TODO: should this use a more strict memory order?
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
         const must_stop_load_mo: std.builtin.AtomicOrder = .Monotonic;
+
+        const QueueItem = struct {
+            ctx: Ctx,
+            stored_file: eraser.StoredFile,
+            writer: DstWriter,
+        };
 
         pub fn init(
             /// contents will be entirely oerwritten
@@ -126,7 +88,7 @@ pub fn PipeLine(comptime W: type) type {
             }
             errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
-            self.queue = try SharedQueue(Ctx).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
             self.chunk_buffer = try allocator.create([header_plus_chunk_max_size * 2]u8);
@@ -162,16 +124,60 @@ pub fn PipeLine(comptime W: type) type {
 
         pub fn downloadFile(
             self: *Self,
-            stored_file: *const StoredFile,
-            encryption_info: *const chunk.EncryptionInfo,
             ctx_ptr: anytype,
+            params: struct {
+                /// The output to which the file contents will be written.
+                writer: DstWriter,
+                /// The handle representing the stored file on the server.
+                stored_file: *const eraser.StoredFile,
+            },
         ) !void {
-            const data = Ctx.Data{
-                .stored_file = stored_file.*,
-                .encryption_info = encryption_info.*,
-            };
-            _ = try self.queue.pushValue(self.allocator, Ctx.init(data, ctx_ptr));
+            _ = try self.queue.pushValue(self.allocator, QueueItem{
+                .ctx = Ctx.init(ctx_ptr),
+                .writer = params.writer,
+                .stored_file = params.stored_file.*,
+            });
         }
+
+        const Ctx = struct {
+            ptr: *anyopaque,
+            actionFn: *const fn (ptr: *anyopaque, state: Action) void,
+
+            inline fn init(ctx_ptr: anytype) Ctx {
+                const Ptr = @TypeOf(ctx_ptr);
+                const gen = struct {
+                    fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
+                        const ptr: Ptr = @ptrCast(@alignCast(erased_ptr));
+                        switch (action_data) {
+                            .update => |percentage| ptr.update(percentage),
+                            .close => |dst| ptr.close(dst),
+                        }
+                    }
+                };
+                return .{
+                    .ptr = @ptrCast(ctx_ptr),
+                    .actionFn = gen.actionFn,
+                };
+            }
+
+            pub inline fn update(self: Ctx, percentage: u8) void {
+                return self.action(.{ .update = percentage });
+            }
+
+            pub inline fn close(self: Ctx, dst: DstWriter) void {
+                return self.action(.{ .close = dst });
+            }
+
+            inline fn action(self: Ctx, data: Action) void {
+                return self.actionFn(self.ptr, data);
+            }
+
+            pub const Action = union(enum) {
+                /// percentage of progress
+                update: u8,
+                close: DstWriter,
+            };
+        };
 
         fn downloadPipeLineThread(dpp: *Self) void {
             var client = std.http.Client{ .allocator = dpp.allocator };
@@ -181,13 +187,14 @@ pub fn PipeLine(comptime W: type) type {
             const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = dpp.chunk_buffer[header_plus_chunk_max_size * 1 ..][0..header_plus_chunk_max_size];
 
             while (true) {
-                const down_ctx: Ctx = dpp.queue.popValue() orelse {
+                const down_data: QueueItem = dpp.queue.popValue() orelse {
                     if (dpp.must_stop.load(must_stop_load_mo)) break;
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                const down_data = down_ctx.data;
-                defer down_ctx.close();
+
+                const down_ctx = down_data.ctx;
+                defer down_ctx.close(down_data.writer);
 
                 const excluded_index_set = erasure.sampleIndexSet(
                     dpp.random,
@@ -195,11 +202,8 @@ pub fn PipeLine(comptime W: type) type {
                     dpp.ec.shardCount() - dpp.ec.shardsRequired(),
                 );
 
-                var maybe_file: ?std.fs.File = null;
-                defer if (maybe_file) |file| file.close();
-
-                var next_encryption_info = down_data.encryption_info;
                 var current_chunk_name: ?[Sha256.digest_length]u8 = down_data.stored_file.first_name;
+                var current_encryption = down_data.stored_file.encryption;
 
                 var chunks_encountered: chunk.Count = 0;
                 while (current_chunk_name) |chunk_name| {
@@ -207,6 +211,7 @@ pub fn PipeLine(comptime W: type) type {
                         @panic("TODO handle: more chunks encountered than specified");
                     }
                     chunks_encountered += 1;
+
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 
@@ -278,9 +283,9 @@ pub fn PipeLine(comptime W: type) type {
                     };
                     const encrypted_blob_data: []const u8 = ecd_fbs.getWritten();
 
-                    const auth_tag = next_encryption_info.tag;
-                    const npub = next_encryption_info.npub;
-                    const key = next_encryption_info.key;
+                    const auth_tag = current_encryption.tag;
+                    const npub = current_encryption.npub;
+                    const key = current_encryption.key;
                     Aes256Gcm.decrypt(
                         decrypted_chunk_buffer[0..encrypted_blob_data.len],
                         encrypted_blob_data,
@@ -304,19 +309,12 @@ pub fn PipeLine(comptime W: type) type {
                     assert(header.byteCount() == fbs.pos);
                     const decrypted_chunk_data = decrypted_blob_data[header.byteCount()..];
 
-                    current_chunk_name, next_encryption_info = if (header.next) |next|
+                    current_chunk_name, current_encryption = if (header.next) |next|
                         .{ next.chunk_blob_digest, next.encryption }
                     else
                         .{ null, undefined };
 
-                    const file = maybe_file orelse blk: {
-                        const file = std.fs.cwd().createFile("decoded", .{}) catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        maybe_file = file;
-                        break :blk file;
-                    };
-                    file.writeAll(decrypted_chunk_data) catch |err| switch (err) {
+                    down_data.writer.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                 }
