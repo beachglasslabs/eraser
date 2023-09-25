@@ -11,7 +11,7 @@ pub fn SharedQueue(comptime T: type) type {
         unused_nodes: UnusedNodeList = .{},
         const Self = @This();
 
-        pub const TailQueue = std.DoublyLinkedList(T);
+        pub const TailQueue = std.TailQueue(T);
         pub const Node = TailQueue.Node;
         pub const NodeList = std.SegmentedList(Node, 0);
         pub const UnusedNodeList = std.ArrayListUnmanaged(*Node);

@@ -157,6 +157,7 @@ pub fn main() !void {
                         while (self.close_re.isSet()) {}
                     }
                 };
+
                 var wait_ctx = WaitCtx{
                     .progress = root_node,
                 };

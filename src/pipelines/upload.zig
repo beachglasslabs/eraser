@@ -144,19 +144,20 @@ pub fn PipeLine(
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
+        const UploadParams = struct {
+            /// The content source. Must be copy-able by value - if it is a pointer
+            /// or handle of some sort, it must outlive the pipeline, or it must only
+            /// become invalid after being passed to `ctx_ptr.close`.
+            /// Must provide `src.seekableStream()` and `src.reader()`.
+            src: Src,
+            /// Pre-calculated size of the contents; if `null`,
+            /// the size will be determined during this function call.
+            full_size: ?u64 = null,
+        };
         pub inline fn uploadFile(
             self: *Self,
             ctx_ptr: anytype,
-            params: struct {
-                /// The content source. Must be copy-able by value - if it is a pointer
-                /// or handle of some sort, it must outlive the pipeline, or it must only
-                /// become invalid after being passed to `ctx_ptr.close`.
-                /// Must provide `src.seekableStream()` and `src.reader()`.
-                src: Src,
-                /// Pre-calculated size of the contents; if `null`,
-                /// the size will be determined during this function call.
-                full_size: ?u64 = null,
-            },
+            params: UploadParams,
         ) (std.mem.Allocator.Error || SrcNs.SeekableStream.GetSeekPosError)!void {
             const src = params.src;
             const ctx = Ctx.init(ctx_ptr);

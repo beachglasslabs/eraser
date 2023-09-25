@@ -122,15 +122,16 @@ pub fn PipeLine(
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
+        const DownloadParams = struct {
+            /// The output to which the file contents will be written.
+            writer: DstWriter,
+            /// The handle representing the stored file on the server.
+            stored_file: *const eraser.StoredFile,
+        };
         pub fn downloadFile(
             self: *Self,
             ctx_ptr: anytype,
-            params: struct {
-                /// The output to which the file contents will be written.
-                writer: DstWriter,
-                /// The handle representing the stored file on the server.
-                stored_file: *const eraser.StoredFile,
-            },
+            params: DownloadParams,
         ) !void {
             _ = try self.queue.pushValue(self.allocator, QueueItem{
                 .ctx = Ctx.init(ctx_ptr),
@@ -143,7 +144,7 @@ pub fn PipeLine(
             ptr: *anyopaque,
             actionFn: *const fn (ptr: *anyopaque, state: Action) void,
 
-            inline fn init(ctx_ptr: anytype) Ctx {
+            fn init(ctx_ptr: anytype) Ctx {
                 const Ptr = @TypeOf(ctx_ptr);
                 const gen = struct {
                     fn actionFn(erased_ptr: *anyopaque, action_data: Ctx.Action) void {
@@ -309,10 +310,13 @@ pub fn PipeLine(
                     assert(header.byteCount() == fbs.pos);
                     const decrypted_chunk_data = decrypted_blob_data[header.byteCount()..];
 
-                    current_chunk_name, current_encryption = if (header.next) |next|
-                        .{ next.chunk_blob_digest, next.encryption }
-                    else
-                        .{ null, undefined };
+                    if (header.next) |next| {
+                        current_chunk_name = next.chunk_blob_digest;
+                        current_encryption = next.encryption;
+                    } else {
+                        current_chunk_name = null;
+                        current_encryption = undefined;
+                    }
 
                     down_data.writer.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
