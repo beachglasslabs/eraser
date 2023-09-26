@@ -9,15 +9,15 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const util = @import("../util.zig");
 
 const ServerInfo = @This();
-shard_size: u7,
+shards_required: u7,
 google_cloud: ?GoogleCloud = null,
 
 pub const GoogleCloud = struct {
     auth_token: SensitiveBytes,
     bucket_names: []const []const u8,
 
-    const authorization_value_fmt = "Bearer {[auth_token]s}";
-    const bucket_object_uri_fmt = "https://storage.googleapis.com/{[bucket]s}/{[object]s}";
+    pub const authorization_value_fmt = "Bearer {[auth_token]s}";
+    pub const bucket_object_uri_fmt = "https://storage.googleapis.com/{[bucket]s}/{[object]s}";
 
     pub fn preAllocated(gc: GoogleCloud, allocator: std.mem.Allocator) std.mem.Allocator.Error!PreAllocated {
         var full_size: usize = 0;

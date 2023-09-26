@@ -5,15 +5,6 @@ const erasure = @import("erasure.zig");
 const Matrix = @import("Matrix.zig");
 const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
-test {
-    _ = galois;
-    _ = erasure;
-    _ = Matrix;
-    _ = BinaryFieldMatrix;
-    _ = @import("SensitiveBytes.zig");
-    _ = @import("pipelines.zig");
-}
-
 const usage =
     \\Usage: eraser [command] [options]
     \\
@@ -130,11 +121,14 @@ fn encodeCommand(
     allocator: std.mem.Allocator,
     comptime W: type,
     shard_count: u7,
-    shard_size: u7,
+    shards_required: u7,
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
-    const ec = try erasure.Coder(W).init(allocator, shard_count, shard_size);
+    const ec = try erasure.Coder(W).init(allocator, .{
+        .shard_count = shard_count,
+        .shards_required = shards_required,
+    });
     defer ec.deinit(allocator);
 
     const data_file = try std.fs.cwd().openFile(data_filename, .{});
@@ -171,11 +165,14 @@ fn decodeCommand(
     allocator: std.mem.Allocator,
     comptime W: type,
     shard_count: u7,
-    shard_size: u7,
+    shards_required: u7,
     data_filename: []const u8,
     code_prefix: []const u8,
 ) !void {
-    const ec = try erasure.Coder(W).init(allocator, shard_count, shard_size);
+    const ec = try erasure.Coder(W).init(allocator, .{
+        .shard_count = shard_count,
+        .shards_required = shards_required,
+    });
     defer ec.deinit(allocator);
 
     // TODO: use better RNG source? maybe from std.crypto?

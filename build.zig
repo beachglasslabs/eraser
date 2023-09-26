@@ -8,7 +8,7 @@ pub fn build(b: *Build) void {
     const difftest_file_paths = b.option([]const []const u8, "dt", "List of paths of inputs to test") orelse &.{};
 
     const shard_count = b.option([]const u8, "shard-count", "Erasure shard count to specify for executables and tests");
-    const shard_size = b.option([]const u8, "shard-size", "Erasure shard size to specify for executables and tests");
+    const shards_required = b.option([]const u8, "shards-required", "Erasure shard size to specify for executables and tests");
     const word_size = b.option([]const u8, "word-size", "Erasure word size to specify for executables and tests");
     const confirm_clear_buckets = b.option(bool, "clear-buckets", "Confirm clearing all buckets of all objects (FOR TESTING PURPOSES ONLY).");
 
@@ -27,7 +27,7 @@ pub fn build(b: *Build) void {
 
     const exe = b.addExecutable(.{
         .name = "eraser",
-        .root_source_file = Build.LazyPath.relative("src/main.zig"),
+        .root_source_file = Build.LazyPath.relative("tests/erasure-demo.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -39,19 +39,19 @@ pub fn build(b: *Build) void {
     if (b.args) |args| run_exe.addArgs(args);
     run_step.dependOn(&run_exe.step);
 
-    const main_tests = b.addTest(.{
-        .root_source_file = Build.LazyPath.relative("src/main.zig"),
+    const unit_tests_exe = b.addTest(.{
+        .root_source_file = Build.LazyPath.relative("src/pipelines.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const run_main_tests = b.addRunArtifact(main_tests);
-    unit_test_step.dependOn(&run_main_tests.step);
+    const unit_tests_run = b.addRunArtifact(unit_tests_exe);
+    unit_test_step.dependOn(&unit_tests_run.step);
 
     for (difftest_file_paths) |file_path| {
         const input = Build.LazyPath.relative(file_path);
         const output = encodeAndDecode(b, exe, input, .{
             .n = shard_count,
-            .k = shard_size,
+            .k = shards_required,
             .w = word_size,
         });
 

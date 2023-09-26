@@ -12,6 +12,28 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
+pub inline fn verifySrcType(comptime Src: type) !type {
+    const Ns = Ns: {
+        switch (@typeInfo(Src)) {
+            .Struct, .Union, .Enum => Src,
+            .Pointer => |pointer| if (pointer.size == .One)
+                switch (@typeInfo(pointer.child)) {
+                    .Struct, .Union, .Enum, .Opaque => switch (pointer.child) {
+                        anyopaque => {},
+                        else => |T| break :Ns T,
+                    },
+                    else => {},
+                },
+            else => {},
+        }
+        return @field(anyerror, std.fmt.comptimePrint(
+            "Expected type or pointer type with a child type with an associated namespace (struct, union, enum, typed opaque pointer), instead got '{s}'",
+            .{@typeName(Src)},
+        ));
+    };
+    if (!@hasDecl(Ns, "Reader")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}'", .{}));
+}
+
 pub fn PipeLine(
     comptime W: type,
     /// `Src.Reader`         = `std.io.Reader(...)`
@@ -115,7 +137,10 @@ pub fn PipeLine(
             self.chunk_buffer = try self.allocator.create([header_plus_chunk_max_size * 2]u8);
             errdefer self.allocator.free(self.chunk_buffer);
 
-            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
+            self.ec = try ErasureCoder.init(self.allocator, .{
+                .shard_count = @intCast(values.server_info.bucketCount()),
+                .shards_required = values.server_info.shards_required,
+            });
             errdefer self.ec.deinit(self.allocator);
 
             self.thread = try std.Thread.spawn(.{ .allocator = self.allocator, .stack_size = 16 * 1024 * 1024 }, uploadPipeLineThread, .{self});
@@ -505,8 +530,8 @@ pub fn PipeLine(
                         .up_ctx = up_ctx,
                         .bytes_uploaded = &bytes_uploaded,
                         .upload_size = size: {
-                            const shard_size = @as(u64, up_data.full_size) / upp.ec.shardsRequired();
-                            break :size shard_size * upp.ec.shardCount();
+                            const shards_required = @as(u64, up_data.full_size) / upp.ec.shardsRequired();
+                            break :size shards_required * upp.ec.shardCount();
                         },
                     };
 

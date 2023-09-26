@@ -12,11 +12,6 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
-const PipelineInitValues = struct {
-    queue_capacity: usize,
-    server_info: ServerInfo,
-};
-
 pub fn PipeLine(
     comptime W: type,
     comptime DstWriter: type,
@@ -52,21 +47,28 @@ pub fn PipeLine(
             writer: DstWriter,
         };
 
-        pub fn init(
-            /// contents will be entirely oerwritten
-            self: *Self,
+        pub const InitParams = struct {
             /// should be a thread-safe allocator
             allocator: std.mem.Allocator,
             /// should be thread-safe Pseudo-RNG
             random: std.rand.Random,
-            values: PipelineInitValues,
+            /// initial capacity of the queue
+            queue_capacity: usize,
+            /// server provider configuration
+            server_info: ServerInfo,
+        };
+
+        pub fn init(
+            /// contents will be entirely oerwritten
+            self: *Self,
+            params: InitParams,
         ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
-            assert(values.queue_capacity != 0);
+            assert(params.queue_capacity != 0);
 
             self.* = .{
-                .allocator = allocator,
+                .allocator = params.allocator,
                 .requests_buf = &.{},
-                .server_info = values.server_info,
+                .server_info = params.server_info,
                 .gc_prealloc = null,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
@@ -75,26 +77,29 @@ pub fn PipeLine(
 
                 .chunk_buffer = undefined,
 
-                .random = random,
+                .random = params.random,
                 .ec = undefined,
                 .thread = undefined,
             };
 
-            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
+            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
             errdefer self.allocator.free(self.requests_buf);
 
-            if (values.server_info.google_cloud) |gc| {
+            if (params.server_info.google_cloud) |gc| {
                 self.gc_prealloc = try gc.preAllocated(self.allocator);
             }
             errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
-            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, params.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            self.chunk_buffer = try allocator.create([header_plus_chunk_max_size * 2]u8);
-            errdefer allocator.free(self.chunk_buffer);
+            self.chunk_buffer = try params.allocator.create([header_plus_chunk_max_size * 2]u8);
+            errdefer params.allocator.free(self.chunk_buffer);
 
-            self.ec = try ErasureCoder.init(self.allocator, @intCast(values.server_info.bucketCount()), values.server_info.shard_size);
+            self.ec = try ErasureCoder.init(self.allocator, .{
+                .shard_count = @intCast(params.server_info.bucketCount()),
+                .shards_required = params.server_info.shards_required,
+            });
             errdefer self.ec.deinit(self.allocator);
 
             self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, downloadPipeLineThread, .{self});

@@ -27,7 +27,7 @@ pub fn main() !void {
                 "ec6.blocktube.net",
             },
         },
-        .shard_size = 3,
+        .shards_required = 3,
     };
 
     var default_prng = std.rand.DefaultPrng.init(1243);
@@ -84,7 +84,9 @@ pub fn main() !void {
     defer upload_pipeline.deinit(.finish_remaining_uploads);
 
     var download_pipeline: eraser.DownloadPipeLine(u8, std.fs.File.Writer) = undefined;
-    try download_pipeline.init(allocator, random, .{
+    try download_pipeline.init(.{
+        .allocator = allocator,
+        .random = random,
         .queue_capacity = 8,
         .server_info = server_info,
     });

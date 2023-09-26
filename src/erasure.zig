@@ -6,6 +6,14 @@ const util = @import("util.zig");
 const galois = @import("galois.zig");
 const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
+comptime {
+    if (@import("builtin").is_test) {
+        _ = util;
+        _ = galois;
+        _ = BinaryFieldMatrix;
+    }
+}
+
 pub fn roundByteSize(comptime T: type) comptime_int {
     return @bitSizeOf(T) / @bitSizeOf(u8);
 }
@@ -42,11 +50,18 @@ pub fn Coder(comptime T: type) type {
         };
 
         pub const InitError = std.mem.Allocator.Error || CalcGaloisFieldExponentError || galois.BinaryField.InitError || galois.BinaryField.OpError;
-        pub fn init(allocator: std.mem.Allocator, shard_count: u7, shard_size: u7) InitError!Self {
-            assert(shard_count >= shard_size);
-            const exp = try calcGaloisFieldExponent(shard_count, shard_size);
+        pub const InitValues = struct {
+            shard_count: u7,
+            shards_required: u7,
+        };
+        pub fn init(
+            allocator: std.mem.Allocator,
+            params: InitValues,
+        ) InitError!Self {
+            assert(params.shard_count >= params.shards_required);
+            const exp = try calcGaloisFieldExponent(params.shard_count, params.shards_required);
 
-            const bf_mat = try BinaryFieldMatrix.initCauchy(allocator, shard_count, shard_size, exp);
+            const bf_mat = try BinaryFieldMatrix.initCauchy(allocator, params.shard_count, params.shards_required, exp);
             errdefer bf_mat.deinit(allocator);
 
             const encoder_bf_mat_bin = try bf_mat.toBinary(allocator);
@@ -74,7 +89,7 @@ pub fn Coder(comptime T: type) type {
                 decoder_buf_fba_state.end_index ==
                 decoder_buf_fba_state.buffer.len);
 
-            const block_buffer = try allocator.alloc(T, mulWide(u8, exp, shard_size));
+            const block_buffer = try allocator.alloc(T, mulWide(u8, exp, params.shards_required));
             errdefer allocator.free(block_buffer);
 
             return .{
@@ -154,7 +169,7 @@ pub fn Coder(comptime T: type) type {
                 const rs = try readDataBlock(T, data_block, in_fifo_reader);
                 try writeCodeBlock(T, self.encoder_bf_mat_bin, data_block, out_fifo_writers_ctx, .{
                     .shard_count = self.shardCount(),
-                    .shard_size = self.shardsRequired(),
+                    .shards_required = self.shardsRequired(),
                 });
                 switch (rs) {
                     .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardsRequired()),
@@ -228,6 +243,14 @@ pub fn Coder(comptime T: type) type {
 
             return size;
         }
+
+        pub inline fn sampleExcludedIndexSet(self: Self, random: std.rand.Random) IndexSet {
+            return sampleIndexSet(
+                random,
+                self.shardCount(),
+                self.shardCount() - self.shardsRequired(),
+            );
+        }
     };
 }
 
@@ -277,11 +300,11 @@ pub fn writeCodeBlock(
     out_fifos: anytype,
     values: struct {
         shard_count: u7,
-        shard_size: u7,
+        shards_required: u7,
     },
 ) !void {
-    const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(values.shard_count, values.shard_size) catch unreachable;
-    assert(@divExact(data_block.len, values.shard_size) == exp);
+    const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(values.shard_count, values.shards_required) catch unreachable;
+    assert(@divExact(data_block.len, values.shards_required) == exp);
 
     var index: u7 = 0;
     while (index != exp * values.shard_count) : (index += 1) {
@@ -405,11 +428,11 @@ pub fn writeDataBlock(
 }
 
 pub const CalcGaloisFieldExponentError = error{ ShardSizePlusCountOverflow, ZeroShards, ZeroShardSize };
-pub inline fn calcGaloisFieldExponent(shard_count: u7, shard_size: u7) CalcGaloisFieldExponentError!galois.BinaryField.Exp {
+pub inline fn calcGaloisFieldExponent(shard_count: u7, shards_required: u7) CalcGaloisFieldExponentError!galois.BinaryField.Exp {
     if (shard_count == 0) return error.ZeroShards;
-    if (shard_size == 0) return error.ZeroShardSize;
+    if (shards_required == 0) return error.ZeroShardSize;
 
-    const count_plus_size = @as(u8, shard_count) + shard_size;
+    const count_plus_size = @as(u8, shard_count) + shards_required;
     if (count_plus_size >= galois.BinaryField.order(.degree7)) {
         return error.ShardSizePlusCountOverflow;
     }
@@ -450,9 +473,9 @@ inline fn calcCodeBlockSize(
 inline fn calcDataBlockSize(
     /// Size of each chunk, likely calculated using `calcChunkSize`.
     chunk_size: anytype,
-    shard_size: u8,
+    shards_required: u8,
 ) u8 {
-    return chunk_size * shard_size;
+    return chunk_size * shards_required;
 }
 
 pub fn sampleIndexSet(
@@ -488,7 +511,10 @@ test Coder {
 
     for (test_data) |data| {
         inline for ([_]type{ u8, u16, u32, u64 }) |T| {
-            var ec = try Coder(T).init(std.testing.allocator, 5, 3);
+            var ec = try Coder(T).init(std.testing.allocator, .{
+                .shard_count = 5,
+                .shards_required = 3,
+            });
             defer ec.deinit(std.testing.allocator);
 
             const code_datas = try std.testing.allocator.alloc(std.ArrayListUnmanaged(u8), ec.shardCount());

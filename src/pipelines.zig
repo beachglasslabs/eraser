@@ -2,24 +2,33 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+pub const chunk = @import("pipelines/chunk.zig");
 pub const erasure = @import("erasure.zig");
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
-
 pub const ServerInfo = @import("pipelines/ServerInfo.zig");
-
-pub const chunk = @import("pipelines/chunk.zig");
-
-pub const StoredFile = struct {
-    encryption: chunk.Encryption,
-    first_name: [Sha256.digest_length]u8,
-    chunk_count: chunk.Count,
-};
 
 const upload = @import("pipelines/upload.zig");
 pub const UploadPipeLine = upload.PipeLine;
 
 const download = @import("pipelines/download.zig");
 pub const DownloadPipeLine = download.PipeLine;
+
+comptime {
+    if (@import("builtin").is_test) {
+        _ = chunk;
+        _ = erasure;
+        _ = SensitiveBytes;
+        _ = ServerInfo;
+        _ = upload;
+        _ = download;
+    }
+}
+
+pub const StoredFile = struct {
+    encryption: chunk.Encryption,
+    first_name: [Sha256.digest_length]u8,
+    chunk_count: chunk.Count,
+};
 
 pub fn digestBytesToString(bytes: *const [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
     return std.fmt.bytesToHex(bytes.*, .lower);
@@ -54,10 +63,3 @@ pub const ThreadSafeRandom = struct {
         tsr.inner.bytes(buf);
     }
 };
-
-comptime {
-    _ = @import("pipelines/chunk.zig");
-    _ = ServerInfo;
-    _ = upload;
-    _ = download;
-}
