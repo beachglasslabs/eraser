@@ -2,7 +2,7 @@ const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
-const SharedQueue = @import("../shared_queue.zig").SharedQueue;
+const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const EncryptedFile = eraser.StoredFile;
 
 const std = @import("std");
@@ -24,7 +24,7 @@ pub fn PipeLine(
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
-        queue: SharedQueue(QueueItem),
+        queue: ManagedQueue(QueueItem),
 
         chunk_buffer: *[header_plus_chunk_max_size * 2]u8,
 
@@ -90,7 +90,7 @@ pub fn PipeLine(
             }
             errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
-            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, params.queue_capacity);
+            self.queue = try ManagedQueue(QueueItem).initCapacity(self.allocator, params.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
             self.chunk_buffer = try params.allocator.create([header_plus_chunk_max_size * 2]u8);
@@ -115,7 +115,11 @@ pub fn PipeLine(
             self.must_stop.store(true, must_stop_store_mo);
             switch (remaining_queue_fate) {
                 .finish_remaining_uploads => {},
-                .cancel_remaining_uploads => self.queue.clearItems(),
+                .cancel_remaining_uploads => {
+                    self.queue_mtx.lock();
+                    defer self.queue_mtx.unlock();
+                    self.queue.clearItems();
+                },
             }
             self.thread.join();
             self.queue.deinit(self.allocator);
@@ -138,7 +142,9 @@ pub fn PipeLine(
             ctx_ptr: anytype,
             params: DownloadParams,
         ) !void {
-            _ = try self.queue.pushValue(self.allocator, QueueItem{
+            self.queue_mtx.lock();
+            defer self.queue_mtx.unlock();
+            try self.queue.pushValue(self.allocator, QueueItem{
                 .ctx = Ctx.init(ctx_ptr),
                 .writer = params.writer,
                 .stored_file = params.stored_file.*,
@@ -193,12 +199,15 @@ pub fn PipeLine(
             const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = dpp.chunk_buffer[header_plus_chunk_max_size * 1 ..][0..header_plus_chunk_max_size];
 
             while (true) {
-                const down_data: QueueItem = dpp.queue.popValue() orelse {
-                    if (dpp.must_stop.load(must_stop_load_mo)) break;
-                    std.atomic.spinLoopHint();
-                    continue;
+                const down_data: QueueItem = blk: {
+                    dpp.queue_mtx.lock();
+                    defer dpp.queue_mtx.unlock();
+                    break :blk dpp.queue.popValue() orelse {
+                        if (dpp.must_stop.load(must_stop_load_mo)) break;
+                        std.atomic.spinLoopHint();
+                        continue;
+                    };
                 };
-
                 const down_ctx = down_data.ctx;
                 defer down_ctx.close(down_data.writer);
 

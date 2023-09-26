@@ -2,7 +2,7 @@ const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
-const SharedQueue = @import("../shared_queue.zig").SharedQueue;
+const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const StoredFile = eraser.StoredFile;
 
 const std = @import("std");
@@ -63,7 +63,7 @@ pub fn PipeLine(
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
-        queue: SharedQueue(QueueItem),
+        queue: ManagedQueue(QueueItem),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
         chunk_headers_buf: std.MultiArrayList(ChunkHeaderInfo),
@@ -131,7 +131,7 @@ pub fn PipeLine(
             }
             errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
 
-            self.queue = try SharedQueue(QueueItem).initCapacity(&self.queue_mtx, self.allocator, values.queue_capacity);
+            self.queue = try ManagedQueue(QueueItem).initCapacity(self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
             self.chunk_buffer = try self.allocator.create([header_plus_chunk_max_size * 2]u8);
@@ -156,7 +156,11 @@ pub fn PipeLine(
             self.must_stop.store(true, must_stop_store_mo);
             switch (remaining_queue_fate) {
                 .finish_remaining_uploads => {},
-                .cancel_remaining_uploads => self.queue.clearItems(),
+                .cancel_remaining_uploads => {
+                    self.queue_mtx.lock();
+                    defer self.queue_mtx.unlock();
+                    self.queue.clearItems();
+                },
             }
             self.thread.join();
             self.queue.deinit(self.allocator);
@@ -187,9 +191,6 @@ pub fn PipeLine(
             const src = params.src;
             const ctx = Ctx.init(ctx_ptr);
 
-            self.queue.mutex.lock();
-            defer self.queue.mutex.unlock();
-
             const full_size: u64 = size: {
                 const reported_full_size = params.full_size orelse {
                     break :size try src.seekableStream().getEndPos();
@@ -213,12 +214,16 @@ pub fn PipeLine(
                 try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, chunk.countForFileSize(full_size));
             }
 
-            try src.seekableStream().seekTo(0);
-            _ = try self.queue.pushValueLocked(self.allocator, QueueItem{
-                .ctx = ctx,
-                .src = src,
-                .full_size = full_size,
-            });
+            {
+                try src.seekableStream().seekTo(0);
+                self.queue_mtx.lock();
+                defer self.queue_mtx.unlock();
+                try self.queue.pushValue(self.allocator, QueueItem{
+                    .ctx = ctx,
+                    .src = src,
+                    .full_size = full_size,
+                });
+            }
         }
 
         const Ctx = struct {
@@ -301,10 +306,14 @@ pub fn PipeLine(
             var nonce_generator = NonceGenerator{ .random = upp.random };
 
             while (true) {
-                const up_data: QueueItem = upp.queue.popValue() orelse {
-                    if (upp.must_stop.load(must_stop_load_mo)) break;
-                    std.atomic.spinLoopHint();
-                    continue;
+                const up_data: QueueItem = blk: {
+                    upp.queue_mtx.lock();
+                    defer upp.queue_mtx.unlock();
+                    break :blk upp.queue.popValue() orelse {
+                        if (upp.must_stop.load(must_stop_load_mo)) break;
+                        std.atomic.spinLoopHint();
+                        continue;
+                    };
                 };
 
                 const up_ctx = up_data.ctx;
