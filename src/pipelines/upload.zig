@@ -12,26 +12,12 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
-pub inline fn verifySrcType(comptime Src: type) !type {
-    const Ns = Ns: {
-        switch (@typeInfo(Src)) {
-            .Struct, .Union, .Enum => Src,
-            .Pointer => |pointer| if (pointer.size == .One)
-                switch (@typeInfo(pointer.child)) {
-                    .Struct, .Union, .Enum, .Opaque => switch (pointer.child) {
-                        anyopaque => {},
-                        else => |T| break :Ns T,
-                    },
-                    else => {},
-                },
-            else => {},
-        }
-        return @field(anyerror, std.fmt.comptimePrint(
-            "Expected type or pointer type with a child type with an associated namespace (struct, union, enum, typed opaque pointer), instead got '{s}'",
-            .{@typeName(Src)},
-        ));
-    };
-    if (!@hasDecl(Ns, "Reader")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}'", .{}));
+pub inline fn pipeLine(
+    comptime W: type,
+    comptime Src: type,
+    init_values: PipeLine(W, Src).InitValues,
+) PipeLine(W, Src).InitError!PipeLine(W, Src) {
+    return PipeLine(W, Src).init(init_values);
 }
 
 pub fn PipeLine(
@@ -42,19 +28,7 @@ pub fn PipeLine(
     /// `Src.seekableStream` = `fn (Src) Src.SeekableStream`
     comptime Src: type,
 ) type {
-    const SrcNs = switch (@typeInfo(Src)) {
-        .Struct, .Union, .Enum => Src,
-        .Pointer => |pointer| if (pointer.size != .One)
-            struct {}
-        else switch (@typeInfo(pointer.child)) {
-            .Struct, .Union, .Enum, .Opaque => switch (pointer.child) {
-                anyopaque => struct {},
-                else => |T| T,
-            },
-            else => struct {},
-        },
-        else => struct {},
-    };
+    const SrcNs = verifySrcType(Src) catch |err| @compileError(@errorName(err));
     return struct {
         allocator: std.mem.Allocator,
         requests_buf: []std.http.Client.Request,
@@ -71,7 +45,7 @@ pub fn PipeLine(
 
         random: std.rand.Random,
         ec: ErasureCoder,
-        thread: std.Thread,
+        thread: ?std.Thread,
         const Self = @This();
 
         const header_plus_chunk_max_size = chunk.size + chunk.max_header_size;
@@ -88,23 +62,23 @@ pub fn PipeLine(
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
         const must_stop_load_mo: std.builtin.AtomicOrder = .Monotonic;
 
-        pub fn init(
-            /// contents will be entirely oerwritten
-            self: *Self,
-            values: struct {
-                /// should be a thread-safe allocator
-                allocator: std.mem.Allocator,
-                /// should be thread-safe Pseudo-RNG
-                random: std.rand.Random,
-                /// initial capacity of the queue
-                queue_capacity: usize,
-                /// server provider configuration
-                server_info: ServerInfo,
-            },
-        ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
-            assert(values.queue_capacity != 0);
+        pub const InitValues = struct {
+            /// should be a thread-safe allocator
+            allocator: std.mem.Allocator,
+            /// should be thread-safe Pseudo-RNG
+            random: std.rand.Random,
+            /// initial capacity of the queue
+            queue_capacity: usize,
+            /// server provider configuration
+            server_info: ServerInfo,
+        };
 
-            self.* = .{
+        pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError;
+        pub fn init(
+            values: InitValues,
+        ) InitError!Self {
+            assert(values.queue_capacity != 0);
+            var self: Self = .{
                 .allocator = values.allocator,
                 .requests_buf = &.{},
                 .server_info = values.server_info,
@@ -120,7 +94,7 @@ pub fn PipeLine(
 
                 .random = values.random,
                 .ec = undefined,
-                .thread = undefined,
+                .thread = null,
             };
 
             self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
@@ -143,7 +117,11 @@ pub fn PipeLine(
             });
             errdefer self.ec.deinit(self.allocator);
 
-            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator, .stack_size = 16 * 1024 * 1024 }, uploadPipeLineThread, .{self});
+            return self;
+        }
+
+        pub inline fn start(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, uploadPipeLineThread, .{self});
         }
 
         pub fn deinit(
@@ -162,7 +140,7 @@ pub fn PipeLine(
                     self.queue.clearItems();
                 },
             }
-            self.thread.join();
+            if (self.thread) |thread| thread.join();
             self.queue.deinit(self.allocator);
 
             self.chunk_headers_buf.deinit(self.allocator);
@@ -563,4 +541,46 @@ pub fn PipeLine(
             }
         }
     };
+}
+
+/// Verify & return the associated namespace of `Src`.
+inline fn verifySrcType(comptime Src: type) !type {
+    const Ns = Ns: {
+        switch (@typeInfo(Src)) {
+            .Struct, .Union, .Enum => break :Ns Src,
+            .Pointer => |pointer| if (pointer.size == .One)
+                switch (@typeInfo(pointer.child)) {
+                    .Struct, .Union, .Enum, .Opaque => switch (pointer.child) {
+                        else => break :Ns pointer.child,
+                        anyopaque => {},
+                    },
+                    else => {},
+                },
+            else => {},
+        }
+        return @field(anyerror, std.fmt.comptimePrint(
+            "Expected type or pointer type with a child type with an associated namespace (struct, union, enum, typed opaque pointer), instead got '{s}'",
+            .{@typeName(Src)},
+        ));
+    };
+
+    const ptr_prefix = if (Src == Ns) "" else blk: {
+        const info = @typeInfo(Src).Pointer;
+        var prefix: []const u8 = "*";
+        if (info.is_allowzero) prefix = prefix ++ "allowzero ";
+        if (@sizeOf(info.child) != 0 and @alignOf(info.child) != info.alignment) {
+            prefix = prefix ++ std.fmt.comptimePrint("align({d})", .{info.alignment});
+        }
+        if (info.address_space != @typeInfo(*anyopaque).Pointer.address_space) {
+            prefix = prefix ++ std.fmt.comptimePrint("addrspace(.{s})", .{std.zig.fmtId(@tagName(info.address_space))});
+        }
+        if (info.is_const) prefix = prefix ++ "const ";
+        if (info.is_volatile) prefix = prefix ++ "volatile ";
+        break :blk prefix;
+    };
+    if (!@hasDecl(Ns, "Reader")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}' to contain `pub const Reader = std.io.Reader(...);`", .{@typeName(Ns)}));
+    if (!@hasDecl(Ns, "reader")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}' to contain `pub fn reader(self: {s}@This()) Reader {...}`", .{ @typeName(Ns), ptr_prefix }));
+    if (!@hasDecl(Ns, "SeekableStream")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}' to contain `pub const SeekableStream = std.io.SeekableStream(...);`", .{@typeName(Ns)}));
+    if (!@hasDecl(Ns, "seekableStream")) return @field(anyerror, std.fmt.comptimePrint("Expected '{s}' to contain `pub fn seekableStream(self: {s}@This()) SeekableStream {...}`", .{ @typeName(Ns), ptr_prefix }));
+    return Ns;
 }

@@ -8,6 +8,7 @@ pub const SensitiveBytes = @import("SensitiveBytes.zig");
 pub const ServerInfo = @import("pipelines/ServerInfo.zig");
 
 const upload = @import("pipelines/upload.zig");
+pub const uploadPipeline = upload.pipeLine;
 pub const UploadPipeLine = upload.PipeLine;
 
 const download = @import("pipelines/download.zig");

@@ -74,14 +74,14 @@ pub fn main() !void {
         // zig fmt: on
     };
 
-    var upload_pipeline: eraser.UploadPipeLine(u8, *FilePReaderSrc) = undefined;
-    try upload_pipeline.init(.{
+    var upload_pipeline = try eraser.uploadPipeline(u8, *FilePReaderSrc, .{
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
         .server_info = server_info,
     });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
+    try upload_pipeline.start();
 
     var download_pipeline: eraser.DownloadPipeLine(u8, std.fs.File.Writer) = undefined;
     try download_pipeline.init(.{
