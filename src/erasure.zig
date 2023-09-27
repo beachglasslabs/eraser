@@ -1,10 +1,13 @@
+const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
+
+const galois = @import("erasure/galois.zig");
+
 const std = @import("std");
-const mulWide = std.math.mulWide;
 const assert = std.debug.assert;
+const mulWide = std.math.mulWide;
 
 const util = @import("util.zig");
-const galois = @import("galois.zig");
-const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
 
 comptime {
     if (@import("builtin").is_test) {
@@ -14,16 +17,16 @@ comptime {
     }
 }
 
-pub fn roundByteSize(comptime T: type) comptime_int {
-    return @bitSizeOf(T) / @bitSizeOf(u8);
-}
-comptime {
-    assert(roundByteSize(u64) == @sizeOf(u64));
-}
-
+pub const BinaryFieldMatrix = @import("erasure/BinaryFieldMatrix.zig");
 pub const IndexSet = BinaryFieldMatrix.IndexSet;
-pub const ReadState = enum { done, in_progress };
 
+pub fn roundByteSize(comptime T: type) comptime_int {
+    const result = @bitSizeOf(T) / @bitSizeOf(u8);
+    assert(result == @sizeOf(T));
+    return result;
+}
+
+pub const ReadState = enum { done, in_progress };
 pub fn Coder(comptime T: type) type {
     assert(@typeInfo(T) == .Int);
     return struct {
@@ -267,8 +270,9 @@ pub fn readDataBlock(
     const data_block_size = block.len * word_size;
     var block_size: u8 = 0;
 
+    if (word_size == 1) {} else {}
     for (block) |*block_int| {
-        var buffer = [_]u8{0} ** word_size;
+        var buffer: [word_size]u8 = undefined;
         const read_size = try data_reader.readAll(&buffer);
         block_size += @intCast(read_size);
 

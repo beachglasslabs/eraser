@@ -13,43 +13,64 @@ pub fn build(b: *Build) void {
     const confirm_clear_buckets = b.option(bool, "clear-buckets", "Confirm clearing all buckets of all objects (FOR TESTING PURPOSES ONLY).");
 
     // top level steps
-    const run_step = b.step("run", "Run the app");
+    const erasure_demo_step = b.step("erasure-demo", "Run the app");
+    const pipeline_demo_step = b.step("pipeline-demo", "Run the library test executable");
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
-    const run_libtest_step = b.step("pipeline-demo", "Run the library test executable");
     const clear_buckets_step = b.step("clear-buckets", "Clear all buckets of all objects (INVOKES `gcloud`, FOR TESTING PURPOSES ONLY).");
 
     // everything else
 
-    const eraser_mod = b.addModule("eraser", .{
+    const erasure_mod = b.addModule("erasure", .{
+        .source_file = Build.LazyPath.relative("src/erasure.zig"),
+    });
+    const pipelines_mod = b.addModule("eraser", .{
         .source_file = Build.LazyPath.relative("src/pipelines.zig"),
     });
 
-    const exe = b.addExecutable(.{
-        .name = "eraser",
+    const erasure_demo_exe = b.addExecutable(.{
+        .name = "erasure-demo",
         .root_source_file = Build.LazyPath.relative("tests/erasure-demo.zig"),
         .target = target,
         .optimize = optimize,
     });
-    b.installArtifact(exe);
+    b.installArtifact(erasure_demo_exe);
+    erasure_demo_exe.addModule("erasure", erasure_mod);
 
-    const run_exe = b.addRunArtifact(exe);
-    run_exe.has_side_effects = true; // tell zig we want to run this every time
-    run_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_exe.addArgs(args);
-    run_step.dependOn(&run_exe.step);
+    const erasure_demo_run = b.addRunArtifact(erasure_demo_exe);
+    erasure_demo_run.has_side_effects = true; // tell zig we want to run this every time
+    erasure_demo_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| erasure_demo_run.addArgs(args);
+    erasure_demo_step.dependOn(&erasure_demo_run.step);
 
-    const unit_tests_exe = b.addTest(.{
+    const pipeline_demo_exe = b.addExecutable(.{
+        .name = "pipelines-demo",
+        .root_source_file = Build.LazyPath.relative("tests/pipelines-demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(pipeline_demo_exe);
+    pipeline_demo_exe.addModule("eraser", pipelines_mod);
+
+    const pipeline_demo_run = b.addRunArtifact(pipeline_demo_exe);
+    pipeline_demo_step.dependOn(&pipeline_demo_run.step);
+    pipeline_demo_run.stdio = .inherit;
+
+    if (b.option([]const u8, "gc-auth-key", "Google cloud auth key")) |auth_key| {
+        pipeline_demo_run.setEnvironmentVariable("ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY", auth_key);
+    }
+
+    const unit_test_exe = b.addTest(.{
         .root_source_file = Build.LazyPath.relative("src/pipelines.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const unit_tests_run = b.addRunArtifact(unit_tests_exe);
+    const unit_tests_run = b.addRunArtifact(unit_test_exe);
     unit_test_step.dependOn(&unit_tests_run.step);
 
     for (difftest_file_paths) |file_path| {
         const input = Build.LazyPath.relative(file_path);
-        const output = encodeAndDecode(b, exe, input, .{
+        const output = encodeAndDecode(b, erasure_demo_exe, input, .{
             .n = shard_count,
             .k = shards_required,
             .w = word_size,
@@ -68,23 +89,6 @@ pub fn build(b: *Build) void {
 
         const run_difftest_exe = b.addRunArtifact(difftest_exe);
         difftest_step.dependOn(&run_difftest_exe.step);
-    }
-
-    const libtest_exe = b.addExecutable(.{
-        .name = "pipelines-demo",
-        .root_source_file = Build.LazyPath.relative("tests/pipelines-demo.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(libtest_exe);
-    libtest_exe.addModule("eraser", eraser_mod);
-
-    const libtest_run = b.addRunArtifact(libtest_exe);
-    run_libtest_step.dependOn(&libtest_run.step);
-    libtest_run.stdio = .inherit;
-
-    if (b.option([]const u8, "gc-auth-key", "Google cloud auth key")) |auth_key| {
-        libtest_run.setEnvironmentVariable("ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY", auth_key);
     }
 
     clear_buckets_step.dependOn(step: {

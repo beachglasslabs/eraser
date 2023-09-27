@@ -3,7 +3,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mulWide = std.math.mulWide;
 
-const util = @import("util.zig");
+const util = @import("../util.zig");
 
 const Matrix = @This();
 data: [*]u8 = undefined,

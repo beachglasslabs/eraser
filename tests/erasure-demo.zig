@@ -1,9 +1,8 @@
 const std = @import("std");
 
-const galois = @import("galois.zig");
-const erasure = @import("erasure.zig");
-const Matrix = @import("Matrix.zig");
-const BinaryFieldMatrix = @import("BinaryFieldMatrix.zig");
+const erasure = @import("erasure");
+const Matrix = erasure.Matrix;
+const BinaryFieldMatrix = erasure;
 
 const usage =
     \\Usage: eraser [command] [options]
@@ -67,6 +66,8 @@ const Args = struct {
 
 fn parseArgs(argv: []const []const u8) !Args {
     errdefer std.log.info("Usage: {s}", .{usage});
+
+    if (argv.len == 0) return error.MissingVerb;
     var parsed: Args = .{
         .verb = std.meta.stringToEnum(Args.Verb, @as(?[]const u8, argv[0]) orelse
             return error.MissingVerb) orelse

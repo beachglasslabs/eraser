@@ -1,3 +1,5 @@
+const builtin = @import("builtin");
+
 const std = @import("std");
 const assert = std.debug.assert;
 const mulWide = std.math.mulWide;
@@ -171,10 +173,48 @@ pub const BinaryField = enum(u3) {
 
     fn setMatrixCol(mat: *Matrix, col: usize, value: u8) void {
         for (0..mat.numRows()) |row| {
-            const val = (value >> @intCast(row)) & 1;
+            const num = value >> @intCast(row);
+            const val = num & 1; // 1 if odd, 0 if even
             mat.set(.{ .row = @intCast(row), .col = @intCast(col) }, val);
         }
     }
+
+    pub inline fn cauchyMatrixView(self: BinaryField, rows: u8, cols: u8) OpError!CauchyMatrixView {
+        assert(self.order() >= rows + cols);
+        const result: CauchyMatrixView = .{
+            .gf = self,
+            .cols = cols,
+            .rows = if (std.debug.runtime_safety) rows else {},
+        };
+
+        var r: u8 = 0;
+        while (r < rows) : (r += 1) {
+            var c: u8 = 0;
+            while (c < cols) : (c += 1) {
+                _ = try result.getChecked(.{ .row = r, .col = c });
+            }
+        }
+
+        return result;
+    }
+    pub const CauchyMatrixView = struct {
+        gf: BinaryField,
+        cols: u8,
+        rows: if (std.debug.runtime_safety) u8 else void,
+
+        pub inline fn get(cmv: CauchyMatrixView, idx: Matrix.CellIndex) u8 {
+            return cmv.getChecked(idx) catch unreachable;
+        }
+        inline fn getChecked(cmv: CauchyMatrixView, idx: Matrix.CellIndex) OpError!u8 {
+            if (@TypeOf(cmv.rows) != void) {
+                assert(idx.row < cmv.rows);
+            }
+            return cmv.gf.cauchyMatrixCellValue(.{
+                .idx = idx,
+                .cols = cmv.cols,
+            });
+        }
+    };
 };
 
 test "convert to matrix" {
