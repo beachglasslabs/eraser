@@ -261,36 +261,37 @@ pub fn Coder(comptime T: type) type {
 /// being `block.len * roundByteSize(Word)`.
 pub fn readDataBlock(
     comptime Word: type,
-    block: []Word,
+    block_buffer: []Word,
     /// `std.io.Reader(...)`
     data_reader: anytype,
 ) @TypeOf(data_reader).Error!ReadState {
     const word_size = roundByteSize(Word);
-    @memset(block, 0);
-    const data_block_size = block.len * word_size;
-    var block_size: u8 = 0;
+    @memset(block_buffer, 0);
+    const data_block_size = block_buffer.len * word_size;
+    const block_buffer_bytes = std.mem.sliceAsBytes(block_buffer);
+    assert(block_buffer_bytes.len == data_block_size);
 
-    if (word_size == 1) {} else {}
-    for (block) |*block_int| {
-        var buffer: [word_size]u8 = undefined;
-        const read_size = try data_reader.readAll(&buffer);
-        block_size += @intCast(read_size);
+    const block_size: u8 = @intCast(try data_reader.readAll(block_buffer_bytes));
+    const last_incomplete_word_size = block_size % word_size;
+    const full_word_count = @divExact(block_size - last_incomplete_word_size, word_size);
 
-        if (read_size < buffer.len) {
-            buffer[buffer.len - 1] = block_size;
-        }
-        const new_value = std.mem.readIntBig(Word, &buffer);
-        block_int.* = new_value;
-
-        if (read_size == 0) {
-            // we only end up reading the very last word of the block to decode the block size
-            block[block.len - 1] = new_value;
-            break;
-        }
+    switch (native_endian) {
+        .Big => {},
+        .Little => for (block_buffer[0..full_word_count]) |*word| {
+            word.* = @byteSwap(word.*);
+        },
     }
 
-    if (block_size < data_block_size)
+    if (block_size < block_buffer_bytes.len) {
+        if (last_incomplete_word_size != 0) {
+            const last = &block_buffer[full_word_count];
+            const last_bytes = std.mem.asBytes(last);
+            last_bytes[last_bytes.len - 1] = block_size;
+        } else {
+            block_buffer_bytes[block_buffer_bytes.len - 1] = block_size;
+        }
         return .done;
+    }
     return .in_progress;
 }
 
@@ -310,21 +311,26 @@ pub fn writeCodeBlock(
     const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(values.shard_count, values.shards_required) catch unreachable;
     assert(@divExact(data_block.len, values.shards_required) == exp);
 
-    var index: u7 = 0;
-    while (index != exp * values.shard_count) : (index += 1) {
-        var value: Word = 0;
+    for (0..values.shard_count) |out_index_uncasted| {
+        const out_index: u7 = @intCast(out_index_uncasted);
+        const current_writer = out_fifos.getWriter(out_index);
+        var buffered = std.io.BufferedWriter(4096 * 4, @TypeOf(current_writer)){ .unbuffered_writer = current_writer };
+        for (out_index * exp..(out_index + 1) * exp) |row_uncasted| {
+            const row: u8 = @intCast(row_uncasted);
 
-        var j: u8 = 0;
-        while (j < encoder.numCols()) : (j += 1) {
-            if (encoder.get(.{ .row = index, .col = j }) == 1) {
-                value ^= data_block[j];
+            var value: Word = 0;
+            for (0..encoder.numCols()) |col_uncasted| {
+                const col: u8 = @intCast(col_uncasted);
+                if (encoder.get(.{ .row = row, .col = col }) == 1) {
+                    value ^= data_block[col];
+                }
             }
-        }
 
-        const word_size = roundByteSize(Word);
-        const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
-        const out_idx = index / exp;
-        try out_fifos.getWriter(out_idx).writeAll(&word);
+            const word_size = roundByteSize(Word);
+            const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
+            try buffered.writer().writeAll(&word);
+        }
+        try buffered.flush();
     }
 }
 
