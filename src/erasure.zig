@@ -18,6 +18,7 @@ comptime {
 }
 
 pub const BinaryFieldMatrix = @import("erasure/BinaryFieldMatrix.zig");
+pub const Matrix = @import("erasure/Matrix.zig");
 pub const IndexSet = BinaryFieldMatrix.IndexSet;
 
 pub fn roundByteSize(comptime T: type) comptime_int {
@@ -361,7 +362,9 @@ pub fn readCodeBlock(
 
         const use_prev_bytes =
             reader_idx == last_reader_idx and
-            maybe_last_reader_bytes != null;
+            maybe_last_reader_bytes != null //
+        ;
+
         if (use_prev_bytes) {
             buffer = maybe_last_reader_bytes.?;
             maybe_last_reader_bytes = null;
@@ -402,7 +405,8 @@ pub fn writeDataBlock(
 
         var val: T = 0;
         for (params.code_block, 0..params.decoder.numCols()) |code_byte, j| {
-            if (params.decoder.get(.{ .row = i, .col = @intCast(j) }) == 1) {
+            const idx: Matrix.CellIndex = .{ .row = i, .col = @intCast(j) };
+            if (params.decoder.get(idx) == 1) {
                 val ^= code_byte;
             }
         }
@@ -415,10 +419,9 @@ pub fn writeDataBlock(
     var written_size: usize = 0;
     for (0..params.code_block.len) |i| {
         var val: T = 0;
-        for (params.code_block, 0..params.decoder.numCols()) |code_byte, j| {
-            if (params.decoder.get(.{ .row = @intCast(i), .col = @intCast(j) }) == 1) {
-                val ^= code_byte;
-            }
+        for (params.code_block, 0..params.decoder.numCols()) |code_byte, col| {
+            const idx: Matrix.CellIndex = .{ .row = @intCast(i), .col = @intCast(col) };
+            if (params.decoder.get(idx) == 1) val ^= code_byte;
         }
 
         var word = [_]u8{0} ** word_size;
