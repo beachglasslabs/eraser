@@ -71,6 +71,10 @@ pub inline fn set(self: BinaryFieldMatrix, idx: Matrix.CellIndex, value: u8) u8 
     return self.matrix.set(idx, value);
 }
 
+pub inline fn getRow(self: BinaryFieldMatrix, row: u8) []u8 {
+    return self.matrix.getRow(row);
+}
+
 pub inline fn det(self: BinaryFieldMatrix) !u8 {
     var view = self.matrix.subView(.{}, .{});
     return viewDet(self.field, &view);

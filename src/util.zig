@@ -1,6 +1,43 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+pub inline fn sliceBufferedWriter(inner: anytype, buf: []u8) SliceBufferedWriter(@TypeOf(inner)) {
+    return .{ .inner = inner, .buf = buf };
+}
+pub fn SliceBufferedWriter(comptime Inner: type) type {
+    return struct {
+        inner: Inner,
+        buf: []u8,
+        end: usize = 0,
+        const Self = @This();
+
+        const Error = Inner.Error;
+        pub const Writer = std.io.Writer(*Self, Self.Error, Self.write);
+
+        pub inline fn writer(self: *Self) Writer {
+            return .{ .context = self };
+        }
+
+        pub inline fn flush(self: *Self) !void {
+            try self.inner.writeAll(self.buf[0..self.end]);
+            self.end = 0;
+        }
+
+        fn write(self: *Self, bytes: []const u8) Error!usize {
+            if (self.end + bytes.len > self.buf.len) {
+                try self.flush();
+                if (bytes.len > self.buf.len)
+                    return self.inner.write(bytes);
+            }
+
+            const new_end = self.end + bytes.len;
+            @memcpy(self.buf[self.end..new_end], bytes);
+            self.end = new_end;
+            return bytes.len;
+        }
+    };
+}
+
 pub fn slicesOverlap(a: anytype, b: anytype) bool {
     const a_bytes: []const u8 = std.mem.sliceAsBytes(a);
     const b_bytes: []const u8 = std.mem.sliceAsBytes(b);

@@ -1,3 +1,5 @@
+const HeadersUnmanaged = @import("../../HeadersUnmanaged.zig");
+
 const pipelines = @import("../../pipelines.zig");
 const digestBytesToString = pipelines.digestBytesToString;
 
@@ -33,12 +35,12 @@ pub fn preAllocated(gc: GoogleCloud, allocator: std.mem.Allocator) std.mem.Alloc
     const authorization_value = std.fmt.bufPrint(headers_buf, authorization_value_fmt, .{ .auth_token = gc.auth_token.getSensitiveSlice() }) catch unreachable;
     const bucket_uris_buf = headers_buf[authorization_value.len..];
 
-    var headers = std.http.Headers.init(allocator);
-    errdefer headers.deinit();
+    var headers: HeadersUnmanaged = .{};
+    errdefer headers.deinit(allocator);
     headers.owned = false;
 
-    try headers.append("Authorization", authorization_value);
-    try headers.append("Transfer-Encoding", "chunked");
+    try headers.append(allocator, "Authorization", authorization_value);
+    try headers.append(allocator, "Transfer-Encoding", "chunked");
 
     return .{
         .bucket_uris_buf = bucket_uris_buf,
@@ -50,14 +52,14 @@ pub fn preAllocated(gc: GoogleCloud, allocator: std.mem.Allocator) std.mem.Alloc
 pub const PreAllocated = struct {
     bucket_uris_buf: []u8,
     headers_buf: []u8,
-    headers: std.http.Headers,
+    headers: HeadersUnmanaged,
 
     pub fn deinit(pre_allocated: PreAllocated, allocator: std.mem.Allocator) void {
         allocator.free(pre_allocated.headers_buf);
 
-        var headers_copy = pre_allocated.headers;
-        headers_copy.allocator = allocator;
-        headers_copy.deinit();
+        std.debug.assert(!pre_allocated.headers.owned);
+        var copy = pre_allocated.headers;
+        copy.deinit(allocator);
     }
 
     /// The strings obtained from the returned iterator are valid until the next call to this function.

@@ -21,6 +21,53 @@ pub inline fn startOffset(chunk_idx: Count) u64 {
     return (@as(u64, chunk_idx) * size);
 }
 
+pub inline fn headerBytesInTotal(chunk_count: chunk.Count) usize {
+    return switch (chunk_count) {
+        0 => unreachable,
+        1 => comptime Header.byteCount(&Header{
+            .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
+            .full_file_digest = .{0xFF} ** Sha256.digest_length,
+            .next = null,
+        }),
+        2 => comptime size: {
+            var result = 0;
+            result += Header.byteCount(&Header{
+                .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
+                .full_file_digest = null,
+                .next = Header.NextInfo{
+                    .chunk_blob_digest = .{0xFf} ** Sha256.digest_length,
+                    .encryption = Encryption{
+                        .tag = .{0xFF} ** Aes256Gcm.tag_length,
+                        .npub = .{0xFF} ** Aes256Gcm.nonce_length,
+                        .key = .{0xFF} ** Aes256Gcm.key_length,
+                    },
+                },
+            });
+            result += Header.byteCount(&Header{
+                .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
+                .full_file_digest = .{0xFF} ** Sha256.digest_length,
+                .next = null,
+            });
+            break :size result;
+        },
+        else => {
+            const first_and_last = comptime headerBytesInTotal(2);
+            const middle = (chunk_count - 2) * comptime Header.byteCount(&Header{
+                .current_chunk_digest = .{0xFF} ** Sha256.digest_length,
+                .full_file_digest = null,
+                .next = Header.NextInfo{
+                    .chunk_blob_digest = .{0xFf} ** Sha256.digest_length,
+                    .encryption = Encryption{
+                        .tag = .{0xFF} ** Aes256Gcm.tag_length,
+                        .npub = .{0xFF} ** Aes256Gcm.nonce_length,
+                        .key = .{0xFF} ** Aes256Gcm.key_length,
+                    },
+                },
+            });
+            return first_and_last + middle;
+        },
+    };
+}
 pub const Header = struct {
     version: HeaderVersion = HeaderVersion.latest,
     /// Represents the SHA of the current chunk's unencrypted data.

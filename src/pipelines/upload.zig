@@ -377,6 +377,10 @@ pub fn PipeLine(
                 assert(upp.chunk_headers_buf.len == chunk_count);
 
                 var bytes_uploaded: u64 = 0;
+                const upload_size = upp.ec.totalEncodedSize(
+                    chunk.headerBytesInTotal(chunk_count) + up_data.full_size,
+                );
+
                 for (1 + 0..1 + chunk_count) |rev_chunk_idx_uncasted| {
                     const chunk_idx: chunk.Count = @intCast(chunk_count - rev_chunk_idx_uncasted);
                     const chunk_offset = chunk.startOffset(chunk_idx);
@@ -469,7 +473,7 @@ pub fn PipeLine(
                         var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
                         while (iter.next()) |uri_str| {
                             const uri = std.Uri.parse(uri_str) catch unreachable;
-                            const req = client.request(.PUT, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                            const req = client.request(.PUT, uri, gc_prealloc.headers.toManaged(upp.allocator), .{}) catch |err| switch (err) {
                                 error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                 inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                             };
@@ -516,16 +520,14 @@ pub fn PipeLine(
                         .requests = requests.slice(),
                         .up_ctx = up_ctx,
                         .bytes_uploaded = &bytes_uploaded,
-                        .upload_size = size: {
-                            const shards_required = @as(u64, up_data.full_size) / upp.ec.shardsRequired();
-                            break :size shards_required * upp.ec.shardCount();
-                        },
+                        .upload_size = upload_size,
                     };
 
                     var ecd_fbs = std.io.fixedBufferStream(encrypted_chunk_blob);
-                    _ = upp.ec.encodeCtx(ecd_fbs.reader(), writers_ctx) catch |err| switch (err) {
+                    _ = upp.ec.encodeCtx(ecd_fbs.reader(), writers_ctx, &.{}) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
+                    up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
 
                     for (requests.slice()) |*req| req.finish() catch |err| @panic(switch (err) {
                         inline else => |e| "Decide how to handle " ++ @errorName(e),

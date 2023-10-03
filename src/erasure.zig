@@ -143,11 +143,20 @@ pub fn Coder(comptime T: type) type {
             return calcDataBlockSize(self.chunkSize(), self.shardsRequired());
         }
 
+        pub inline fn totalEncodedSize(ec: Self, data_len: anytype) u64 {
+            const trail_len = data_len % ec.dataBlockSize();
+            const padded_len: u64 = data_len - trail_len + ec.dataBlockSize();
+            return padded_len * ec.shardCount() / ec.shardsRequired();
+        }
+
         pub inline fn encode(
             self: Self,
             in_fifo_reader: anytype,
             /// `[]const std.io.Writer(...)`
             out_fifo_writers: anytype,
+            /// Used to buffer writes to `out_fifos`. Supplying an empty
+            /// buffer will cause direct writes to be issued instead.
+            write_buffer: []u8,
         ) !usize {
             const Ctx = struct {
                 slice: @TypeOf(out_fifo_writers),
@@ -156,7 +165,7 @@ pub fn Coder(comptime T: type) type {
                     return ctx.slice[idx];
                 }
             };
-            return self.encodeCtx(in_fifo_reader, Ctx{ .slice = out_fifo_writers });
+            return self.encodeCtx(in_fifo_reader, Ctx{ .slice = out_fifo_writers }, write_buffer);
         }
         pub fn encodeCtx(
             self: Self,
@@ -165,15 +174,21 @@ pub fn Coder(comptime T: type) type {
             /// Value with an associated namespace, in which a method of the form
             /// `fn getWriter(ctx: @This(), idx: u7) std.io.Writer(...)`
             /// should be defined.
-            out_fifo_writers_ctx: anytype,
+            out_fifos: anytype,
+            /// Used to buffer writes to `out_fifos`. Supplying an empty
+            /// buffer will cause direct writes to be issued instead.
+            write_buffer: []u8,
         ) !usize {
             var size: usize = 0;
             while (true) {
                 const data_block = self.block_buffer;
                 const rs = try readDataBlock(T, data_block, in_fifo_reader);
-                try writeCodeBlock(T, self.encoder_bf_mat_bin, data_block, out_fifo_writers_ctx, .{
+                try writeCodeBlock(T, out_fifos, .{
+                    .encoder = self.encoder_bf_mat_bin,
+                    .data_block = data_block,
                     .shard_count = self.shardCount(),
                     .shards_required = self.shardsRequired(),
+                    .write_buffer = write_buffer,
                 });
                 switch (rs) {
                     .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardsRequired()),
@@ -276,55 +291,67 @@ pub fn readDataBlock(
     const last_incomplete_word_size = block_size % word_size;
     const full_word_count = @divExact(block_size - last_incomplete_word_size, word_size);
 
-    switch (native_endian) {
-        .Big => {},
-        .Little => for (block_buffer[0..full_word_count]) |*word| {
-            word.* = @byteSwap(word.*);
-        },
-    }
-
-    if (block_size < block_buffer_bytes.len) {
+    const is_final_block = block_size < block_buffer_bytes.len;
+    if (is_final_block) {
         if (last_incomplete_word_size != 0) {
             const last = &block_buffer[full_word_count];
             const last_bytes = std.mem.asBytes(last);
             last_bytes[last_bytes.len - 1] = block_size;
-        } else {
-            block_buffer_bytes[block_buffer_bytes.len - 1] = block_size;
+            switch (native_endian) {
+                .Big => {},
+                .Little => last.* = @byteSwap(last.*),
+            }
         }
-        return .done;
+        block_buffer_bytes[block_buffer_bytes.len - 1] = block_size;
+        switch (native_endian) {
+            .Big => {},
+            .Little => block_buffer[block_buffer.len - 1] = @byteSwap(block_buffer[block_buffer.len - 1]),
+        }
     }
+
+    switch (native_endian) {
+        .Big => {},
+        .Little => if (comptime word_size > 1) {
+            for (block_buffer[0..full_word_count]) |*word| {
+                word.* = @byteSwap(word.*);
+            }
+        },
+    }
+
+    if (is_final_block)
+        return .done;
     return .in_progress;
 }
 
 pub fn writeCodeBlock(
     comptime Word: type,
-    encoder: BinaryFieldMatrix,
-    data_block: []const Word,
     /// Value with an associated namespace, in which a method of the form
     /// `fn getWriter(ctx: @This(), idx: u7) std.io.Writer(...)`
     /// should be defined.
     out_fifos: anytype,
     values: struct {
+        encoder: BinaryFieldMatrix,
+        data_block: []const Word,
         shard_count: u7,
         shards_required: u7,
+        write_buffer: []u8,
     },
 ) !void {
     const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(values.shard_count, values.shards_required) catch unreachable;
-    assert(@divExact(data_block.len, values.shards_required) == exp);
+    assert(@divExact(values.data_block.len, values.shards_required) == exp);
 
     for (0..values.shard_count) |out_index_uncasted| {
         const out_index: u7 = @intCast(out_index_uncasted);
         const current_writer = out_fifos.getWriter(out_index);
-        var buffered = std.io.BufferedWriter(4096 * 4, @TypeOf(current_writer)){ .unbuffered_writer = current_writer };
+        var buffered = util.sliceBufferedWriter(current_writer, values.write_buffer);
         for (out_index * exp..(out_index + 1) * exp) |row_uncasted| {
             const row: u8 = @intCast(row_uncasted);
 
             var value: Word = 0;
-            for (0..encoder.numCols()) |col_uncasted| {
-                const col: u8 = @intCast(col_uncasted);
-                if (encoder.get(.{ .row = row, .col = col }) == 1) {
-                    value ^= data_block[col];
-                }
+            for (values.encoder.getRow(row), 0..values.encoder.numCols()) |col_val, col_uncasted| {
+                const col_idx: u8 = @intCast(col_uncasted);
+                assert(col_val == 0 or col_val == 1);
+                value ^= values.data_block[col_idx] * col_val;
             }
 
             const word_size = roundByteSize(Word);
@@ -486,7 +513,7 @@ inline fn calcCodeBlockSize(
 inline fn calcDataBlockSize(
     /// Size of each chunk, likely calculated using `calcChunkSize`.
     chunk_size: anytype,
-    shards_required: u8,
+    shards_required: u7,
 ) u8 {
     return chunk_size * shards_required;
 }
@@ -516,16 +543,16 @@ test Coder {
         "The quick brown fox jumps over the lazy dog.",
         "All your base are belong to us.",
         "All work and no play makes Jack a dull boy.",
-        "Whoever fights monsters should see to it that in the process he does not become a monster.\nAnd if you gaze long enough into an abyss, the abyss will gaze back into you.",
+        "Whoever fights monsters should see to it that in the process he does not become a monster.\nAnd if you gaze long enough into an abyss, the abyss will gaze back into you.\n",
     };
 
-    var prng = std.rand.DefaultPrng.init(1234);
+    var prng = std.rand.DefaultPrng.init(0xdeadbeef);
     var random = prng.random();
 
     for (test_data) |data| {
         inline for ([_]type{ u8, u16, u32, u64 }) |T| {
-            var ec = try Coder(T).init(std.testing.allocator, .{
-                .shard_count = 5,
+            const ec = try Coder(T).init(std.testing.allocator, .{
+                .shard_count = 6,
                 .shards_required = 3,
             });
             defer ec.deinit(std.testing.allocator);
@@ -537,7 +564,7 @@ test Coder {
                 std.testing.allocator.free(code_datas);
             }
 
-            const data_size: usize = encode: {
+            const actual_encoded_size: usize = encode: {
                 const WritersCtx = struct {
                     allocator: std.mem.Allocator,
                     code_datas: []std.ArrayListUnmanaged(u8),
@@ -551,9 +578,17 @@ test Coder {
                     .allocator = std.testing.allocator,
                     .code_datas = code_datas,
                 };
-                break :encode try ec.encodeCtx(data_in.reader(), writers);
+                const actual_encoded_size = try ec.encodeCtx(data_in.reader(), writers, &.{});
+
+                var actual_total_encoded_size: u64 = 0;
+                for (writers.code_datas) |code| {
+                    actual_total_encoded_size += code.items.len;
+                }
+                try std.testing.expectEqual(ec.totalEncodedSize(data.len), actual_total_encoded_size);
+
+                break :encode actual_encoded_size;
             };
-            try std.testing.expect(data_size > 0);
+            try std.testing.expectEqual(data.len, actual_encoded_size);
 
             decode: {
                 const excluded_shards = sampleIndexSet(
@@ -589,7 +624,7 @@ test Coder {
                 defer decoded_data.deinit();
 
                 const decoded_size = try ec.decodeCtx(excluded_shards, decoded_data.writer(), readers_ctx);
-                try std.testing.expectEqual(data_size, decoded_size);
+                try std.testing.expectEqual(actual_encoded_size, decoded_size);
                 try std.testing.expectEqual(decoded_size, decoded_data.items.len);
 
                 try std.testing.expectEqualStrings(data, decoded_data.items);

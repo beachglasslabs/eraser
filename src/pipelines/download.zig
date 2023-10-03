@@ -242,7 +242,7 @@ pub fn PipeLine(
                                 if (excluded_index_set.isSet(current_index)) continue;
 
                                 const uri = std.Uri.parse(uri_str) catch unreachable;
-                                const req = client.request(.GET, uri, gc_prealloc.headers, .{}) catch |err| switch (err) {
+                                const req = client.request(.GET, uri, gc_prealloc.headers.toManaged(dpp.allocator), .{}) catch |err| switch (err) {
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
