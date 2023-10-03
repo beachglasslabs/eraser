@@ -33,7 +33,7 @@ pub fn PipeLine(
         thread: std.Thread,
         const Self = @This();
 
-        const header_plus_chunk_max_size = chunk.size + chunk.max_header_size;
+        const header_plus_chunk_max_size = chunk.size + chunk.Header.size;
 
         const ErasureCoder = erasure.Coder(W);
 
@@ -223,7 +223,10 @@ pub fn PipeLine(
                 var chunks_encountered: chunk.Count = 0;
                 while (current_chunk_name) |chunk_name| {
                     if (chunks_encountered == down_data.stored_file.chunk_count) {
-                        @panic("TODO handle: more chunks encountered than specified");
+                        if (!std.mem.allEqual(u8, &chunk_name, 0)) {
+                            @panic("TODO handle: more chunks encountered than specified");
+                        }
+                        break;
                     }
                     chunks_encountered += 1;
 
@@ -312,25 +315,14 @@ pub fn PipeLine(
                         inline error.AuthenticationFailed => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                     const decrypted_blob_data: []const u8 = decrypted_chunk_buffer[0..encrypted_blob_data.len];
-                    var fbs = std.io.fixedBufferStream(decrypted_blob_data);
 
-                    const header = chunk.readHeader(fbs.reader()) catch |err| switch (err) {
-                        inline //
-                        error.EndOfStream,
-                        error.UnrecognizedHeaderVersion,
-                        error.InvalidFirstChunkFlag,
-                        => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    const header = chunk.Header.fromBytes(decrypted_blob_data[0..chunk.Header.size]) catch |err| switch (err) {
+                        inline error.UnrecognizedHeaderVersion => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
-                    assert(header.byteCount() == fbs.pos);
-                    const decrypted_chunk_data = decrypted_blob_data[header.byteCount()..];
+                    const decrypted_chunk_data = decrypted_blob_data[chunk.Header.size..];
 
-                    if (header.next) |next| {
-                        current_chunk_name = next.chunk_blob_digest;
-                        current_encryption = next.encryption;
-                    } else {
-                        current_chunk_name = null;
-                        current_encryption = undefined;
-                    }
+                    current_chunk_name = header.next.chunk_blob_digest;
+                    current_encryption = header.next.encryption;
 
                     down_data.writer.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),

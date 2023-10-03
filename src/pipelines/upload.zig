@@ -48,7 +48,7 @@ pub fn PipeLine(
         thread: ?std.Thread,
         const Self = @This();
 
-        const header_plus_chunk_max_size = chunk.size + chunk.max_header_size;
+        const header_plus_chunk_max_size = chunk.size + chunk.Header.size;
 
         const ErasureCoder = erasure.Coder(W);
         const QueueItem = struct {
@@ -326,7 +326,7 @@ pub fn PipeLine(
                     };
                     var real_chunk_count: chunk.Count = 0;
                     while (true) {
-                        const chunk_buffer: *[chunk.size]u8 = upp.chunk_buffer[chunk.max_header_size..][0..chunk.size];
+                        const chunk_buffer: *[chunk.size]u8 = upp.chunk_buffer[chunk.Header.size..][0..chunk.size];
                         const bytes_read = reader.readAll(chunk_buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
@@ -348,8 +348,15 @@ pub fn PipeLine(
                         upp.chunk_headers_buf.appendAssumeCapacity(ChunkHeaderInfo{
                             .header = chunk.Header{
                                 .current_chunk_digest = chunk_digest,
-                                .full_file_digest = null,
-                                .next = null,
+                                .full_file_digest = .{0} ** Sha256.digest_length,
+                                .next = .{
+                                    .chunk_blob_digest = .{0} ** Sha256.digest_length,
+                                    .encryption = .{
+                                        .tag = .{0} ** Aes256Gcm.tag_length,
+                                        .npub = .{0} ** Aes256Gcm.nonce_length,
+                                        .key = .{0} ** Aes256Gcm.key_length,
+                                    },
+                                },
                             },
                         });
                     }
@@ -371,14 +378,21 @@ pub fn PipeLine(
                     first.* = .{
                         .current_chunk_digest = first.current_chunk_digest,
                         .full_file_digest = full_file_digest,
-                        .next = null,
+                        .next = .{
+                            .chunk_blob_digest = .{0} ** Sha256.digest_length,
+                            .encryption = .{
+                                .tag = .{0} ** Aes256Gcm.tag_length,
+                                .npub = .{0} ** Aes256Gcm.nonce_length,
+                                .key = .{0} ** Aes256Gcm.key_length,
+                            },
+                        },
                     };
                 }
                 assert(upp.chunk_headers_buf.len == chunk_count);
 
                 var bytes_uploaded: u64 = 0;
                 const upload_size = upp.ec.totalEncodedSize(
-                    chunk.headerBytesInTotal(chunk_count) + up_data.full_size,
+                    chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
                 );
 
                 for (1 + 0..1 + chunk_count) |rev_chunk_idx_uncasted| {
@@ -392,27 +406,18 @@ pub fn PipeLine(
                         const headers = upp.chunk_headers_buf.items(.header);
                         break :blk headers[chunk_idx];
                     };
-
-                    const header_byte_size = blk: {
-                        var decrypted_fbs = std.io.fixedBufferStream(decrypted_chunk_buffer);
-                        const header_byte_size = chunk.writeHeader(decrypted_fbs.writer(), &current_header) catch |err| switch (err) {
-                            error.NoSpaceLeft => unreachable,
-                        };
-                        assert(decrypted_fbs.pos == header_byte_size);
-                        assert(decrypted_fbs.pos <= chunk.max_header_size);
-                        break :blk header_byte_size;
-                    };
+                    decrypted_chunk_buffer[0..chunk.Header.size].* = current_header.toBytes();
 
                     // the entire unencrypted header bytes and data bytes of the current block
                     const decrypted_chunk_blob: []const u8 = blk: {
-                        const buffer_subsection = decrypted_chunk_buffer[header_byte_size..][0..chunk.size];
+                        const buffer_subsection: *[chunk.size]u8 = decrypted_chunk_buffer[chunk.Header.size..];
                         seeker.seekTo(chunk_offset) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         const bytes_len = reader.readAll(buffer_subsection) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        break :blk decrypted_chunk_buffer[0 .. header_byte_size + bytes_len];
+                        break :blk decrypted_chunk_buffer[0 .. chunk.Header.size + bytes_len];
                     };
 
                     var auth_tag: [Aes256Gcm.tag_length]u8 = undefined;
