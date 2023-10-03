@@ -54,9 +54,9 @@ pub fn main() !void {
         const fbs_reader = fbs.reader();
 
         timer.reset();
-        _ = try ec.encode(fbs_reader, &output_writers);
+        _ = try ec.encode(fbs_reader, &output_writers, &.{});
         const encoding_time_ns = timer.read();
-        std.log.info("encoding took {}", .{std.fmt.fmtDuration(encoding_time_ns)});
+        std.log.info("encoding took {} ({d})", .{ std.fmt.fmtDuration(encoding_time_ns), encoding_time_ns });
 
         break :blk encoding_time_ns;
     };
@@ -82,7 +82,7 @@ pub fn main() !void {
         timer.reset();
         _ = try ec.decode(excluded_set, decoded_writer, encoded_readers_slice);
         const decoding_time_ns = timer.read();
-        std.log.info("decoding took {}", .{std.fmt.fmtDuration(decoding_time_ns)});
+        std.log.info("decoding took {} ({d})", .{ std.fmt.fmtDuration(decoding_time_ns), decoding_time_ns });
 
         break :blk decoding_time_ns;
     };
@@ -95,8 +95,8 @@ pub fn main() !void {
 
     const fastest: struct { value: u64, name: []const u8 } = switch (enc_dec_order) {
         .eq => unreachable,
-        .lt => .{ .value = decoding_time_ns, .name = "Decoding" },
-        .gt => .{ .value = encoding_time_ns, .name = "Encoding" },
+        .lt => .{ .value = decoding_time_ns, .name = "Encoding" },
+        .gt => .{ .value = encoding_time_ns, .name = "Decoding" },
     };
     const slowest: @TypeOf(fastest) = switch (enc_dec_order) {
         .eq => unreachable,
