@@ -21,12 +21,6 @@ pub const BinaryFieldMatrix = @import("erasure/BinaryFieldMatrix.zig");
 pub const Matrix = @import("erasure/Matrix.zig");
 pub const IndexSet = BinaryFieldMatrix.IndexSet;
 
-pub fn roundByteSize(comptime T: type) comptime_int {
-    const result = @bitSizeOf(T) / @bitSizeOf(u8);
-    assert(result == @sizeOf(T));
-    return result;
-}
-
 pub const ReadState = enum { done, in_progress };
 pub fn Coder(comptime T: type) type {
     assert(@typeInfo(T) == .Int);
@@ -45,7 +39,7 @@ pub fn Coder(comptime T: type) type {
         block_buffer: []T,
         const Self = @This();
 
-        pub const word_size = roundByteSize(T);
+        pub const word_size = @sizeOf(T);
         const Exp = galois.BinaryField.Exp;
 
         pub const ReadOutput = struct {
@@ -130,7 +124,7 @@ pub fn Coder(comptime T: type) type {
             return @intCast(self.bf_mat.matrix.numCols());
         }
 
-        const ChunkSize = std.math.IntFittingRange(0, roundByteSize(T) * std.math.maxInt(Exp));
+        const ChunkSize = std.math.IntFittingRange(0, @sizeOf(T) * std.math.maxInt(Exp));
         pub inline fn chunkSize(self: Self) ChunkSize {
             return calcChunkSize(word_size, self.exponent());
         }
@@ -281,7 +275,7 @@ pub fn readDataBlock(
     /// `std.io.Reader(...)`
     data_reader: anytype,
 ) @TypeOf(data_reader).Error!ReadState {
-    const word_size = roundByteSize(Word);
+    const word_size = @sizeOf(Word);
     @memset(block_buffer, 0);
     const data_block_size = block_buffer.len * word_size;
     const block_buffer_bytes = std.mem.sliceAsBytes(block_buffer);
@@ -354,7 +348,7 @@ pub fn writeCodeBlock(
                 value ^= values.data_block[col_idx] * col_val;
             }
 
-            const word_size = roundByteSize(Word);
+            const word_size = @sizeOf(Word);
             const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
             try buffered.writer().writeAll(&word);
         }
@@ -375,10 +369,10 @@ pub fn readCodeBlock(
     readers_ctx: anytype,
     /// `null` if this is the first call, otherwise
     /// this should be the result from the previous call to this function.
-    last_bytes_from_prev_call: ?[roundByteSize(Word)]u8,
-) !?[roundByteSize(Word)]u8 {
+    last_bytes_from_prev_call: ?[@sizeOf(Word)]u8,
+) !?[@sizeOf(Word)]u8 {
     @memset(block, 0);
-    const word_size = roundByteSize(Word);
+    const word_size = @sizeOf(Word);
 
     var maybe_last_reader_bytes = last_bytes_from_prev_call;
     const last_reader_idx: u7 = @intCast((block.len - 1) / exp);
@@ -424,7 +418,7 @@ pub fn writeDataBlock(
         done: bool,
     },
 ) !usize {
-    const word_size = roundByteSize(T);
+    const word_size = @sizeOf(T);
     const full_data_block_size: u8 = @intCast(params.code_block.len * word_size);
 
     const data_block_size: u8 = if (!params.done) full_data_block_size else blk: {
