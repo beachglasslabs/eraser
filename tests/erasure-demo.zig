@@ -157,9 +157,11 @@ fn encodeCommand(
     var code_writers: std.BoundedArray(std.fs.File.Writer, std.math.maxInt(u8)) = .{};
     for (code_files.constSlice()) |cf| code_writers.appendAssumeCapacity(cf.writer());
 
+    var write_buffer: [4096 * 4]u8 = undefined;
     _ = try ec.encode(
         data_file.reader(),
         code_writers.constSlice(),
+        &write_buffer,
     );
 }
 fn decodeCommand(
