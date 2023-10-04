@@ -37,6 +37,7 @@ pub fn PipeLine(
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
+        queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
         chunk_headers_buf_mtx: std.Thread.Mutex,
@@ -86,6 +87,7 @@ pub fn PipeLine(
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
+                .queue_pop_re = .{},
                 .queue = undefined,
 
                 .chunk_headers_buf_mtx = .{},
@@ -140,6 +142,8 @@ pub fn PipeLine(
                     self.queue.clearItems();
                 },
             }
+
+            self.queue_pop_re.set();
             if (self.thread) |thread| thread.join();
             self.queue.deinit(self.allocator);
 
@@ -196,6 +200,7 @@ pub fn PipeLine(
                 try src.seekableStream().seekTo(0);
                 self.queue_mtx.lock();
                 defer self.queue_mtx.unlock();
+                self.queue_pop_re.set();
                 try self.queue.pushValue(self.allocator, QueueItem{
                     .ctx = ctx,
                     .src = src,
@@ -284,11 +289,15 @@ pub fn PipeLine(
 
             while (true) {
                 const up_data: QueueItem = blk: {
+                    upp.queue_pop_re.wait();
+
                     upp.queue_mtx.lock();
                     defer upp.queue_mtx.unlock();
+
                     break :blk upp.queue.popValue() orelse {
+                        upp.queue_pop_re.reset();
+
                         if (upp.must_stop.load(must_stop_load_mo)) break;
-                        std.atomic.spinLoopHint();
                         continue;
                     };
                 };
