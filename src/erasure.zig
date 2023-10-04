@@ -26,15 +26,10 @@ pub fn Coder(comptime T: type) type {
     assert(@typeInfo(T) == .Int);
     return struct {
         bf_mat: BinaryFieldMatrix,
-
         encoder_bf_mat_bin: BinaryFieldMatrix,
 
-        decoder_buf_full_allocation: []u8,
-
-        decoder_sub_mat_buf: []u8,
-        decoder_mat_inv_buf: []u8,
-        decoder_mat_bin_buf: []u8,
-        decoder_mat_bin_tmp_buf: []u8,
+        decoder_bufs_full_allocation: []u8,
+        decoder_bufs: DecoderBufs,
 
         block_buffer: []T,
         const Self = @This();
@@ -42,16 +37,20 @@ pub fn Coder(comptime T: type) type {
         pub const word_size = @sizeOf(T);
         const Exp = galois.BinaryField.Exp;
 
+        pub const DecoderBufs = struct {
+            sub_mat: []u8,
+            mat_inv: []u8,
+            mat_bin: []u8,
+            mat_bin_tmp: []u8,
+        };
+
         pub const ReadOutput = struct {
             block: []T,
             state: ReadState,
         };
 
         pub const InitError = std.mem.Allocator.Error || CalcGaloisFieldExponentError || galois.BinaryField.InitError || galois.BinaryField.OpError;
-        pub const InitValues = struct {
-            shard_count: u7,
-            shards_required: u7,
-        };
+        pub const InitValues = struct { shard_count: u7, shards_required: u7 };
         pub fn init(
             allocator: std.mem.Allocator,
             params: InitValues,
@@ -65,51 +64,31 @@ pub fn Coder(comptime T: type) type {
             const encoder_bf_mat_bin = try bf_mat.toBinary(allocator);
             errdefer encoder_bf_mat_bin.deinit(allocator);
 
-            const decoder_buf_full_alloc = try allocator.alloc(
-                u8,
-                @as(usize, 0) +
-                    bf_mat.matrix.getCellCount() +
-                    bf_mat.matrix.getCellCount() +
-                    bf_mat.toBinaryCellCount() +
-                    bf_mat.toBinaryTempBufCellCount(),
-            );
+            const decoder_bufs_result = try util.buffer_backed_slices.fromAlloc(DecoderBufs, allocator, .{
+                .sub_mat = bf_mat.matrix.getCellCount(),
+                .mat_inv = bf_mat.matrix.getCellCount(),
+                .mat_bin = bf_mat.toBinaryCellCount(),
+                .mat_bin_tmp = bf_mat.toBinaryTempBufCellCount(),
+            });
+            const decoder_bufs: DecoderBufs = decoder_bufs_result[0];
+            const decoder_buf_full_alloc = decoder_bufs_result[1];
             errdefer allocator.free(decoder_buf_full_alloc);
-
-            var decoder_buf_fba_state = std.heap.FixedBufferAllocator.init(decoder_buf_full_alloc);
-            const decoder_buf_fba = decoder_buf_fba_state.allocator();
-
-            const decoder_sub_mat_buf = decoder_buf_fba.alloc(u8, bf_mat.matrix.getCellCount()) catch unreachable;
-            const decoder_mat_inv_buf = decoder_buf_fba.alloc(u8, bf_mat.matrix.getCellCount()) catch unreachable;
-            const decoder_mat_bin_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryCellCount()) catch unreachable;
-            const decoder_mat_bin_tmp_buf = decoder_buf_fba.alloc(u8, bf_mat.toBinaryTempBufCellCount()) catch unreachable;
-
-            assert( //
-                decoder_buf_fba_state.end_index ==
-                decoder_buf_fba_state.buffer.len);
 
             const block_buffer = try allocator.alloc(T, mulWide(u8, exp, params.shards_required));
             errdefer allocator.free(block_buffer);
 
             return .{
                 .bf_mat = bf_mat,
-
                 .encoder_bf_mat_bin = encoder_bf_mat_bin,
-
-                .decoder_buf_full_allocation = decoder_buf_full_alloc,
-                .decoder_sub_mat_buf = decoder_sub_mat_buf,
-                .decoder_mat_inv_buf = decoder_mat_inv_buf,
-                .decoder_mat_bin_buf = decoder_mat_bin_buf,
-                .decoder_mat_bin_tmp_buf = decoder_mat_bin_tmp_buf,
-
+                .decoder_bufs_full_allocation = decoder_buf_full_alloc,
+                .decoder_bufs = decoder_bufs,
                 .block_buffer = block_buffer,
             };
         }
 
         pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
             allocator.free(self.block_buffer);
-
-            allocator.free(self.decoder_buf_full_allocation);
-
+            allocator.free(self.decoder_bufs_full_allocation);
             self.encoder_bf_mat_bin.deinit(allocator);
             self.bf_mat.deinit(allocator);
         }
@@ -228,14 +207,14 @@ pub fn Coder(comptime T: type) type {
             assert(excluded_shards.count() == self.shardCount() - self.shardsRequired());
 
             const decoder_bin = blk: {
-                const decoder_sub_buf = self.decoder_sub_mat_buf[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet{})];
+                const decoder_sub_buf = self.decoder_bufs.sub_mat[0..self.bf_mat.subMatrixCellCount(excluded_shards, IndexSet{})];
                 const decoder_sub = self.bf_mat.subMatrixWith(decoder_sub_buf, excluded_shards, IndexSet{});
 
-                const decoder_inv_buf = self.decoder_mat_inv_buf[0..decoder_sub.matrix.getCellCount()];
+                const decoder_inv_buf = self.decoder_bufs.mat_inv[0..decoder_sub.matrix.getCellCount()];
                 const decoder_inv = try decoder_sub.invertWith(decoder_inv_buf);
 
-                const decoder_bin_buf = self.decoder_mat_bin_buf[0..decoder_inv.toBinaryCellCount()];
-                const decoder_bin_tmp_buf = self.decoder_mat_bin_tmp_buf[0..decoder_inv.toBinaryTempBufCellCount()];
+                const decoder_bin_buf = self.decoder_bufs.mat_bin[0..decoder_inv.toBinaryCellCount()];
+                const decoder_bin_tmp_buf = self.decoder_bufs.mat_bin_tmp[0..decoder_inv.toBinaryTempBufCellCount()];
 
                 break :blk try decoder_inv.toBinaryWith(decoder_bin_buf, decoder_bin_tmp_buf);
             };

@@ -269,7 +269,7 @@ pub fn PipeLine(
 
             const test_key = [_]u8{0xD} ** Aes256Gcm.key_length;
 
-            const NonceGenerator = struct {
+            var nonce_generator: struct {
                 counter: u64 = 0,
                 random: std.rand.Random,
 
@@ -280,8 +280,7 @@ pub fn PipeLine(
                     this.random.bytes(&random_bytes);
                     return std.mem.toBytes(counter_value) ++ random_bytes;
                 }
-            };
-            var nonce_generator = NonceGenerator{ .random = upp.random };
+            } = .{ .random = upp.random };
 
             while (true) {
                 const up_data: QueueItem = blk: {

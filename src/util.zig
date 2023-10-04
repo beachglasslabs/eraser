@@ -38,6 +38,157 @@ pub fn SliceBufferedWriter(comptime Inner: type) type {
     };
 }
 
+pub const buffer_backed_slices = struct {
+    pub fn SliceLengths(comptime S: type) type {
+        return Impl(S).Lengths;
+    }
+    pub fn bufferAlignment(comptime S: type) comptime_int {
+        return Impl(S).max_align;
+    }
+    pub fn bufferLength(comptime S: type, lengths: Impl(S).Lengths) usize {
+        return Impl(S).calcBufferOffsets(lengths)[1];
+    }
+
+    pub inline fn fromBuffer(
+        comptime S: type,
+        buf: []align(bufferAlignment(S)) u8,
+        lengths: SliceLengths(S),
+    ) S {
+        return fromBufferImpl(S, lengths, buf, false, {});
+    }
+
+    pub inline fn fromAlloc(
+        comptime S: type,
+        allocator: std.mem.Allocator,
+        lengths: SliceLengths(S),
+    ) std.mem.Allocator.Error!struct { S, []align(bufferAlignment(S)) u8 } {
+        const offsets_result = Impl(S).calcBufferOffsets(lengths);
+        const offsets: Impl(S).Offsets = offsets_result[0];
+        const buffer_len = offsets_result[1];
+
+        const alloc = try allocator.alignedAlloc(u8, bufferAlignment(S), buffer_len);
+        errdefer allocator.free(alloc);
+
+        const result = fromBufferImpl(S, alloc, lengths, true, .{ offsets, buffer_len });
+        return .{ result, alloc };
+    }
+
+    fn fromBufferImpl(
+        comptime S: type,
+        /// asserts `buf.len == bufferLength(S, lengths)`
+        buf: []align(bufferAlignment(S)) u8,
+        lengths: SliceLengths(S),
+        comptime precalculated: bool,
+        precalculated_offsets_result: if (precalculated) struct { Impl(S).Offsets, usize } else void,
+    ) S {
+        const offsets_result = if (precalculated)
+            precalculated_offsets_result
+        else
+            Impl(S).calcBufferOffsets(lengths);
+        const offsets = offsets_result[0];
+        const buffer_length = offsets_result[1];
+
+        assert(buf.len == buffer_length);
+
+        var result: S = undefined;
+        inline for (Impl(S).fields) |field| {
+            const pointer = @typeInfo(field.type).Pointer;
+            const offset = @field(offsets, field.name);
+            const byte_len = @field(lengths, field.name) * @sizeOf(pointer.child);
+            @field(result, field.name) = @alignCast(switch (pointer.size) {
+                .Slice => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]),
+                .Many => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]).ptr,
+                .One => std.mem.bytesAsValue(pointer.child, buf[offset..][0..byte_len]),
+                else => comptime unreachable,
+            });
+        }
+
+        return result;
+    }
+
+    fn Impl(comptime S: type) type {
+        return struct {
+            /// Returns the offsets struct and the exact required buffer length.
+            inline fn calcBufferOffsets(lengths: Lengths) struct { Offsets, usize } {
+                var offsets: Offsets = undefined;
+
+                var offset: usize = 0;
+                inline for (ordered_ids) |id| {
+                    const info = fields[@intFromEnum(id)];
+                    const pointer = @typeInfo(info.type).Pointer;
+                    offset = std.mem.alignForward(usize, offset, pointer.alignment);
+                    @field(offsets, info.name) = offset;
+                    offset += @sizeOf(pointer.child) * @field(lengths, info.name);
+                }
+
+                return .{ offsets, offset };
+            }
+
+            const fields = @typeInfo(S).Struct.fields;
+            const FieldId = std.meta.FieldEnum(S);
+
+            const Offsets = std.enums.EnumFieldStruct(FieldId, usize, null);
+            const Lengths = @Type(.{ .Struct = blk: {
+                var new_fields = fields[0..].*;
+                for (&new_fields) |*field| {
+                    const pointer = @typeInfo(field.type).Pointer;
+                    switch (pointer.size) {
+                        .Slice, .Many => field.* = .{
+                            .name = field.name,
+                            .type = usize,
+                            .alignment = 0,
+                            .is_comptime = false,
+                            .default_value = null,
+                        },
+                        .One => field.* = .{
+                            .name = field.name,
+                            .type = comptime_int,
+                            .alignment = 0,
+                            .is_comptime = true,
+                            .default_value = @typeInfo(struct {
+                                comptime comptime_int = 1,
+                            }).Struct.fields[0].default_value,
+                        },
+                        else => @compileError("Other pointer sizes not supported"),
+                    }
+                }
+                break :blk .{
+                    .layout = .Auto,
+                    .is_tuple = false,
+                    .backing_integer = null,
+                    .decls = &.{},
+                    .fields = &new_fields,
+                };
+            } });
+
+            const max_align = blk: {
+                var max = 1;
+                for (fields) |field| {
+                    max = @max(max, @typeInfo(field.type).Pointer.alignment);
+                }
+                break :blk max;
+            };
+            const ordered_ids = &blk: {
+                var ids: [fields.len]FieldId = std.enums.values(FieldId)[0..].*;
+
+                @setEvalBranchQuota(ids.len * ids.len + 10);
+                std.sort.insertionContext(0, ids.len, struct {
+                    pub fn lessThan(a: usize, b: usize) bool {
+                        const align_a = @typeInfo(fields[@intFromEnum(ids[a])].type).Pointer.alignment;
+                        const align_b = @typeInfo(fields[@intFromEnum(ids[b])].type).Pointer.alignment;
+                        return align_a > align_b;
+                    }
+                    pub fn swap(a: usize, b: usize) void {
+                        std.mem.swap(&ids[a], &ids[b]);
+                    }
+                });
+
+                break :blk ids;
+            };
+        };
+    }
+};
+
 pub fn slicesOverlap(a: anytype, b: anytype) bool {
     const a_bytes: []const u8 = std.mem.sliceAsBytes(a);
     const b_bytes: []const u8 = std.mem.sliceAsBytes(b);

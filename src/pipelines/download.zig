@@ -195,8 +195,9 @@ pub fn PipeLine(
             var client = std.http.Client{ .allocator = dpp.allocator };
             defer client.deinit();
 
-            const decrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = dpp.chunk_buffer[header_plus_chunk_max_size * 0 ..][0..header_plus_chunk_max_size];
-            const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = dpp.chunk_buffer[header_plus_chunk_max_size * 1 ..][0..header_plus_chunk_max_size];
+            const hpcms = header_plus_chunk_max_size;
+            const decrypted_chunk_buffer: *[hpcms]u8 = dpp.chunk_buffer[hpcms * 0 ..][0..hpcms];
+            const encrypted_chunk_buffer: *[hpcms]u8 = dpp.chunk_buffer[hpcms * 1 ..][0..hpcms];
 
             while (true) {
                 const down_data: QueueItem = blk: {
