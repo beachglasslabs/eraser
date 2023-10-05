@@ -14,9 +14,13 @@ const util = @import("../util.zig");
 
 pub fn PipeLine(
     comptime W: type,
+    /// `std.io.Writer(...)`
     comptime DstWriter: type,
 ) type {
     return struct {
+        //! All fields in this container are private and not to be modified directly unless
+        //! explicitly stated otherwise in the field's doc comment.
+
         allocator: std.mem.Allocator,
         requests_buf: []std.http.Client.Request,
         server_info: ServerInfo,
@@ -27,7 +31,9 @@ pub fn PipeLine(
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
-        chunk_buffer: *[header_plus_chunk_max_size * 2]u8,
+        /// decrypted_chunk_buffer = &chunk_buffer[0]
+        /// encrypted_chunk_buffer = &chunk_buffer[1]
+        chunk_buffers: *[2][header_plus_chunk_max_size]u8,
 
         random: std.rand.Random,
         ec: ErasureCoder,
@@ -68,7 +74,6 @@ pub fn PipeLine(
 
             self.* = .{
                 .allocator = params.allocator,
-                .requests_buf = &.{},
                 .server_info = params.server_info,
                 .gc_prealloc = null,
 
@@ -77,15 +82,13 @@ pub fn PipeLine(
                 .queue_pop_re = .{},
                 .queue = undefined,
 
-                .chunk_buffer = undefined,
+                .requests_buf = &.{},
+                .chunk_buffers = undefined,
 
                 .random = params.random,
                 .ec = undefined,
                 .thread = undefined,
             };
-
-            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
-            errdefer self.allocator.free(self.requests_buf);
 
             if (params.server_info.google_cloud) |gc| {
                 self.gc_prealloc = try gc.preAllocated(self.allocator);
@@ -95,8 +98,11 @@ pub fn PipeLine(
             self.queue = try ManagedQueue(QueueItem).initCapacity(self.allocator, params.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            self.chunk_buffer = try params.allocator.create([header_plus_chunk_max_size * 2]u8);
-            errdefer params.allocator.free(self.chunk_buffer);
+            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
+            errdefer self.allocator.free(self.requests_buf);
+
+            self.chunk_buffers = try self.allocator.create([2][header_plus_chunk_max_size]u8);
+            errdefer self.allocator.destroy(self.chunk_buffers);
 
             self.ec = try ErasureCoder.init(self.allocator, .{
                 .shard_count = @intCast(params.server_info.bucketCount()),
@@ -128,10 +134,10 @@ pub fn PipeLine(
             self.thread.join();
             self.queue.deinit(self.allocator);
 
-            self.allocator.free(self.chunk_buffer);
+            self.allocator.destroy(self.chunk_buffers);
+            self.allocator.free(self.requests_buf);
 
             self.ec.deinit(self.allocator);
-            self.allocator.free(self.requests_buf);
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
@@ -200,9 +206,8 @@ pub fn PipeLine(
             var client = std.http.Client{ .allocator = dpp.allocator };
             defer client.deinit();
 
-            const hpcms = header_plus_chunk_max_size;
-            const decrypted_chunk_buffer: *[hpcms]u8 = dpp.chunk_buffer[hpcms * 0 ..][0..hpcms];
-            const encrypted_chunk_buffer: *[hpcms]u8 = dpp.chunk_buffer[hpcms * 1 ..][0..hpcms];
+            const decrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &dpp.chunk_buffers[0];
+            const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &dpp.chunk_buffers[1];
 
             while (true) {
                 const down_data: QueueItem = blk: {
@@ -227,13 +232,16 @@ pub fn PipeLine(
                     dpp.ec.shardCount() - dpp.ec.shardsRequired(),
                 );
 
-                var current_chunk_name: ?[Sha256.digest_length]u8 = down_data.stored_file.first_name;
-                var current_encryption = down_data.stored_file.encryption;
+                var current_chunk_info: chunk.Header.NextInfo = .{
+                    .chunk_blob_digest = down_data.stored_file.first_name,
+                    .encryption = down_data.stored_file.encryption,
+                };
+                var full_file_digest = [_]u8{0} ** Sha256.digest_length;
 
                 var chunks_encountered: chunk.Count = 0;
-                while (current_chunk_name) |chunk_name| {
+                while (true) {
                     if (chunks_encountered == down_data.stored_file.chunk_count) {
-                        if (!std.mem.allEqual(u8, &chunk_name, 0)) {
+                        if (!std.mem.allEqual(u8, &current_chunk_info.chunk_blob_digest, 0)) {
                             @panic("TODO handle: more chunks encountered than specified");
                         }
                         break;
@@ -249,7 +257,7 @@ pub fn PipeLine(
                         if (dpp.server_info.google_cloud) |gc| {
                             const gc_prealloc = dpp.gc_prealloc.?;
 
-                            var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
+                            var iter = gc_prealloc.bucketObjectUriIterator(gc, &current_chunk_info.chunk_blob_digest);
 
                             while (iter.next()) |uri_str| : (current_index += 1) {
                                 if (excluded_index_set.isSet(current_index)) continue;
@@ -311,9 +319,9 @@ pub fn PipeLine(
                     };
                     const encrypted_blob_data: []const u8 = ecd_fbs.getWritten();
 
-                    const auth_tag = current_encryption.tag;
-                    const npub = current_encryption.npub;
-                    const key = current_encryption.key;
+                    const auth_tag = current_chunk_info.encryption.tag;
+                    const npub = current_chunk_info.encryption.npub;
+                    const key = current_chunk_info.encryption.key;
                     Aes256Gcm.decrypt(
                         decrypted_chunk_buffer[0..encrypted_blob_data.len],
                         encrypted_blob_data,
@@ -331,8 +339,8 @@ pub fn PipeLine(
                     };
                     const decrypted_chunk_data = decrypted_blob_data[chunk.Header.size..];
 
-                    current_chunk_name = header.next.chunk_blob_digest;
-                    current_encryption = header.next.encryption;
+                    current_chunk_info = header.next;
+                    full_file_digest = header.full_file_digest;
 
                     down_data.writer.writeAll(decrypted_chunk_data) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),

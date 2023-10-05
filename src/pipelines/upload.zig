@@ -30,8 +30,10 @@ pub fn PipeLine(
 ) type {
     const SrcNs = verifySrcType(Src) catch |err| @compileError(@errorName(err));
     return struct {
+        //! All fields in this container are private and not to be modified directly unless
+        //! explicitly stated otherwise in the field's doc comment.
+
         allocator: std.mem.Allocator,
-        requests_buf: []std.http.Client.Request,
         server_info: ServerInfo,
         gc_prealloc: ?ServerInfo.GoogleCloud.PreAllocated,
 
@@ -40,9 +42,10 @@ pub fn PipeLine(
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
-        chunk_headers_buf_mtx: std.Thread.Mutex,
-        chunk_headers_buf: std.MultiArrayList(ChunkHeaderInfo),
-        chunk_buffer: *[header_plus_chunk_max_size * 2]u8,
+        requests_buf: []std.http.Client.Request,
+        /// decrypted_chunk_buffer = &chunk_buffer[0]
+        /// encrypted_chunk_buffer = &chunk_buffer[1]
+        chunk_buffers: *[2][header_plus_chunk_max_size]u8,
 
         random: std.rand.Random,
         ec: ErasureCoder,
@@ -57,7 +60,6 @@ pub fn PipeLine(
             src: Src,
             full_size: u64,
         };
-        const ChunkHeaderInfo = struct { header: chunk.Header };
 
         // TODO: should this use a more strict memory order?
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
@@ -81,7 +83,6 @@ pub fn PipeLine(
             assert(values.queue_capacity != 0);
             var self: Self = .{
                 .allocator = values.allocator,
-                .requests_buf = &.{},
                 .server_info = values.server_info,
                 .gc_prealloc = null,
 
@@ -90,17 +91,13 @@ pub fn PipeLine(
                 .queue_pop_re = .{},
                 .queue = undefined,
 
-                .chunk_headers_buf_mtx = .{},
-                .chunk_headers_buf = .{},
-                .chunk_buffer = undefined,
+                .requests_buf = &.{},
+                .chunk_buffers = undefined,
 
                 .random = values.random,
                 .ec = undefined,
                 .thread = null,
             };
-
-            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
-            errdefer self.allocator.free(self.requests_buf);
 
             if (values.server_info.google_cloud) |gc| {
                 self.gc_prealloc = try gc.preAllocated(self.allocator);
@@ -110,8 +107,11 @@ pub fn PipeLine(
             self.queue = try ManagedQueue(QueueItem).initCapacity(self.allocator, values.queue_capacity);
             errdefer self.queue.deinit(self.allocator);
 
-            self.chunk_buffer = try self.allocator.create([header_plus_chunk_max_size * 2]u8);
-            errdefer self.allocator.free(self.chunk_buffer);
+            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, values.server_info.bucketCount());
+            errdefer self.allocator.free(self.requests_buf);
+
+            self.chunk_buffers = try self.allocator.create([2][header_plus_chunk_max_size]u8);
+            errdefer self.allocator.destroy(self.chunk_buffers);
 
             self.ec = try ErasureCoder.init(self.allocator, .{
                 .shard_count = @intCast(values.server_info.bucketCount()),
@@ -123,6 +123,7 @@ pub fn PipeLine(
         }
 
         pub inline fn start(self: *Self) !void {
+            assert(self.thread == null);
             self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, uploadPipeLineThread, .{self});
         }
 
@@ -147,11 +148,10 @@ pub fn PipeLine(
             if (self.thread) |thread| thread.join();
             self.queue.deinit(self.allocator);
 
-            self.chunk_headers_buf.deinit(self.allocator);
-            self.allocator.free(self.chunk_buffer);
+            self.allocator.destroy(self.chunk_buffers);
+            self.allocator.free(self.requests_buf);
 
             self.ec.deinit(self.allocator);
-            self.allocator.free(self.requests_buf);
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
@@ -190,23 +190,15 @@ pub fn PipeLine(
                 break :size reported_full_size;
             };
 
-            {
-                self.chunk_headers_buf_mtx.lock();
-                defer self.chunk_headers_buf_mtx.unlock();
-                try self.chunk_headers_buf.ensureTotalCapacity(self.allocator, chunk.countForFileSize(full_size));
-            }
-
-            {
-                try src.seekableStream().seekTo(0);
-                self.queue_mtx.lock();
-                defer self.queue_mtx.unlock();
-                self.queue_pop_re.set();
-                try self.queue.pushValue(self.allocator, QueueItem{
-                    .ctx = ctx,
-                    .src = src,
-                    .full_size = full_size,
-                });
-            }
+            try src.seekableStream().seekTo(0);
+            self.queue_mtx.lock();
+            defer self.queue_mtx.unlock();
+            self.queue_pop_re.set();
+            try self.queue.pushValue(self.allocator, QueueItem{
+                .ctx = ctx,
+                .src = src,
+                .full_size = full_size,
+            });
         }
 
         const Ctx = struct {
@@ -268,9 +260,8 @@ pub fn PipeLine(
             var client = std.http.Client{ .allocator = upp.allocator };
             defer client.deinit();
 
-            const hpcms = header_plus_chunk_max_size;
-            const decrypted_chunk_buffer: *[hpcms]u8 = upp.chunk_buffer[hpcms * 0 ..][0..hpcms];
-            const encrypted_chunk_buffer: *[hpcms]u8 = upp.chunk_buffer[hpcms * 1 ..][0..hpcms];
+            const decrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &upp.chunk_buffers[0];
+            const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &upp.chunk_buffers[1];
 
             const test_key = [_]u8{0xD} ** Aes256Gcm.key_length;
 
@@ -312,124 +303,85 @@ pub fn PipeLine(
 
                 defer {
                     up_ctx.update(100);
-
-                    upp.chunk_headers_buf_mtx.lock();
-                    defer upp.chunk_headers_buf_mtx.unlock();
                     up_ctx.close(
                         up_data.src,
                         if (stored_file) |*ptr| ptr else null,
                     );
                 }
 
-                // clear chunk header buffer
-                // NOTE: this should be safe as the `len` field is never touched by the other thread,
-                // and this doesn't touch the capacity, which is only ever touched by the other thread.
-                upp.chunk_headers_buf.shrinkRetainingCapacity(0);
+                // `uploadFile` seeks to 0 before pushing the source to the queue,
+                // so we assume we're at the start of the source here.
+                const full_file_digest = blk: {
 
-                { // full SHA calculation & first step of chunk headers initialisation
-                    var full_hasher = Sha256.init(.{});
+                    // although we'll be using the array elements of this buffer later,
+                    // we aren't using them yet, so we use the whole thing here first
+                    // to hash large amounts of the data at a time.
+                    const buffer: *[header_plus_chunk_max_size * 2]u8 = std.mem.asBytes(upp.chunk_buffers);
+                    var full_file_hasher = Sha256.init(.{});
 
-                    seeker.seekTo(0) catch |err| switch (err) {
-                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                    };
-                    var real_chunk_count: chunk.Count = 0;
+                    var calculated_file_size: u64 = 0;
                     while (true) {
-                        const chunk_buffer: *[chunk.size]u8 = upp.chunk_buffer[chunk.Header.size..][0..chunk.size];
-                        const bytes_read = reader.readAll(chunk_buffer) catch |err| switch (err) {
+                        const byte_len = reader.readAll(buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        const chunk_data = chunk_buffer[0..bytes_read];
-                        if (chunk_data.len == 0) break;
+                        const data = buffer[0..byte_len];
+                        if (data.len == 0) break;
 
-                        real_chunk_count += 1;
-
-                        full_hasher.update(chunk_data);
-                        const chunk_digest = sha: {
-                            var chunk_sha: [Sha256.digest_length]u8 = undefined;
-                            Sha256.hash(chunk_data, &chunk_sha, .{});
-                            break :sha chunk_sha;
-                        };
-
-                        upp.chunk_headers_buf_mtx.lock();
-                        defer upp.chunk_headers_buf_mtx.unlock();
-
-                        upp.chunk_headers_buf.appendAssumeCapacity(ChunkHeaderInfo{
-                            .header = chunk.Header{
-                                .current_chunk_digest = chunk_digest,
-                                .full_file_digest = .{0} ** Sha256.digest_length,
-                                .next = .{
-                                    .chunk_blob_digest = .{0} ** Sha256.digest_length,
-                                    .encryption = .{
-                                        .tag = .{0} ** Aes256Gcm.tag_length,
-                                        .npub = .{0} ** Aes256Gcm.nonce_length,
-                                        .key = .{0} ** Aes256Gcm.key_length,
-                                    },
-                                },
-                            },
-                        });
+                        calculated_file_size += data.len;
+                        full_file_hasher.update(data);
                     }
-                    switch (std.math.order(real_chunk_count, chunk_count)) {
+
+                    switch (std.math.order(calculated_file_size, up_data.full_size)) {
+                        .lt => @panic("TODO: handle smaller source size than reported"),
+                        .gt => @panic("TODO: handle bigger source size than reported"),
                         .eq => {},
-                        .lt => @panic("TODO handle: fewer chunks present than reported"),
-                        .gt => @panic("TODO handle: more chunks present than reported"),
                     }
 
-                    const full_file_digest = full_hasher.finalResult();
-
-                    upp.chunk_headers_buf_mtx.lock();
-                    defer upp.chunk_headers_buf_mtx.unlock();
-
-                    const headers: []chunk.Header = upp.chunk_headers_buf.items(.header);
-                    assert(headers.len != 0);
-
-                    const first = &headers[0];
-                    first.* = .{
-                        .current_chunk_digest = first.current_chunk_digest,
-                        .full_file_digest = full_file_digest,
-                        .next = .{
-                            .chunk_blob_digest = .{0} ** Sha256.digest_length,
-                            .encryption = .{
-                                .tag = .{0} ** Aes256Gcm.tag_length,
-                                .npub = .{0} ** Aes256Gcm.nonce_length,
-                                .key = .{0} ** Aes256Gcm.key_length,
-                            },
-                        },
-                    };
-                }
-                assert(upp.chunk_headers_buf.len == chunk_count);
+                    break :blk full_file_hasher.finalResult();
+                };
 
                 var bytes_uploaded: u64 = 0;
                 const upload_size = upp.ec.totalEncodedSize(
                     chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
                 );
 
+                var next_chunk_info: chunk.Header.NextInfo = .{
+                    .chunk_blob_digest = .{0} ** Sha256.digest_length,
+                    .encryption = .{
+                        .tag = .{0} ** Aes256Gcm.tag_length,
+                        .npub = .{0} ** Aes256Gcm.nonce_length,
+                        .key = .{0} ** Aes256Gcm.key_length,
+                    },
+                };
+
                 for (1 + 0..1 + chunk_count) |rev_chunk_idx_uncasted| {
                     const chunk_idx: chunk.Count = @intCast(chunk_count - rev_chunk_idx_uncasted);
                     const chunk_offset = chunk.startOffset(chunk_idx);
 
-                    const current_header: chunk.Header = blk: {
-                        upp.chunk_headers_buf_mtx.lock();
-                        defer upp.chunk_headers_buf_mtx.unlock();
-
-                        const headers = upp.chunk_headers_buf.items(.header);
-                        break :blk headers[chunk_idx];
-                    };
-                    decrypted_chunk_buffer[0..chunk.Header.size].* = current_header.toBytes();
-
-                    // the entire unencrypted header bytes and data bytes of the current block
                     const decrypted_chunk_blob: []const u8 = blk: {
-                        const buffer_subsection: *[chunk.size]u8 = decrypted_chunk_buffer[chunk.Header.size..];
+                        const header_buffer: *[chunk.Header.size]u8 = decrypted_chunk_buffer[0..chunk.Header.size];
+                        const data_buffer: *[chunk.size]u8 = decrypted_chunk_buffer[header_buffer.len..];
                         seeker.seekTo(chunk_offset) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        const bytes_len = reader.readAll(buffer_subsection) catch |err| switch (err) {
+                        const data_bytes_len = reader.readAll(data_buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
-                        break :blk decrypted_chunk_buffer[0 .. chunk.Header.size + bytes_len];
+                        const chunk_data = data_buffer[0..data_bytes_len];
+
+                        var current_chunk_header: chunk.Header = .{
+                            .current_chunk_digest = undefined,
+                            .full_file_digest = if (chunk_idx == 0) full_file_digest else .{0} ** Sha256.digest_length,
+                            .next = next_chunk_info,
+                        };
+                        Sha256.hash(chunk_data, &current_chunk_header.current_chunk_digest, .{});
+                        header_buffer.* = current_chunk_header.toBytes();
+                        break :blk decrypted_chunk_buffer[0 .. chunk.Header.size + data_bytes_len];
                     };
 
                     var auth_tag: [Aes256Gcm.tag_length]u8 = undefined;
                     const npub = nonce_generator.new();
+                    const key = test_key;
 
                     Aes256Gcm.encrypt(
                         encrypted_chunk_buffer[0..decrypted_chunk_blob.len],
@@ -437,45 +389,20 @@ pub fn PipeLine(
                         decrypted_chunk_blob,
                         "",
                         npub,
-                        test_key,
+                        key,
                     );
                     const encrypted_chunk_blob: []const u8 = encrypted_chunk_buffer[0..decrypted_chunk_blob.len];
 
-                    const chunk_name = blk: {
-                        var chunk_name: [Sha256.digest_length]u8 = undefined;
-                        Sha256.hash(encrypted_chunk_blob, &chunk_name, .{});
-                        break :blk chunk_name;
+                    next_chunk_info = .{
+                        .chunk_blob_digest = undefined,
+                        .encryption = .{
+                            .tag = auth_tag,
+                            .npub = npub,
+                            .key = key,
+                        },
                     };
-
-                    {
-                        upp.chunk_headers_buf_mtx.lock();
-                        defer upp.chunk_headers_buf_mtx.unlock();
-
-                        const slice = upp.chunk_headers_buf.slice();
-
-                        if (chunk_idx != 0) { // initialise the `next_chunk_blob_digest` field of the previous chunk (it is the next in the iteration order)
-                            const headers: []chunk.Header = slice.items(.header);
-                            headers[chunk_idx - 1].next = .{
-                                .chunk_blob_digest = chunk_name,
-                                .encryption = .{
-                                    .tag = auth_tag,
-                                    .npub = npub,
-                                    .key = test_key,
-                                },
-                            };
-                        } else {
-                            assert(stored_file == null);
-                            stored_file = .{
-                                .encryption = .{
-                                    .tag = auth_tag,
-                                    .npub = npub,
-                                    .key = test_key,
-                                },
-                                .first_name = chunk_name,
-                                .chunk_count = chunk_count,
-                            };
-                        }
-                    }
+                    Sha256.hash(encrypted_chunk_blob, &next_chunk_info.chunk_blob_digest, .{});
+                    const chunk_name: *const [Sha256.digest_length]u8 = &next_chunk_info.chunk_blob_digest;
 
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
@@ -483,7 +410,7 @@ pub fn PipeLine(
                     if (upp.server_info.google_cloud) |gc| {
                         const gc_prealloc = upp.gc_prealloc.?;
 
-                        var iter = gc_prealloc.bucketObjectUriIterator(gc, &chunk_name);
+                        var iter = gc_prealloc.bucketObjectUriIterator(gc, chunk_name);
                         while (iter.next()) |uri_str| {
                             const uri = std.Uri.parse(uri_str) catch unreachable;
                             const req = client.request(.PUT, uri, gc_prealloc.headers.toManaged(upp.allocator), .{}) catch |err| switch (err) {
@@ -553,6 +480,12 @@ pub fn PipeLine(
                         };
                     }
                 }
+
+                stored_file = .{
+                    .encryption = next_chunk_info.encryption,
+                    .first_name = next_chunk_info.chunk_blob_digest,
+                    .chunk_count = chunk_count,
+                };
             }
         }
     };

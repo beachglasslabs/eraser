@@ -22,17 +22,17 @@ pub inline fn startOffset(chunk_idx: Count) u64 {
 }
 
 pub const Header = struct {
-    version: HeaderVersion = HeaderVersion.latest,
+    version: Version = Version.latest,
     /// Represents the SHA of the current chunk's unencrypted data.
     current_chunk_digest: [Sha256.digest_length]u8,
     /// Represents the SHA digest of the entire file. If this header does not represent
     /// the first chunk, this field should be zeroed out & ignored.
     full_file_digest: [Sha256.digest_length]u8,
-    /// If there is no chunk after the one represented by this header, this field should be zeroed out & ignored.
+    /// If there is no subsequent chunk, this field should be zeroed out and ignored.
     next: NextInfo,
 
     pub const size =
-        HeaderVersion.size +
+        Version.size +
         Sha256.digest_length +
         Sha256.digest_length +
         NextInfo.size //
@@ -52,11 +52,11 @@ pub const Header = struct {
         comptime var cursor = 0;
 
         // read version
-        const version: HeaderVersion = blk: {
-            defer cursor += HeaderVersion.size;
-            break :blk HeaderVersion.fromBytes(bytes[cursor..][0..HeaderVersion.size].*);
+        const version: Version = blk: {
+            defer cursor += Version.size;
+            break :blk Version.fromBytes(bytes[cursor..][0..Version.size].*);
         };
-        switch (version.order(HeaderVersion.latest)) {
+        switch (version.order(Version.latest)) {
             .gt => return error.UnrecognizedHeaderVersion,
             .lt => @panic("This should not yet be possible"),
             .eq => {},
@@ -84,9 +84,12 @@ pub const Header = struct {
     }
 
     pub const NextInfo = struct {
-        /// Represents the SHA of the blob comprised of the next chunk's header and data.
+        /// Represents the SHA of the blob comprised of the next chunk's unencrypted header
+        /// and data.
+        /// If there is no subsequent chunk, this field should be zeroed out and ignored.
         chunk_blob_digest: [Sha256.digest_length]u8,
         /// Represents the encryption information of the next chunk.
+        /// If there is no subsequent chunk, this field should be zeroed out and ignored.
         encryption: Encryption,
 
         pub const size =
@@ -107,38 +110,21 @@ pub const Header = struct {
             };
         }
     };
-
-    pub fn format(
-        self: *const Header,
-        comptime fmt_str: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = options;
-        _ = fmt_str;
-        try writer.print("{{ ver: {}, curr: {s}", .{
-            self.version,
-            digestBytesToString(&self.current_chunk_digest),
-        });
-        if (self.full_file_digest) |*full_digest| {
-            try writer.print(", full: {s}", .{&digestBytesToString(full_digest)});
-        }
-        if (self.next) |*next| {
-            try writer.print(", next_blob: {s}, next_enc: {}", .{ digestBytesToString(&next.chunk_blob_digest), next.encryption });
-        }
-        try writer.writeAll("}");
-    }
 };
 
-pub const HeaderVersion = extern struct {
+pub const Version = extern struct {
     major: u16,
     minor: u16,
     patch: u16,
 
-    const latest: HeaderVersion = .{ .major = 0, .minor = 0, .patch = 0 };
-    pub const size = @sizeOf(HeaderVersion);
+    comptime {
+        assert(@sizeOf(Version) == @sizeOf([3]u16));
+    }
 
-    pub fn order(self: HeaderVersion, other: HeaderVersion) std.math.Order {
+    const latest: Version = .{ .major = 0, .minor = 0, .patch = 0 };
+    pub const size = @sizeOf(Version);
+
+    pub fn order(self: Version, other: Version) std.math.Order {
         const major = std.math.order(self.major, other.major);
         const minor = std.math.order(self.minor, other.minor);
         const patch = std.math.order(self.patch, other.patch);
@@ -158,28 +144,16 @@ pub const HeaderVersion = extern struct {
         };
     }
 
-    pub fn format(
-        version: HeaderVersion,
-        comptime fmt_str: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        _ = options;
-        if (fmt_str.len != 0) std.fmt.invalidFmtError(fmt_str, version);
-        try writer.print("{[major]d}.{[minor]d}.{[patch]d}", version);
-    }
-
-    pub inline fn toBytes(chv: HeaderVersion) [HeaderVersion.size]u8 {
-        const le = HeaderVersion{
+    pub inline fn toBytes(chv: Version) [Version.size]u8 {
+        return @bitCast(Version{
             .major = std.mem.nativeToLittle(u16, chv.major),
             .minor = std.mem.nativeToLittle(u16, chv.minor),
             .patch = std.mem.nativeToLittle(u16, chv.patch),
-        };
-        return @bitCast(le);
+        });
     }
-    pub inline fn fromBytes(bytes: [HeaderVersion.size]u8) HeaderVersion {
-        const le: HeaderVersion = @bitCast(bytes);
-        return HeaderVersion{
+    pub inline fn fromBytes(bytes: [Version.size]u8) Version {
+        const le: Version = @bitCast(bytes);
+        return .{
             .major = std.mem.littleToNative(u16, le.major),
             .minor = std.mem.littleToNative(u16, le.minor),
             .patch = std.mem.littleToNative(u16, le.patch),
@@ -223,22 +197,6 @@ pub const Encryption = struct {
             .npub = npub.*,
             .key = key.*,
         };
-    }
-
-    pub fn format(
-        self: *const Encryption,
-        comptime fmt_str: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        try writer.writeAll(".{ ");
-        inline for (@typeInfo(Encryption).Struct.fields, 0..) |field, i| {
-            if (i != 0) try writer.writeAll(", ");
-            const field_ptr = &@field(self, field.name);
-            try writer.writeAll(comptime std.fmt.comptimePrint(".{} = ", .{std.zig.fmtId(field.name)}));
-            try std.fmt.formatType(std.fmt.fmtSliceHexLower(field_ptr), fmt_str, options, writer, std.fmt.default_max_depth);
-        }
-        try writer.writeAll(" }");
     }
 };
 
