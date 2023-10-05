@@ -46,7 +46,7 @@ pub const buffer_backed_slices = struct {
         return Impl(S).max_align;
     }
     pub fn bufferLength(comptime S: type, lengths: Impl(S).Lengths) usize {
-        return Impl(S).calcBufferOffsets(lengths)[1];
+        return Impl(S).calcBufferOffsetsAndSize(lengths)[1];
     }
 
     pub inline fn fromBuffer(
@@ -54,7 +54,10 @@ pub const buffer_backed_slices = struct {
         buf: []align(bufferAlignment(S)) u8,
         lengths: SliceLengths(S),
     ) S {
-        return fromBufferImpl(S, lengths, buf, false, {});
+        const I = Impl(S);
+        const offsets_and_size = I.calcBufferOffsetsAndSize(lengths);
+        assert(buf.len == offsets_and_size[1]);
+        return I.fromBufferImpl(buf, lengths, offsets_and_size[0]);
     }
 
     pub inline fn fromAlloc(
@@ -62,54 +65,23 @@ pub const buffer_backed_slices = struct {
         allocator: std.mem.Allocator,
         lengths: SliceLengths(S),
     ) std.mem.Allocator.Error!struct { S, []align(bufferAlignment(S)) u8 } {
-        const offsets_result = Impl(S).calcBufferOffsets(lengths);
-        const offsets: Impl(S).Offsets = offsets_result[0];
-        const buffer_len = offsets_result[1];
+        const I = Impl(S);
 
-        const alloc = try allocator.alignedAlloc(u8, bufferAlignment(S), buffer_len);
+        const offsets_and_size = I.calcBufferOffsetsAndSize(lengths);
+        const offsets: I.Offsets = offsets_and_size[0];
+        const buffer_size = offsets_and_size[1];
+
+        const alloc = try allocator.alignedAlloc(u8, I.max_align, buffer_size);
         errdefer allocator.free(alloc);
 
-        const result = fromBufferImpl(S, alloc, lengths, true, .{ offsets, buffer_len });
+        const result = I.fromBufferImpl(alloc, lengths, offsets);
         return .{ result, alloc };
-    }
-
-    fn fromBufferImpl(
-        comptime S: type,
-        /// asserts `buf.len == bufferLength(S, lengths)`
-        buf: []align(bufferAlignment(S)) u8,
-        lengths: SliceLengths(S),
-        comptime precalculated: bool,
-        precalculated_offsets_result: if (precalculated) struct { Impl(S).Offsets, usize } else void,
-    ) S {
-        const offsets_result = if (precalculated)
-            precalculated_offsets_result
-        else
-            Impl(S).calcBufferOffsets(lengths);
-        const offsets = offsets_result[0];
-        const buffer_length = offsets_result[1];
-
-        assert(buf.len == buffer_length);
-
-        var result: S = undefined;
-        inline for (Impl(S).fields) |field| {
-            const pointer = @typeInfo(field.type).Pointer;
-            const offset = @field(offsets, field.name);
-            const byte_len = @field(lengths, field.name) * @sizeOf(pointer.child);
-            @field(result, field.name) = @alignCast(switch (pointer.size) {
-                .Slice => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]),
-                .Many => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]).ptr,
-                .One => std.mem.bytesAsValue(pointer.child, buf[offset..][0..byte_len]),
-                else => comptime unreachable,
-            });
-        }
-
-        return result;
     }
 
     fn Impl(comptime S: type) type {
         return struct {
             /// Returns the offsets struct and the exact required buffer length.
-            inline fn calcBufferOffsets(lengths: Lengths) struct { Offsets, usize } {
+            inline fn calcBufferOffsetsAndSize(lengths: Lengths) struct { Offsets, usize } {
                 var offsets: Offsets = undefined;
 
                 var offset: usize = 0;
@@ -122,6 +94,28 @@ pub const buffer_backed_slices = struct {
                 }
 
                 return .{ offsets, offset };
+            }
+
+            fn fromBufferImpl(
+                /// asserts `buf.len == bufferLength(S, lengths)`
+                buf: []align(bufferAlignment(S)) u8,
+                lengths: SliceLengths(S),
+                offsets: Offsets,
+            ) S {
+                var result: S = undefined;
+                inline for (Impl(S).fields) |field| {
+                    const pointer = @typeInfo(field.type).Pointer;
+                    const offset = @field(offsets, field.name);
+                    const byte_len = @field(lengths, field.name) * @sizeOf(pointer.child);
+                    @field(result, field.name) = @alignCast(switch (pointer.size) {
+                        .Slice => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]),
+                        .Many => std.mem.bytesAsSlice(pointer.child, buf[offset..][0..byte_len]).ptr,
+                        .One => std.mem.bytesAsValue(pointer.child, buf[offset..][0..byte_len]),
+                        else => comptime unreachable,
+                    });
+                }
+
+                return result;
             }
 
             const fields = @typeInfo(S).Struct.fields;
@@ -189,6 +183,56 @@ pub const buffer_backed_slices = struct {
     }
 };
 
+pub const InlineSlicer = struct {
+    Elem: type,
+    count: comptime_int,
+    cursor: comptime_int,
+
+    pub fn init(comptime Elem: type, comptime count: comptime_int) InlineSlicer {
+        return .{
+            .Elem = Elem,
+            .count = count,
+            .cursor = 0,
+        };
+    }
+
+    pub inline fn next(
+        comptime self: *InlineSlicer,
+        buffer: *const [self.count]self.Elem,
+        comptime advance: comptime_int,
+    ) *const [advance]u8 {
+        const remaining = buffer[self.cursor..];
+        comptime if (advance > remaining.len) @compileError(std.fmt.comptimePrint(
+            "Tried slicing {d} more elements, but there are only {d} remaining in the {d} element buffer",
+            .{ advance, remaining.len, self.count },
+        ));
+        const result = remaining[0..advance];
+        comptime self.cursor += result.len;
+        return result;
+    }
+
+    pub inline fn nextRemaining(
+        comptime self: *InlineSlicer,
+        buffer: *const [self.count]self.Elem,
+    ) *const [buffer.len - self.cursor]u8 {
+        const remaining = buffer[self.cursor..];
+        comptime self.cursor += remaining.len;
+        return remaining;
+    }
+
+    pub inline fn finish(comptime self: *const InlineSlicer) void {
+        _ = struct { // makes this lazy despite inlining
+            comptime {
+                assert(self.cursor <= self.count);
+                if (self.cursor != self.count) @compileError(std.fmt.comptimePrint(
+                    "{d} of {d} elements remain unused",
+                    .{ self.count - self.cursor, self.count },
+                ));
+            }
+        };
+    }
+};
+
 pub fn slicesOverlap(a: anytype, b: anytype) bool {
     const a_bytes: []const u8 = std.mem.sliceAsBytes(a);
     const b_bytes: []const u8 = std.mem.sliceAsBytes(b);
@@ -224,16 +268,6 @@ pub fn safeMemcpy(dst: anytype, src: anytype) void {
             dst[i] = src[i];
         },
     }
-}
-
-pub inline fn match2(a: anytype, b: anytype) u2 {
-    const Ta = @TypeOf(a);
-    const Tb = @TypeOf(b);
-    if (Ta == comptime_int) return match2(@as(u1, a), @as(Tb, b));
-    if (Tb == comptime_int) return match2(@as(Ta, a), @as(u1, b));
-    const Bits = packed struct { a: bool, b: bool };
-    const bits: Bits = .{ .a = @bitCast(a), .b = @bitCast(b) };
-    return @bitCast(bits);
 }
 
 /// Allocator which always fails to allocate, and presumes
@@ -272,89 +306,6 @@ pub const empty_allocator = std.mem.Allocator{
         };
     },
 };
-
-pub inline fn redirectingReader(reader: anytype, writer: anytype) RedirectingReader(@TypeOf(reader), @TypeOf(writer)) {
-    return .{ .inner = reader, .writer = writer };
-}
-pub fn RedirectingReader(comptime InnerReader: type, comptime Writer: type) type {
-    return struct {
-        inner: InnerReader,
-        writer: Writer,
-        const Self = @This();
-
-        pub const Reader = std.io.Reader(Self, Self.Error, Self.read);
-        const Error = InnerReader.Error || Writer.Error;
-        pub inline fn reader(self: Self) Reader {
-            return .{ .context = self };
-        }
-
-        fn read(self: Self, buf: []u8) Error!usize {
-            const count = try self.inner.read(buf);
-            try self.writer.writeAll(buf[0..count]);
-        }
-    };
-}
-
-pub inline fn sha256DigestCalcReader(
-    hasher: *std.crypto.hash.sha2.Sha256,
-    inner: anytype,
-) Sha256DigestCalcReader(@TypeOf(inner)) {
-    return .{
-        .inner = inner,
-        .hasher = hasher,
-    };
-}
-pub fn Sha256DigestCalcReader(comptime InnerReader: type) type {
-    return struct {
-        hasher: *Sha256,
-        inner: Inner,
-        const Self = @This();
-
-        pub const Inner = InnerReader;
-
-        pub const Reader = std.io.Reader(Self, Inner.Error, Self.read);
-        pub inline fn reader(self: Self) Reader {
-            return .{ .context = self };
-        }
-
-        const Sha256 = std.crypto.hash.sha2.Sha256;
-        fn read(self: Self, buf: []u8) Inner.Error!usize {
-            const count = try self.inner.read(buf);
-            self.hasher.update(buf[0..count]);
-            return count;
-        }
-    };
-}
-pub inline fn sha256DigestCalcWriter(
-    hasher: *std.crypto.hash.sha2.Sha256,
-    inner: anytype,
-) Sha256DigestCalcWriter(@TypeOf(inner)) {
-    return .{
-        .inner = inner,
-        .hasher = hasher,
-    };
-}
-pub fn Sha256DigestCalcWriter(comptime InnerWriter: type) type {
-    return struct {
-        hasher: *Sha256,
-        inner: Inner,
-        const Self = @This();
-
-        pub const Inner = InnerWriter;
-
-        pub const Writer = std.io.Writer(Self, Inner.Error, Self.write);
-        pub inline fn writer(self: Self) Writer {
-            return .{ .context = self };
-        }
-
-        const Sha256 = std.crypto.hash.sha2.Sha256;
-        fn write(self: Self, bytes: []const u8) Inner.Error!usize {
-            const count = try self.inner.write(bytes);
-            self.hasher.update(bytes[0..count]);
-            return count;
-        }
-    };
-}
 
 pub fn boundedFmt(
     comptime fmt_str: []const u8,
