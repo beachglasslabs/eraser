@@ -29,13 +29,13 @@ pub const Header = struct {
     /// the first chunk, this field should be zeroed out & ignored.
     full_file_digest: [Sha256.digest_length]u8,
     /// If there is no subsequent chunk, this field should be zeroed out and ignored.
-    next: NextInfo,
+    next: ChunkRef,
 
     pub const size =
         Version.size +
         Sha256.digest_length +
         Sha256.digest_length +
-        NextInfo.size //
+        ChunkRef.size //
     ;
 
     pub inline fn toBytes(header: *const Header) [Header.size]u8 {
@@ -49,67 +49,59 @@ pub const Header = struct {
 
     pub const ReadHeaderError = error{UnrecognizedHeaderVersion};
     pub inline fn fromBytes(bytes: *const [Header.size]u8) ReadHeaderError!Header {
-        comptime var cursor = 0;
+        comptime var ils = util.InlineSlicer.init(u8, bytes.len);
+        defer ils.finish();
 
         // read version
-        const version: Version = blk: {
-            defer cursor += Version.size;
-            break :blk Version.fromBytes(bytes[cursor..][0..Version.size].*);
-        };
+        const version: Version = Version.fromBytes(ils.next(bytes, Version.size).*);
         switch (version.order(Version.latest)) {
             .gt => return error.UnrecognizedHeaderVersion,
             .lt => @panic("This should not yet be possible"),
             .eq => {},
         }
 
-        // read the SHA of the current chunk's unencrypted data
-        const current_chunk_digest: *const [Sha256.digest_length]u8 = bytes[cursor..][0..Sha256.digest_length];
-        cursor += current_chunk_digest.len;
-
-        // read the SHA of the entire unencrypted file, if present
-        const full_file_digest: *const [Sha256.digest_length]u8 = bytes[cursor..][0..Sha256.digest_length];
-        cursor += full_file_digest.len;
-
-        // read the info about the next chunk, if present
-        const next: Header.NextInfo = Header.NextInfo.fromBytes(bytes[cursor..][0..Header.NextInfo.size]);
-        cursor += Header.NextInfo.size;
-
-        comptime assert(cursor == bytes.len);
         return .{
             .version = version,
-            .current_chunk_digest = current_chunk_digest.*,
-            .full_file_digest = full_file_digest.*,
-            .next = next,
+            .current_chunk_digest = ils.next(bytes, Sha256.digest_length).*, // read the SHA of the current chunk's unencrypted data
+            .full_file_digest = ils.next(bytes, Sha256.digest_length).*, // read the SHA of the entire unencrypted file, if present
+            .next = ChunkRef.fromBytes(ils.next(bytes, ChunkRef.size)), // read the info about the next chunk, if present
         };
     }
+};
 
-    pub const NextInfo = struct {
-        /// Represents the SHA of the blob comprised of the next chunk's unencrypted header
-        /// and data.
-        /// If there is no subsequent chunk, this field should be zeroed out and ignored.
-        chunk_blob_digest: [Sha256.digest_length]u8,
-        /// Represents the encryption information of the next chunk.
-        /// If there is no subsequent chunk, this field should be zeroed out and ignored.
-        encryption: Encryption,
+pub const ChunkRef = struct {
+    /// Represents the SHA of the blob comprised of the next chunk's unencrypted header
+    /// and data.
+    /// If there is no subsequent chunk, this field should be zeroed out and ignored.
+    chunk_blob_digest: [Sha256.digest_length]u8,
+    /// Represents the encryption information of the next chunk.
+    /// If there is no subsequent chunk, this field should be zeroed out and ignored.
+    encryption: Encryption,
 
-        pub const size =
-            Sha256.digest_length +
-            Encryption.size //
-        ;
+    pub const size =
+        Sha256.digest_length +
+        Encryption.size //
+    ;
 
-        pub inline fn toBytes(next: *const NextInfo) [NextInfo.size]u8 {
-            return [0]u8{} ++
-                next.chunk_blob_digest ++
-                next.encryption.toBytes();
-        }
-
-        pub inline fn fromBytes(bytes: *const [NextInfo.size]u8) NextInfo {
-            return .{
-                .chunk_blob_digest = bytes[0..Sha256.digest_length].*,
-                .encryption = Encryption.fromBytes(bytes[Sha256.digest_length..]),
-            };
-        }
+    pub const zero_init: ChunkRef = .{
+        .chunk_blob_digest = .{0} ** Sha256.digest_length,
+        .encryption = Encryption.zero_init,
     };
+
+    pub inline fn toBytes(next: *const ChunkRef) [ChunkRef.size]u8 {
+        return [0]u8{} ++
+            next.chunk_blob_digest ++
+            next.encryption.toBytes();
+    }
+
+    pub inline fn fromBytes(bytes: *const [ChunkRef.size]u8) ChunkRef {
+        comptime var ils = util.InlineSlicer.init(u8, bytes.len);
+        defer ils.finish();
+        return .{
+            .chunk_blob_digest = ils.next(bytes, Sha256.digest_length).*,
+            .encryption = Encryption.fromBytes(ils.nextRemaining(bytes)),
+        };
+    }
 };
 
 pub const Version = extern struct {
@@ -172,6 +164,12 @@ pub const Encryption = struct {
         Aes256Gcm.key_length //
     ;
 
+    pub const zero_init: Encryption = .{
+        .tag = .{0} ** Aes256Gcm.tag_length,
+        .npub = .{0} ** Aes256Gcm.nonce_length,
+        .key = .{0} ** Aes256Gcm.key_length,
+    };
+
     pub inline fn toBytes(enc: *const Encryption) [Encryption.size]u8 {
         return [0]u8{} ++
             enc.tag ++
@@ -180,22 +178,12 @@ pub const Encryption = struct {
     }
 
     pub inline fn fromBytes(bytes: *const [Encryption.size]u8) Encryption {
-        comptime var cursor = 0;
-        defer comptime assert(cursor == bytes.len);
-
-        const tag = bytes[cursor..][0..Aes256Gcm.tag_length];
-        cursor += tag.len;
-
-        const npub = bytes[cursor..][0..Aes256Gcm.nonce_length];
-        cursor += npub.len;
-
-        const key = bytes[cursor..][0..Aes256Gcm.key_length];
-        cursor += key.len;
-
+        comptime var ils = util.InlineSlicer.init(u8, bytes.len);
+        defer ils.finish();
         return .{
-            .tag = tag.*,
-            .npub = npub.*,
-            .key = key.*,
+            .tag = ils.next(bytes, Aes256Gcm.tag_length).*,
+            .npub = ils.next(bytes, Aes256Gcm.nonce_length).*,
+            .key = ils.next(bytes, Aes256Gcm.key_length).*,
         };
     }
 };
