@@ -231,3 +231,128 @@ fn testChunkHeader(ch: Header) !void {
     const actual = try Header.fromBytes(&ch.toBytes());
     try std.testing.expectEqual(ch, actual);
 }
+
+pub inline fn encryptedChunkIterator(
+    /// `std.io.Reader(...)`
+    reader: anytype,
+    /// Should be the seeker for `reader`.
+    /// `std.io.SeekableStream(...)`
+    seeker: anytype,
+    params: struct {
+        full_file_digest: [Sha256.digest_length]u8,
+        /// Number of expected chunks
+        chunk_count: chunk.Count,
+        /// decrypted_chunk_buffer = &buffer[0]
+        /// encrypted_chunk_buffer = &buffer[1]
+        buffers: *[2][Header.size + chunk.size]u8,
+    },
+) EncryptedChunkIterator(@TypeOf(reader), @TypeOf(seeker)) {
+    return .{
+        .reader = reader,
+        .seeker = seeker,
+        .full_file_digest = params.full_file_digest,
+        .buffers = params.buffers,
+        .chunk_count = params.chunk_count,
+        .chunk_idx = params.chunk_count,
+        .next_chunk_info = chunk.ChunkRef.zero_init,
+    };
+}
+
+pub fn EncryptedChunkIterator(
+    /// `std.io.Reader(...)`
+    comptime Reader: type,
+    /// `std.io.SeekableStream(...)`
+    comptime SeekableStream: type,
+) type {
+    return struct {
+        reader: Reader,
+        seeker: SeekableStream,
+        full_file_digest: [Sha256.digest_length]u8,
+        buffers: *[2][Header.size + chunk.size]u8,
+        chunk_count: chunk.Count,
+        chunk_idx: chunk.Count,
+        next_chunk_info: chunk.ChunkRef,
+        const Self = @This();
+
+        pub const NextResult = struct {
+            /// The name of the encrypted chunk
+            name: *const [Sha256.digest_length]u8,
+            /// The encrypted data
+            encrypted: []const u8,
+        };
+
+        /// The returned pointers are only valid up until the next call to `self.next(...)`
+        pub fn next(
+            self: *Self,
+            params: struct {
+                npub: *const [Aes256Gcm.nonce_length]u8,
+                key: *const [Aes256Gcm.key_length]u8,
+            },
+        ) (Reader.Error || SeekableStream.SeekError)!?NextResult {
+            const decrypted_chunk_buffer: *[Header.size + chunk.size]u8 = &self.buffers[0];
+            const encrypted_chunk_buffer: *[Header.size + chunk.size]u8 = &self.buffers[1];
+
+            if (self.chunk_idx == 0) return null;
+            self.chunk_idx -= 1;
+            const chunk_idx = self.chunk_idx;
+            const offset = startOffset(self.chunk_idx);
+
+            const decrypted_chunk_blob = blk: {
+                const header_buffer: *[chunk.Header.size]u8 = decrypted_chunk_buffer[0..chunk.Header.size];
+                const data_buffer: *[chunk.size]u8 = decrypted_chunk_buffer[header_buffer.len..];
+                self.seeker.seekTo(offset) catch |err| switch (err) {
+                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                };
+                const data_bytes_len = try self.reader.readAll(data_buffer);
+                const chunk_data = data_buffer[0..data_bytes_len];
+
+                var current_chunk_header: chunk.Header = .{
+                    .current_chunk_digest = undefined,
+                    .full_file_digest = if (chunk_idx == 0) self.full_file_digest else .{0} ** Sha256.digest_length,
+                    .next = self.next_chunk_info,
+                };
+                Sha256.hash(chunk_data, &current_chunk_header.current_chunk_digest, .{});
+                header_buffer.* = current_chunk_header.toBytes();
+                break :blk decrypted_chunk_buffer[0 .. chunk.Header.size + data_bytes_len];
+            };
+
+            const associated_data = "";
+            var auth_tag: [Aes256Gcm.tag_length]u8 = undefined;
+            const npub = params.npub;
+            const key = params.key;
+            Aes256Gcm.encrypt(
+                encrypted_chunk_buffer[0..decrypted_chunk_blob.len],
+                &auth_tag,
+                decrypted_chunk_blob,
+                associated_data,
+                npub.*,
+                key.*,
+            );
+            const encrypted_chunk_blob: []const u8 = encrypted_chunk_buffer[0..decrypted_chunk_blob.len];
+
+            self.next_chunk_info = .{
+                .chunk_blob_digest = undefined,
+                .encryption = .{
+                    .tag = auth_tag,
+                    .npub = npub.*,
+                    .key = key.*,
+                },
+            };
+            Sha256.hash(encrypted_chunk_blob, &self.next_chunk_info.chunk_blob_digest, .{});
+
+            return .{
+                .name = &self.next_chunk_info.chunk_blob_digest,
+                .encrypted = encrypted_chunk_blob,
+            };
+        }
+
+        pub inline fn storedFile(self: *const Self) pipelines.StoredFile {
+            assert(self.chunk_idx == 0);
+            return .{
+                .encryption = self.next_chunk_info.encryption,
+                .first_name = self.next_chunk_info.chunk_blob_digest,
+                .chunk_count = self.chunk_count,
+            };
+        }
+    };
+}

@@ -1,4 +1,5 @@
 const chunk = @import("chunk.zig");
+const builtin = @import("builtin");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
 const ServerInfo = @import("ServerInfo.zig");
@@ -260,21 +261,16 @@ pub fn PipeLine(
             var client = std.http.Client{ .allocator = upp.allocator };
             defer client.deinit();
 
-            const decrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &upp.chunk_buffers[0];
-            const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &upp.chunk_buffers[1];
-
             const test_key = [_]u8{0xD} ** Aes256Gcm.key_length;
-
             var nonce_generator: struct {
                 counter: u64 = 0,
                 random: std.rand.Random,
 
                 inline fn new(this: *@This()) [Aes256Gcm.nonce_length]u8 {
-                    const counter_value = this.counter;
-                    this.counter +%= 1;
                     var random_bytes: [4]u8 = undefined;
                     this.random.bytes(&random_bytes);
-                    return std.mem.toBytes(counter_value) ++ random_bytes;
+                    defer this.counter +%= 1;
+                    return std.mem.toBytes(this.counter) ++ random_bytes;
                 }
             } = .{ .random = upp.random };
 
@@ -287,7 +283,6 @@ pub fn PipeLine(
 
                     break :blk upp.queue.popValue() orelse {
                         upp.queue_pop_re.reset();
-
                         if (upp.must_stop.load(must_stop_load_mo)) break;
                         continue;
                     };
@@ -312,97 +307,44 @@ pub fn PipeLine(
                 // `uploadFile` seeks to 0 before pushing the source to the queue,
                 // so we assume we're at the start of the source here.
                 const full_file_digest = blk: {
-
                     // although we'll be using the array elements of this buffer later,
                     // we aren't using them yet, so we use the whole thing here first
                     // to hash large amounts of the data at a time.
                     const buffer: *[header_plus_chunk_max_size * 2]u8 = std.mem.asBytes(upp.chunk_buffers);
                     var full_file_hasher = Sha256.init(.{});
 
-                    var calculated_file_size: u64 = 0;
                     while (true) {
                         const byte_len = reader.readAll(buffer) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         const data = buffer[0..byte_len];
                         if (data.len == 0) break;
-
-                        calculated_file_size += data.len;
                         full_file_hasher.update(data);
                     }
-
-                    switch (std.math.order(calculated_file_size, up_data.full_size)) {
-                        .lt => @panic("TODO: handle smaller source size than reported"),
-                        .gt => @panic("TODO: handle bigger source size than reported"),
-                        .eq => {},
-                    }
-
                     break :blk full_file_hasher.finalResult();
                 };
+
+                var eci = chunk.encryptedChunkIterator(reader, seeker, .{
+                    .full_file_digest = full_file_digest,
+                    .chunk_count = chunk_count,
+                    .buffers = upp.chunk_buffers,
+                });
 
                 var bytes_uploaded: u64 = 0;
                 const upload_size = upp.ec.totalEncodedSize(
                     chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
                 );
 
-                var next_chunk_info: chunk.Header.NextInfo = .{
-                    .chunk_blob_digest = .{0} ** Sha256.digest_length,
-                    .encryption = .{
-                        .tag = .{0} ** Aes256Gcm.tag_length,
-                        .npub = .{0} ** Aes256Gcm.nonce_length,
-                        .key = .{0} ** Aes256Gcm.key_length,
-                    },
-                };
+                while (true) {
+                    const result = eci.next(.{
+                        .npub = &nonce_generator.new(),
+                        .key = &test_key,
+                    }) catch |err| switch (err) {
+                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                    } orelse break;
 
-                for (1 + 0..1 + chunk_count) |rev_chunk_idx_uncasted| {
-                    const chunk_idx: chunk.Count = @intCast(chunk_count - rev_chunk_idx_uncasted);
-                    const chunk_offset = chunk.startOffset(chunk_idx);
-
-                    const decrypted_chunk_blob: []const u8 = blk: {
-                        const header_buffer: *[chunk.Header.size]u8 = decrypted_chunk_buffer[0..chunk.Header.size];
-                        const data_buffer: *[chunk.size]u8 = decrypted_chunk_buffer[header_buffer.len..];
-                        seeker.seekTo(chunk_offset) catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        const data_bytes_len = reader.readAll(data_buffer) catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        const chunk_data = data_buffer[0..data_bytes_len];
-
-                        var current_chunk_header: chunk.Header = .{
-                            .current_chunk_digest = undefined,
-                            .full_file_digest = if (chunk_idx == 0) full_file_digest else .{0} ** Sha256.digest_length,
-                            .next = next_chunk_info,
-                        };
-                        Sha256.hash(chunk_data, &current_chunk_header.current_chunk_digest, .{});
-                        header_buffer.* = current_chunk_header.toBytes();
-                        break :blk decrypted_chunk_buffer[0 .. chunk.Header.size + data_bytes_len];
-                    };
-
-                    var auth_tag: [Aes256Gcm.tag_length]u8 = undefined;
-                    const npub = nonce_generator.new();
-                    const key = test_key;
-
-                    Aes256Gcm.encrypt(
-                        encrypted_chunk_buffer[0..decrypted_chunk_blob.len],
-                        &auth_tag,
-                        decrypted_chunk_blob,
-                        "",
-                        npub,
-                        key,
-                    );
-                    const encrypted_chunk_blob: []const u8 = encrypted_chunk_buffer[0..decrypted_chunk_blob.len];
-
-                    next_chunk_info = .{
-                        .chunk_blob_digest = undefined,
-                        .encryption = .{
-                            .tag = auth_tag,
-                            .npub = npub,
-                            .key = key,
-                        },
-                    };
-                    Sha256.hash(encrypted_chunk_blob, &next_chunk_info.chunk_blob_digest, .{});
-                    const chunk_name: *const [Sha256.digest_length]u8 = &next_chunk_info.chunk_blob_digest;
+                    const chunk_name = result.name;
+                    const encrypted_chunk_blob = result.encrypted;
 
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
@@ -438,8 +380,7 @@ pub fn PipeLine(
                             upload_size: u64,
 
                             const Inner = std.http.Client.Request.Writer;
-                            const Error = Inner.Error;
-                            fn write(self: @This(), bytes: []const u8) Error!usize {
+                            fn write(self: @This(), bytes: []const u8) Inner.Error!usize {
                                 const written = try self.inner.write(bytes);
                                 self.bytes_uploaded.* += written;
                                 self.up_ctx.update(@intCast((self.bytes_uploaded.* * 100) / self.upload_size));
@@ -481,11 +422,7 @@ pub fn PipeLine(
                     }
                 }
 
-                stored_file = .{
-                    .encryption = next_chunk_info.encryption,
-                    .first_name = next_chunk_info.chunk_blob_digest,
-                    .chunk_count = chunk_count,
-                };
+                stored_file = eci.storedFile();
             }
         }
     };

@@ -218,7 +218,6 @@ pub fn PipeLine(
 
                     break :blk dpp.queue.popValue() orelse {
                         dpp.queue_pop_re.reset();
-
                         if (dpp.must_stop.load(must_stop_load_mo)) break;
                         continue;
                     };
@@ -232,19 +231,18 @@ pub fn PipeLine(
                     dpp.ec.shardCount() - dpp.ec.shardsRequired(),
                 );
 
-                var current_chunk_info: chunk.Header.NextInfo = .{
+                var full_file_digest = [_]u8{0} ** Sha256.digest_length;
+                var current_chunk_info: chunk.ChunkRef = .{
                     .chunk_blob_digest = down_data.stored_file.first_name,
                     .encryption = down_data.stored_file.encryption,
                 };
-                var full_file_digest = [_]u8{0} ** Sha256.digest_length;
 
                 var chunks_encountered: chunk.Count = 0;
                 while (true) {
                     if (chunks_encountered == down_data.stored_file.chunk_count) {
                         if (!std.mem.allEqual(u8, &current_chunk_info.chunk_blob_digest, 0)) {
                             @panic("TODO handle: more chunks encountered than specified");
-                        }
-                        break;
+                        } else break;
                     }
                     chunks_encountered += 1;
 
@@ -258,7 +256,6 @@ pub fn PipeLine(
                             const gc_prealloc = dpp.gc_prealloc.?;
 
                             var iter = gc_prealloc.bucketObjectUriIterator(gc, &current_chunk_info.chunk_blob_digest);
-
                             while (iter.next()) |uri_str| : (current_index += 1) {
                                 if (excluded_index_set.isSet(current_index)) continue;
 
@@ -294,8 +291,7 @@ pub fn PipeLine(
                             down_ctx: Ctx,
 
                             const Inner = std.http.Client.Request.Reader;
-                            const Error = Inner.Error;
-                            fn read(self: @This(), buf: []u8) Error!usize {
+                            fn read(self: @This(), buf: []u8) Inner.Error!usize {
                                 const result = try self.inner.read(buf);
                                 return result;
                             }
