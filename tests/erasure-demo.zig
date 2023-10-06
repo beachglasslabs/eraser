@@ -35,7 +35,7 @@ pub fn main() !void {
     const data = cmds.data orelse return error.MissingDataFileName;
     const code = cmds.code orelse return error.MissingCodeDirName;
 
-    switch (cmds.w orelse .u64) {
+    switch (cmds.w orelse .u8) {
         inline else => |word| {
             const W = switch (word) {
                 .u8 => u8,
