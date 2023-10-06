@@ -5,6 +5,10 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const eraser = @import("eraser");
 
+pub const std_options = struct {
+    pub const log_level: std.log.Level = .debug;
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
@@ -83,33 +87,38 @@ pub fn main() !void {
     defer upload_pipeline.deinit(.finish_remaining_uploads);
     try upload_pipeline.start();
 
-    var download_pipeline: eraser.DownloadPipeLine(u8, std.fs.File.Writer) = undefined;
-    try download_pipeline.init(.{
+    var download_pipeline = try eraser.downloadPipeLine(u8, std.fs.File.Writer, .{
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
         .server_info = server_info,
     });
-    defer download_pipeline.deinit(.finish_remaining_uploads);
+    defer download_pipeline.deinit(.finish_remaining_downloads);
+    try download_pipeline.start();
 
     var line_buffer = std.ArrayList(u8).init(allocator);
     defer line_buffer.deinit();
 
     var prev_first_chunk_name: ?eraser.StoredFile = null;
 
+    const Command = enum {
+        q,
+        quit,
+
+        h,
+        help,
+
+        encode,
+        decode,
+    };
+
+    std.log.info("Available commands: {s}", .{comptime std.meta.fieldNames(Command)});
+
     while (true) {
         line_buffer.clearRetainingCapacity();
         try std.io.getStdIn().reader().streamUntilDelimiter(line_buffer.writer(), '\n', 1 << 21);
         var tokenizer = std.mem.tokenizeAny(u8, line_buffer.items, &std.ascii.whitespace);
 
-        const Command = enum {
-            help,
-            q,
-            quit,
-
-            encode,
-            decode,
-        };
         const cmd_str = tokenizer.next() orelse {
             std.log.err("Missing command", .{});
             continue;
@@ -120,8 +129,8 @@ pub fn main() !void {
             continue;
         };
         switch (cmd) {
-            .help => {
-                std.log.err("TODO: implement help cmd", .{});
+            .h, .help => {
+                std.log.info("Available commands: {s}", .{comptime std.meta.fieldNames(Command)});
                 continue;
             },
             .q, .quit => break,

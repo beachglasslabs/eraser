@@ -12,6 +12,14 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("../util.zig");
 
+pub inline fn pipeLine(
+    comptime W: type,
+    comptime DstWriter: type,
+    init_values: PipeLine(W, DstWriter).InitParams,
+) PipeLine(W, DstWriter).InitError!PipeLine(W, DstWriter) {
+    return PipeLine(W, DstWriter).init(init_values);
+}
+
 pub fn PipeLine(
     comptime W: type,
     /// `std.io.Writer(...)`
@@ -37,10 +45,10 @@ pub fn PipeLine(
 
         random: std.rand.Random,
         ec: ErasureCoder,
-        thread: std.Thread,
+        thread: ?std.Thread,
         const Self = @This();
 
-        const header_plus_chunk_max_size = chunk.size + chunk.Header.size;
+        const header_plus_chunk_max_size = chunk.Header.size + chunk.size;
 
         const ErasureCoder = erasure.Coder(W);
 
@@ -65,65 +73,56 @@ pub fn PipeLine(
             server_info: ServerInfo,
         };
 
-        pub fn init(
-            /// contents will be entirely oerwritten
-            self: *Self,
-            params: InitParams,
-        ) (std.mem.Allocator.Error || ErasureCoder.InitError || std.Thread.SpawnError)!void {
-            assert(params.queue_capacity != 0);
+        pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
+        pub fn init(params: InitParams) InitError!Self {
+            const gc_prealloc = if (params.server_info.google_cloud) |gc| try gc.preAllocated(params.allocator) else null;
+            errdefer if (gc_prealloc) |pre_alloc| pre_alloc.deinit(params.allocator);
 
-            self.* = .{
+            var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
+            errdefer queue.deinit(params.allocator);
+
+            const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
+            errdefer params.allocator.free(requests_buf);
+
+            const chunk_buffers = try params.allocator.create([2][header_plus_chunk_max_size]u8);
+            errdefer params.allocator.destroy(chunk_buffers);
+
+            const ec = try ErasureCoder.init(params.allocator, .{
+                .shard_count = @intCast(params.server_info.bucketCount()),
+                .shards_required = params.server_info.shards_required,
+            });
+            errdefer ec.deinit(params.allocator);
+
+            return .{
                 .allocator = params.allocator,
                 .server_info = params.server_info,
-                .gc_prealloc = null,
+                .gc_prealloc = gc_prealloc,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
-                .queue = undefined,
+                .queue = queue,
 
-                .requests_buf = &.{},
-                .chunk_buffers = undefined,
+                .requests_buf = requests_buf,
+                .chunk_buffers = chunk_buffers,
 
                 .random = params.random,
-                .ec = undefined,
-                .thread = undefined,
+                .ec = ec,
+                .thread = null,
             };
-
-            if (params.server_info.google_cloud) |gc| {
-                self.gc_prealloc = try gc.preAllocated(self.allocator);
-            }
-            errdefer if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
-
-            self.queue = try ManagedQueue(QueueItem).initCapacity(self.allocator, params.queue_capacity);
-            errdefer self.queue.deinit(self.allocator);
-
-            self.requests_buf = try self.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
-            errdefer self.allocator.free(self.requests_buf);
-
-            self.chunk_buffers = try self.allocator.create([2][header_plus_chunk_max_size]u8);
-            errdefer self.allocator.destroy(self.chunk_buffers);
-
-            self.ec = try ErasureCoder.init(self.allocator, .{
-                .shard_count = @intCast(params.server_info.bucketCount()),
-                .shards_required = params.server_info.shards_required,
-            });
-            errdefer self.ec.deinit(self.allocator);
-
-            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, downloadPipeLineThread, .{self});
         }
 
         pub fn deinit(
             self: *Self,
             remaining_queue_fate: enum {
-                finish_remaining_uploads,
-                cancel_remaining_uploads,
+                finish_remaining_downloads,
+                cancel_remaining_downloads,
             },
         ) void {
             self.must_stop.store(true, must_stop_store_mo);
             switch (remaining_queue_fate) {
-                .finish_remaining_uploads => {},
-                .cancel_remaining_uploads => {
+                .finish_remaining_downloads => {},
+                .cancel_remaining_downloads => {
                     self.queue_mtx.lock();
                     defer self.queue_mtx.unlock();
                     self.queue.clearItems();
@@ -131,7 +130,7 @@ pub fn PipeLine(
             }
 
             self.queue_pop_re.set();
-            self.thread.join();
+            if (self.thread) |thread| thread.join();
             self.queue.deinit(self.allocator);
 
             self.allocator.destroy(self.chunk_buffers);
@@ -139,6 +138,11 @@ pub fn PipeLine(
 
             self.ec.deinit(self.allocator);
             if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
+        }
+
+        pub inline fn start(self: *Self) std.Thread.SpawnError!void {
+            assert(self.thread == null);
+            self.thread = try std.Thread.spawn(.{ .allocator = self.allocator }, downloadPipeLineThread, .{self});
         }
 
         const DownloadParams = struct {
@@ -296,7 +300,7 @@ pub fn PipeLine(
                                 return result;
                             }
                         };
-                        pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.Error, ReaderCtx.read) {
+                        pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.Inner.Error, ReaderCtx.read) {
                             return .{ .context = .{
                                 .inner = ctx.requests[reader_idx].reader(),
                                 .down_ctx = ctx.down_ctx,

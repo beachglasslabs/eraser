@@ -12,6 +12,7 @@ pub const uploadPipeline = upload.pipeLine;
 pub const UploadPipeLine = upload.PipeLine;
 
 const download = @import("pipelines/download.zig");
+pub const downloadPipeLine = download.pipeLine;
 pub const DownloadPipeLine = download.PipeLine;
 
 comptime {
