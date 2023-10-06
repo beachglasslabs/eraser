@@ -5,12 +5,13 @@ pub fn build(b: *Build) void {
     // build options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const difftest_file_paths = b.option([]const []const u8, "dt", "List of paths of inputs to test") orelse &.{};
+    const difftest_file_paths: []const []const u8 = b.option([]const []const u8, "dt", "List of paths of inputs to test") orelse &.{};
 
-    const shard_count = b.option([]const u8, "shard-count", "Erasure shard count to specify for executables and tests");
-    const shards_required = b.option([]const u8, "shards-required", "Erasure shard size to specify for executables and tests");
+    const shard_count = b.option(u7, "shard-count", "Erasure shard count to specify for executables and tests");
+    const shards_required = b.option(u7, "shards-required", "Erasure shard size to specify for executables and tests");
     const word_size = b.option([]const u8, "word-size", "Erasure word size to specify for executables and tests");
     const confirm_clear_buckets = b.option(bool, "clear-buckets", "Confirm clearing all buckets of all objects (FOR TESTING PURPOSES ONLY).");
+    const difftest_rng_seed = b.option(u64, "dt-rng-seed", "Seed used for RNG");
 
     // top level steps
     const erasure_demo_step = b.step("erasure-demo", "Run the app");
@@ -68,28 +69,23 @@ pub fn build(b: *Build) void {
     const unit_tests_run = b.addRunArtifact(unit_test_exe);
     unit_test_step.dependOn(&unit_tests_run.step);
 
-    for (difftest_file_paths) |file_path| {
-        const input = Build.LazyPath.relative(file_path);
-        const output = encodeAndDecode(b, erasure_demo_exe, input, .{
-            .n = shard_count,
-            .k = shards_required,
-            .w = word_size,
-        });
+    const difftest_exe = b.addTest(.{
+        .name = "diff-test",
+        .root_source_file = Build.LazyPath.relative("tests/difftest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const difftest_build_options = b.addOptions();
+    difftest_exe.addOptions("build-options", difftest_build_options);
+    difftest_build_options.addOption([]const []const u8, "inputs", difftest_file_paths);
+    difftest_build_options.addOption(u7, "shard_count", shard_count orelse 6);
+    difftest_build_options.addOption(u7, "shards_required", shards_required orelse 3);
+    difftest_build_options.addOption(u64, "seed", difftest_rng_seed orelse 0xdeadbeef);
+    difftest_build_options.contents.writer().print("pub const Word: type = {};\n", .{std.zig.fmtId(word_size orelse "u8")}) catch |err| @panic(@errorName(err));
 
-        const difftest_exe = b.addTest(.{
-            .name = b.fmt("difftest__{s}", .{std.fs.path.basename(file_path)}),
-            .root_source_file = Build.LazyPath.relative("tests/difftest.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const paths = b.addOptions();
-        difftest_exe.addOptions("paths", paths);
-        paths.addOptionPath("input", input);
-        paths.addOptionPath("output", output);
-
-        const run_difftest_exe = b.addRunArtifact(difftest_exe);
-        difftest_step.dependOn(&run_difftest_exe.step);
-    }
+    difftest_exe.addModule("erasure", erasure_mod);
+    const difftest_run = b.addRunArtifact(difftest_exe);
+    difftest_step.dependOn(&difftest_run.step);
 
     clear_buckets_step.dependOn(step: {
         if (!(confirm_clear_buckets orelse false))
@@ -103,65 +99,6 @@ pub fn build(b: *Build) void {
         const clear_buckets_run = b.addRunArtifact(clear_buckets_exe);
         break :step &clear_buckets_run.step;
     });
-}
-
-inline fn encodeAndDecode(
-    b: *Build,
-    eraser_artifact: *Build.CompileStep,
-    input: Build.LazyPath,
-    options: struct {
-        n: ?[]const u8 = null,
-        k: ?[]const u8 = null,
-        w: ?[]const u8 = null,
-    },
-) Build.LazyPath {
-    // encode
-    const run_exe_difftest_encode = b.addRunArtifact(eraser_artifact);
-    run_exe_difftest_encode.addArg("encode");
-
-    run_exe_difftest_encode.addArg("--data");
-    run_exe_difftest_encode.addFileArg(input);
-
-    run_exe_difftest_encode.addArg("--code");
-    const difftest_output_dir = run_exe_difftest_encode.addOutputFileArg("output");
-
-    if (options.n) |n| {
-        run_exe_difftest_encode.addArg("-n");
-        run_exe_difftest_encode.addArg(n);
-    }
-    if (options.k) |k| {
-        run_exe_difftest_encode.addArg("-k");
-        run_exe_difftest_encode.addArg(k);
-    }
-    if (options.w) |w| {
-        run_exe_difftest_encode.addArg("-w");
-        run_exe_difftest_encode.addArg(w);
-    }
-
-    // decode
-    const run_exe_difftest_decode = b.addRunArtifact(eraser_artifact);
-    run_exe_difftest_decode.addArg("decode");
-
-    run_exe_difftest_decode.addArg("--data");
-    const output = run_exe_difftest_decode.addOutputFileArg("output.txt");
-
-    run_exe_difftest_decode.addArg("--code");
-    run_exe_difftest_decode.addDirectoryArg(difftest_output_dir);
-
-    if (options.n) |n| {
-        run_exe_difftest_decode.addArg("-n");
-        run_exe_difftest_decode.addArg(b.fmt("{d}", .{n}));
-    }
-    if (options.k) |k| {
-        run_exe_difftest_decode.addArg("-k");
-        run_exe_difftest_decode.addArg(b.fmt("{d}", .{k}));
-    }
-    if (options.w) |w| {
-        run_exe_difftest_decode.addArg("-w");
-        run_exe_difftest_decode.addArg(w);
-    }
-
-    return output;
 }
 
 fn failureStep(
