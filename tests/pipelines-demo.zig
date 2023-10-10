@@ -9,6 +9,21 @@ pub const std_options = struct {
     pub const log_level: std.log.Level = .debug;
 };
 
+const CmdArgs = struct {
+    gc_auth: ?eraser.SensitiveBytes,
+    aws_auth: ?eraser.SensitiveBytes,
+
+    pub fn parse(argv: []const []const u8) !CmdArgs {
+        var result: CmdArgs = .{
+            .gc_auth = null,
+            .aws_auth = null,
+        };
+        if (argv.len >= 1) result.gc_auth = eraser.SensitiveBytes.init(argv[0]);
+        if (argv.len >= 2) result.aws_auth = eraser.SensitiveBytes.init(argv[1]);
+        return result;
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
@@ -16,21 +31,36 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const gc_auth_token = try std.process.getEnvVarOwned(allocator, "ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY");
-    defer allocator.free(gc_auth_token);
+    const argv: []const [:0]const u8 = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, @ptrCast(argv));
+    std.log.info("{s}", .{argv[1..]});
+    const cmd_args = try CmdArgs.parse(argv[1..]);
 
     const server_info = eraser.ServerInfo{
-        .google_cloud = .{
-            .auth_token = eraser.SensitiveBytes.init(gc_auth_token),
+        .google_cloud = if (cmd_args.gc_auth) |auth_tok| .{
+            .auth_token = auth_tok,
             .bucket_names = &[_][]const u8{
-                "ec1.blocktube.net",
-                "ec2.blocktube.net",
-                "ec3.blocktube.net",
+                // "ec1.blocktube.net",
+                // "ec2.blocktube.net",
+                // "ec3.blocktube.net",
                 "ec4.blocktube.net",
                 "ec5.blocktube.net",
                 "ec6.blocktube.net",
             },
-        },
+        } else null,
+
+        .aws = if (cmd_args.aws_auth) |auth_tok| .{
+            .access_key = auth_tok,
+            .bucket_names = &[_][]const u8{
+                "ec7.blocktube.net",
+                "ec8.blocktube.net",
+                "ec9.blocktube.net",
+                // "ec10.blocktube.net",
+                // "ec11.blocktube.net",
+                // "ec12.blocktube.net",
+            },
+        } else null,
+
         .shards_required = 3,
     };
 

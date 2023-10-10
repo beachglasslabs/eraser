@@ -1,6 +1,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+comptime {
+    _ = buffer_backed_slices;
+}
+
 pub inline fn sliceBufferedWriter(inner: anytype, buf: []u8) SliceBufferedWriter(@TypeOf(inner)) {
     return .{ .inner = inner, .buf = buf };
 }
@@ -34,6 +38,29 @@ pub fn SliceBufferedWriter(comptime Inner: type) type {
             @memcpy(self.buf[self.end..new_end], bytes);
             self.end = new_end;
             return bytes.len;
+        }
+    };
+}
+
+pub inline fn hardCodeFmt(
+    comptime fmt_str: []const u8,
+    value: anytype,
+) HardCodeFmt(fmt_str, @TypeOf(value)) {
+    return .{ .value = value };
+}
+pub fn HardCodeFmt(comptime fmt_str: []const u8, comptime T: type) type {
+    return struct {
+        value: T,
+        const Self = @This();
+
+        pub fn format(
+            self: Self,
+            comptime alt_fmt_str: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) @TypeOf(writer).Error!void {
+            _ = alt_fmt_str;
+            try std.fmt.formatType(self.value, fmt_str, options, writer, std.fmt.default_max_depth);
         }
     };
 }

@@ -15,7 +15,7 @@ const usage =
     \\General Options:
     \\  -n                  code chunks in a block # default: 5
     \\  -k                  data chunks in a block # default: 3
-    \\  -w                  bytes in a word in a chunks (u8|u16|u32|u64) # default: u64
+    \\  -w                  bytes in a word in a chunks (u8|u16|u32)
     \\
     \\  --data              name of data fifo file
     \\  --code              prefix of code files
@@ -41,7 +41,6 @@ pub fn main() !void {
                 .u8 => u8,
                 .u16 => u16,
                 .u32 => u32,
-                .u64 => u64,
             };
 
             switch (cmds.verb) {
@@ -61,7 +60,7 @@ const Args = struct {
     w: ?Word = null,
 
     const Verb = enum { encode, decode };
-    const Word = enum { u8, u16, u32, u64 };
+    const Word = enum { u8, u16, u32 };
 };
 
 fn parseArgs(argv: []const []const u8) !Args {

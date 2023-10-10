@@ -24,6 +24,10 @@ pub const IndexSet = BinaryFieldMatrix.IndexSet;
 pub const ReadState = enum { done, in_progress };
 pub fn Coder(comptime T: type) type {
     assert(@typeInfo(T) == .Int);
+    switch (T) {
+        u8, u16, u32 => {},
+        else => unreachable,
+    }
     return struct {
         bf_mat: BinaryFieldMatrix,
         encoder_bf_mat_bin: BinaryFieldMatrix,
@@ -122,6 +126,10 @@ pub fn Coder(comptime T: type) type {
             return padded_len * ec.shardCount() / ec.shardsRequired();
         }
 
+        pub inline fn encodedSizePerShard(self: Self, data_len: anytype) u64 {
+            return self.totalEncodedSize(data_len) / self.shardCount();
+        }
+
         pub inline fn encode(
             self: Self,
             in_fifo_reader: anytype,
@@ -164,7 +172,7 @@ pub fn Coder(comptime T: type) type {
                     .write_buffer = write_buffer,
                 });
                 switch (rs) {
-                    .in_progress => size += calcDataBlockSize(calcChunkSize(word_size, self.exponent()), self.shardsRequired()),
+                    .in_progress => size += self.dataBlockSize(),
                     .done => {
                         var buffer = [_]u8{0} ** word_size;
                         std.mem.writeIntBig(T, &buffer, data_block[data_block.len - 1]);
@@ -261,37 +269,16 @@ pub fn readDataBlock(
     assert(block_buffer_bytes.len == data_block_size);
 
     const block_size: u8 = @intCast(try data_reader.readAll(block_buffer_bytes));
-    const last_incomplete_word_size = block_size % word_size;
-    const full_word_count = @divExact(block_size - last_incomplete_word_size, word_size);
-
-    const is_final_block = block_size < block_buffer_bytes.len;
-    if (is_final_block) {
-        if (last_incomplete_word_size != 0) {
-            const last = &block_buffer[full_word_count];
-            const last_bytes = std.mem.asBytes(last);
-            last_bytes[last_bytes.len - 1] = block_size;
-            switch (native_endian) {
-                .Big => {},
-                .Little => last.* = @byteSwap(last.*),
-            }
-        }
-        block_buffer_bytes[block_buffer_bytes.len - 1] = block_size;
-        switch (native_endian) {
-            .Big => {},
-            .Little => block_buffer[block_buffer.len - 1] = @byteSwap(block_buffer[block_buffer.len - 1]),
-        }
-    }
+    @memset(block_buffer_bytes[block_size..], block_size);
 
     switch (native_endian) {
         .Big => {},
         .Little => if (comptime word_size > 1) {
-            for (block_buffer[0..full_word_count]) |*word| {
-                word.* = @byteSwap(word.*);
-            }
+            for (block_buffer) |*word| word.* = @byteSwap(word.*);
         },
     }
 
-    if (is_final_block)
+    if (block_size < block_buffer_bytes.len)
         return .done;
     return .in_progress;
 }
@@ -481,14 +468,14 @@ inline fn calcCodeBlockSize(
     chunk_size: anytype,
     shard_count: u8,
 ) u8 {
-    return chunk_size * shard_count;
+    return @as(u8, chunk_size) * shard_count;
 }
 inline fn calcDataBlockSize(
     /// Size of each chunk, likely calculated using `calcChunkSize`.
     chunk_size: anytype,
     shards_required: u7,
 ) u8 {
-    return chunk_size * shards_required;
+    return @as(u8, chunk_size) * shards_required;
 }
 
 pub fn sampleIndexSet(
@@ -517,91 +504,110 @@ test Coder {
         "All your base are belong to us.",
         "All work and no play makes Jack a dull boy.",
         "Whoever fights monsters should see to it that in the process he does not become a monster.\nAnd if you gaze long enough into an abyss, the abyss will gaze back into you.\n",
+        comptime rand: {
+            var prng = std.rand.Sfc64.init(4312);
+            const random = prng.random();
+            var bytes: [2048]u8 = undefined;
+            @setEvalBranchQuota(bytes.len * 10);
+            random.bytes(&bytes);
+            break :rand &bytes;
+        },
     };
 
     var prng = std.rand.DefaultPrng.init(0xdeadbeef);
     var random = prng.random();
 
     for (test_data) |data| {
-        inline for ([_]type{ u8, u16, u32, u64 }) |T| {
-            const ec = try Coder(T).init(std.testing.allocator, .{
-                .shard_count = 6,
-                .shards_required = 3,
-            });
-            defer ec.deinit(std.testing.allocator);
+        inline for ([_]type{ u8, u16, u32 }) |T| {
+            for ([_]Coder(T).InitValues{
+                .{ .shard_count = 6, .shards_required = 3 },
+                .{ .shard_count = 5, .shards_required = 3 },
+                .{ .shard_count = 4, .shards_required = 3 },
+                .{ .shard_count = 4, .shards_required = 2 },
+                .{ .shard_count = 12, .shards_required = 8 },
+                .{ .shard_count = 12, .shards_required = 2 },
+            }) |distribution| {
+                errdefer std.log.err("Failed with T={}, {}, data='{s}'", .{ T, distribution, data });
 
-            const code_datas = try std.testing.allocator.alloc(std.ArrayListUnmanaged(u8), ec.shardCount());
-            @memset(code_datas, .{});
-            defer {
-                for (code_datas) |*code| code.deinit(std.testing.allocator);
-                std.testing.allocator.free(code_datas);
-            }
+                const ec = try Coder(T).init(std.testing.allocator, distribution);
+                defer ec.deinit(std.testing.allocator);
 
-            const actual_encoded_size: usize = encode: {
-                const WritersCtx = struct {
-                    allocator: std.mem.Allocator,
-                    code_datas: []std.ArrayListUnmanaged(u8),
-
-                    pub inline fn getWriter(ctx: @This(), idx: u7) std.ArrayListUnmanaged(u8).Writer {
-                        return ctx.code_datas[idx].writer(ctx.allocator);
-                    }
-                };
-                var data_in = std.io.fixedBufferStream(data);
-                const writers = WritersCtx{
-                    .allocator = std.testing.allocator,
-                    .code_datas = code_datas,
-                };
-                const actual_encoded_size = try ec.encodeCtx(data_in.reader(), writers, &.{});
-
-                var actual_total_encoded_size: u64 = 0;
-                for (writers.code_datas) |code| {
-                    actual_total_encoded_size += code.items.len;
+                const code_datas = try std.testing.allocator.alloc(std.ArrayListUnmanaged(u8), ec.shardCount());
+                @memset(code_datas, .{});
+                defer {
+                    for (code_datas) |*code| code.deinit(std.testing.allocator);
+                    std.testing.allocator.free(code_datas);
                 }
-                try std.testing.expectEqual(ec.totalEncodedSize(data.len), actual_total_encoded_size);
 
-                break :encode actual_encoded_size;
-            };
-            try std.testing.expectEqual(data.len, actual_encoded_size);
+                const actual_encoded_size: usize = encode: {
+                    const WritersCtx = struct {
+                        allocator: std.mem.Allocator,
+                        code_datas: []std.ArrayListUnmanaged(u8),
 
-            decode: {
-                const excluded_shards = sampleIndexSet(
-                    random,
-                    ec.shardCount(),
-                    ec.shardCount() - ec.shardsRequired(),
-                );
+                        pub inline fn getWriter(ctx: @This(), idx: u7) std.ArrayListUnmanaged(u8).Writer {
+                            return ctx.code_datas[idx].writer(ctx.allocator);
+                        }
+                    };
+                    var data_in = std.io.fixedBufferStream(data);
+                    const writers = WritersCtx{
+                        .allocator = std.testing.allocator,
+                        .code_datas = code_datas,
+                    };
+                    const actual_encoded_size = try ec.encodeCtx(data_in.reader(), writers, &.{});
 
-                const ReadersCtx = struct {
-                    excluded_shards: IndexSet,
-                    code_datas: []std.ArrayListUnmanaged(u8),
-
-                    pub inline fn getReader(ctx: @This(), idx: u7) Reader {
-                        const abs_idx = ctx.excluded_shards.absoluteFromExclusiveSubIndex(idx);
-                        return .{ .context = &ctx.code_datas[abs_idx] };
+                    const expected_total_encoded_size = ec.totalEncodedSize(data.len);
+                    var actual_total_encoded_size: u64 = 0;
+                    for (writers.code_datas) |code| {
+                        actual_total_encoded_size += code.items.len;
+                        try std.testing.expectEqual(ec.encodedSizePerShard(data.len), code.items.len);
                     }
 
-                    const Reader = std.io.Reader(*std.ArrayListUnmanaged(u8), error{}, @This().read);
-                    fn read(list: *std.ArrayListUnmanaged(u8), buf: []u8) error{}!usize {
-                        const amt = @min(list.items.len, buf.len);
-                        @memcpy(buf[0..amt], list.items[0..amt]);
-                        std.mem.copyForwards(u8, list.items, list.items[amt..]);
-                        list.shrinkRetainingCapacity(list.items.len - amt);
-                        return amt;
-                    }
+                    try std.testing.expectEqual(expected_total_encoded_size, actual_total_encoded_size);
+
+                    break :encode actual_encoded_size;
                 };
-                const readers_ctx = ReadersCtx{
-                    .excluded_shards = excluded_shards,
-                    .code_datas = code_datas,
-                };
+                try std.testing.expectEqual(data.len, actual_encoded_size);
 
-                var decoded_data = std.ArrayList(u8).init(std.testing.allocator);
-                defer decoded_data.deinit();
+                decode: {
+                    const excluded_shards = sampleIndexSet(
+                        random,
+                        ec.shardCount(),
+                        ec.shardCount() - ec.shardsRequired(),
+                    );
 
-                const decoded_size = try ec.decodeCtx(excluded_shards, decoded_data.writer(), readers_ctx);
-                try std.testing.expectEqual(actual_encoded_size, decoded_size);
-                try std.testing.expectEqual(decoded_size, decoded_data.items.len);
+                    const ReadersCtx = struct {
+                        excluded_shards: IndexSet,
+                        code_datas: []std.ArrayListUnmanaged(u8),
 
-                try std.testing.expectEqualStrings(data, decoded_data.items);
-                break :decode;
+                        pub inline fn getReader(ctx: @This(), idx: u7) Reader {
+                            const abs_idx = ctx.excluded_shards.absoluteFromExclusiveSubIndex(idx);
+                            return .{ .context = &ctx.code_datas[abs_idx] };
+                        }
+
+                        const Reader = std.io.Reader(*std.ArrayListUnmanaged(u8), error{}, @This().read);
+                        fn read(list: *std.ArrayListUnmanaged(u8), buf: []u8) error{}!usize {
+                            const amt = @min(list.items.len, buf.len);
+                            @memcpy(buf[0..amt], list.items[0..amt]);
+                            std.mem.copyForwards(u8, list.items, list.items[amt..]);
+                            list.shrinkRetainingCapacity(list.items.len - amt);
+                            return amt;
+                        }
+                    };
+                    const readers_ctx = ReadersCtx{
+                        .excluded_shards = excluded_shards,
+                        .code_datas = code_datas,
+                    };
+
+                    var decoded_data = std.ArrayList(u8).init(std.testing.allocator);
+                    defer decoded_data.deinit();
+
+                    const decoded_size = try ec.decodeCtx(excluded_shards, decoded_data.writer(), readers_ctx);
+                    try std.testing.expectEqual(actual_encoded_size, decoded_size);
+                    try std.testing.expectEqual(decoded_size, decoded_data.items.len);
+
+                    try std.testing.expectEqualStrings(data, decoded_data.items);
+                    break :decode;
+                }
             }
         }
     }

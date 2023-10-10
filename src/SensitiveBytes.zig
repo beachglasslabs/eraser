@@ -7,11 +7,11 @@ const SensitiveBytes = @This();
 pointer: [*]const u8,
 length: usize,
 
-pub fn init(slice: []const u8) SensitiveBytes {
+pub inline fn init(slice: []const u8) SensitiveBytes {
     return .{ .pointer = slice.ptr, .length = slice.len };
 }
 
-pub fn getSensitiveSlice(self: SensitiveBytes) []const u8 {
+pub inline fn getSensitiveSlice(self: SensitiveBytes) []const u8 {
     return self.pointer[0..self.length];
 }
 

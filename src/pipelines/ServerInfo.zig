@@ -21,5 +21,8 @@ pub inline fn bucketCount(server_info: ServerInfo) usize {
     if (server_info.google_cloud) |gcloud| {
         result += gcloud.bucket_names.len;
     }
+    if (server_info.aws) |aws| {
+        result += aws.bucket_names.len;
+    }
     return result;
 }

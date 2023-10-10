@@ -35,14 +35,15 @@ pub fn PipeLine(
         //! explicitly stated otherwise in the field's doc comment.
 
         allocator: std.mem.Allocator,
-        server_info: ServerInfo,
-        gc_prealloc: ?ServerInfo.GoogleCloud.PreAllocated,
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
+        server_info: ServerInfo,
+
+        request_uris_buf: []u8,
         requests_buf: []std.http.Client.Request,
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
@@ -56,10 +57,19 @@ pub fn PipeLine(
         const header_plus_chunk_max_size = chunk.size + chunk.Header.size;
 
         const ErasureCoder = erasure.Coder(W);
-        const QueueItem = struct {
-            ctx: Ctx,
-            src: Src,
-            full_size: u64,
+        const QueueItem = union(enum) {
+            file: Upload,
+            update: Update,
+
+            const Upload = struct {
+                ctx: Ctx,
+                src: Src,
+                full_size: u64,
+            };
+            const Update = struct {
+                gc_auth: ?eraser.SensitiveBytes,
+                aws_auth: ?eraser.SensitiveBytes,
+            };
         };
 
         // TODO: should this use a more strict memory order?
@@ -79,11 +89,14 @@ pub fn PipeLine(
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
         pub fn init(params: InitParams) InitError!Self {
-            const gc_prealloc = if (params.server_info.google_cloud) |gc| try gc.preAllocated(params.allocator) else null;
-            errdefer if (gc_prealloc) |pre_alloc| pre_alloc.deinit(params.allocator);
-
             var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
             errdefer queue.deinit(params.allocator);
+
+            const request_uris_buf: []u8 = if (params.server_info.google_cloud) |gc|
+                try params.allocator.alloc(u8, gc.totalObjectUrisByteCount())
+            else
+                &.{};
+            errdefer params.allocator.free(request_uris_buf);
 
             const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
             errdefer params.allocator.free(requests_buf);
@@ -99,14 +112,15 @@ pub fn PipeLine(
 
             return .{
                 .allocator = params.allocator,
-                .server_info = params.server_info,
-                .gc_prealloc = gc_prealloc,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
                 .queue = queue,
 
+                .server_info = params.server_info,
+
+                .request_uris_buf = request_uris_buf,
                 .requests_buf = requests_buf,
                 .chunk_buffers = chunk_buffers,
 
@@ -144,9 +158,9 @@ pub fn PipeLine(
 
             self.allocator.destroy(self.chunk_buffers);
             self.allocator.free(self.requests_buf);
+            self.allocator.free(self.request_uris_buf);
 
             self.ec.deinit(self.allocator);
-            if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
         const UploadParams = struct {
@@ -159,7 +173,7 @@ pub fn PipeLine(
             /// the size will be determined during this function call.
             full_size: ?u64 = null,
         };
-        pub inline fn uploadFile(
+        pub fn uploadFile(
             self: *Self,
             ctx_ptr: anytype,
             params: UploadParams,
@@ -185,14 +199,28 @@ pub fn PipeLine(
             };
 
             try src.seekableStream().seekTo(0);
-            self.queue_mtx.lock();
-            defer self.queue_mtx.unlock();
-            self.queue_pop_re.set();
-            try self.queue.pushValue(self.allocator, QueueItem{
+            try self.pushToQueue(.{ .file = .{
                 .ctx = ctx,
                 .src = src,
                 .full_size = full_size,
-            });
+            } });
+        }
+
+        pub inline fn updateState(
+            self: *Self,
+            update: QueueItem.Update,
+        ) std.mem.Allocator.Error!void {
+            return self.pushToQueue(.{ .update = update });
+        }
+
+        inline fn pushToQueue(
+            self: *Self,
+            item: QueueItem,
+        ) std.mem.Allocator.Error!void {
+            self.queue_mtx.lock();
+            defer self.queue_mtx.unlock();
+            self.queue_pop_re.set();
+            return self.queue.pushValue(self.allocator, item);
         }
 
         const Ctx = struct {
@@ -268,7 +296,7 @@ pub fn PipeLine(
             } = .{ .random = upp.random };
 
             while (true) {
-                const up_data: QueueItem = blk: {
+                const queue_item: QueueItem = blk: {
                     upp.queue_pop_re.wait();
 
                     upp.queue_mtx.lock();
@@ -281,18 +309,35 @@ pub fn PipeLine(
                     };
                 };
 
-                const up_ctx = up_data.ctx;
-                const chunk_count = chunk.countForFileSize(up_data.full_size);
+                const upload: QueueItem.Upload = switch (queue_item) {
+                    .file => |file| file,
+                    .update => |update| {
+                        if (update.gc_auth) |auth_tok| {
+                            if (upp.server_info.google_cloud) |*gc| {
+                                gc.auth_token = auth_tok;
+                            }
+                        }
+                        if (update.aws_auth) |auth_tok| {
+                            if (upp.server_info.aws) |*aws| {
+                                aws.access_key = auth_tok;
+                            }
+                        }
+                        continue;
+                    },
+                };
 
-                const reader = up_data.src.reader();
-                const seeker = up_data.src.seekableStream();
+                const up_ctx = upload.ctx;
+                const chunk_count = chunk.countForFileSize(upload.full_size);
+
+                const reader = upload.src.reader();
+                const seeker = upload.src.seekableStream();
 
                 var stored_file: ?StoredFile = null;
 
                 defer {
                     up_ctx.update(100);
                     up_ctx.close(
-                        up_data.src,
+                        upload.src,
                         if (stored_file) |*ptr| ptr else null,
                     );
                 }
@@ -325,7 +370,7 @@ pub fn PipeLine(
 
                 var bytes_uploaded: u64 = 0;
                 const upload_size = upp.ec.totalEncodedSize(
-                    chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
+                    chunk_count * @as(u64, chunk.Header.size) + upload.full_size,
                 );
 
                 while (true) {
@@ -342,13 +387,25 @@ pub fn PipeLine(
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = upp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 
-                    if (upp.server_info.google_cloud) |gc| {
-                        const gc_prealloc = upp.gc_prealloc.?;
+                    var gc_headers = std.http.Headers.init(upp.allocator);
+                    defer gc_headers.deinit();
+                    gc_headers.owned = true;
 
-                        var iter = gc_prealloc.bucketObjectUriIterator(gc, chunk_name);
+                    if (upp.server_info.google_cloud) |gc| {
+                        gc_headers.append("Authorization", &gc.authorizationValue()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
+                        gc_headers.append(
+                            "Content-Length",
+                            (util.boundedFmt(
+                                "{d}",
+                                .{upp.ec.encodedSizePerShard(encrypted_chunk_blob.len)},
+                                .{std.math.maxInt(u64)},
+                            ) catch unreachable).constSlice(),
+                        ) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
+
+                        var iter = gc.objectUriIterator(chunk_name, upp.request_uris_buf);
                         while (iter.next()) |uri_str| {
                             const uri = std.Uri.parse(uri_str) catch unreachable;
-                            const req = client.request(.PUT, uri, gc_prealloc.headers.toManaged(upp.allocator), .{}) catch |err| switch (err) {
+                            const req = client.request(.PUT, uri, gc_headers, .{}) catch |err| switch (err) {
                                 error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                 inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                             };

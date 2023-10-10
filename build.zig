@@ -39,10 +39,10 @@ pub fn build(b: *Build) void {
     erasure_demo_exe.addModule("erasure", erasure_mod);
 
     const erasure_demo_run = b.addRunArtifact(erasure_demo_exe);
-    erasure_demo_run.has_side_effects = true; // tell zig we want to run this every time
-    erasure_demo_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| erasure_demo_run.addArgs(args);
     erasure_demo_step.dependOn(&erasure_demo_run.step);
+    erasure_demo_run.step.dependOn(b.getInstallStep());
+    erasure_demo_run.stdio = .inherit;
+    if (b.args) |args| erasure_demo_run.addArgs(args);
 
     const pipeline_demo_exe = b.addExecutable(.{
         .name = "pipelines-demo",
@@ -55,11 +55,10 @@ pub fn build(b: *Build) void {
 
     const pipeline_demo_run = b.addRunArtifact(pipeline_demo_exe);
     pipeline_demo_step.dependOn(&pipeline_demo_run.step);
+    pipeline_demo_run.step.dependOn(b.getInstallStep());
     pipeline_demo_run.stdio = .inherit;
-
-    if (b.option([]const u8, "gc-auth-key", "Google cloud auth key")) |auth_key| {
-        pipeline_demo_run.setEnvironmentVariable("ZIG_TEST_GOOGLE_CLOUD_AUTH_KEY", auth_key);
-    }
+    if (b.option([]const u8, "gc-auth-tok", "Google cloud auth token")) |auth_tok| pipeline_demo_run.addArg(auth_tok);
+    if (b.option([]const u8, "aws-auth-tok", "AWS auth token")) |auth_tok| pipeline_demo_run.addArg(auth_tok);
 
     const unit_test_exe = b.addTest(.{
         .root_source_file = Build.LazyPath.relative("src/pipelines.zig"),

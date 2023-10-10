@@ -30,15 +30,16 @@ pub fn PipeLine(
         //! explicitly stated otherwise in the field's doc comment.
 
         allocator: std.mem.Allocator,
-        requests_buf: []std.http.Client.Request,
-        server_info: ServerInfo,
-        gc_prealloc: ?ServerInfo.GoogleCloud.PreAllocated,
 
         must_stop: std.atomic.Atomic(bool),
         queue_mtx: std.Thread.Mutex,
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
+        server_info: ServerInfo,
+
+        request_uris_buf: []u8,
+        requests_buf: []std.http.Client.Request,
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
         chunk_buffers: *[2][header_plus_chunk_max_size]u8,
@@ -75,11 +76,14 @@ pub fn PipeLine(
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
         pub fn init(params: InitParams) InitError!Self {
-            const gc_prealloc = if (params.server_info.google_cloud) |gc| try gc.preAllocated(params.allocator) else null;
-            errdefer if (gc_prealloc) |pre_alloc| pre_alloc.deinit(params.allocator);
-
             var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
             errdefer queue.deinit(params.allocator);
+
+            const request_uris_buf: []u8 = if (params.server_info.google_cloud) |gc|
+                try params.allocator.alloc(u8, gc.totalObjectUrisByteCount())
+            else
+                &.{};
+            errdefer params.allocator.free(request_uris_buf);
 
             const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
             errdefer params.allocator.free(requests_buf);
@@ -96,13 +100,13 @@ pub fn PipeLine(
             return .{
                 .allocator = params.allocator,
                 .server_info = params.server_info,
-                .gc_prealloc = gc_prealloc,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
                 .queue = queue,
 
+                .request_uris_buf = request_uris_buf,
                 .requests_buf = requests_buf,
                 .chunk_buffers = chunk_buffers,
 
@@ -135,9 +139,9 @@ pub fn PipeLine(
 
             self.allocator.destroy(self.chunk_buffers);
             self.allocator.free(self.requests_buf);
+            self.allocator.free(self.request_uris_buf);
 
             self.ec.deinit(self.allocator);
-            if (self.gc_prealloc) |pre_alloc| pre_alloc.deinit(self.allocator);
         }
 
         pub inline fn start(self: *Self) std.Thread.SpawnError!void {
@@ -253,23 +257,37 @@ pub fn PipeLine(
                     var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
                     defer for (requests.slice()) |*req| req.deinit();
 
+                    var gc_headers = std.http.Headers.init(dpp.allocator);
+                    defer gc_headers.deinit();
+                    gc_headers.owned = true;
+
+                    var aws_headers = std.http.Headers.init(dpp.allocator);
+                    defer aws_headers.deinit();
+                    aws_headers.owned = true;
+
                     { // populate `requests`
                         var current_index: u8 = 0;
 
                         if (dpp.server_info.google_cloud) |gc| {
-                            const gc_prealloc = dpp.gc_prealloc.?;
+                            const authval = gc.authorizationValue();
+                            gc_headers.append("Authorization", &authval) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
-                            var iter = gc_prealloc.bucketObjectUriIterator(gc, &current_chunk_info.chunk_blob_digest);
+                            var iter = gc.objectUriIterator(&current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
                             while (iter.next()) |uri_str| : (current_index += 1) {
                                 if (excluded_index_set.isSet(current_index)) continue;
 
                                 const uri = std.Uri.parse(uri_str) catch unreachable;
-                                const req = client.request(.GET, uri, gc_prealloc.headers.toManaged(dpp.allocator), .{}) catch |err| switch (err) {
+                                const req = client.request(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
                                 requests.appendAssumingCapacity(req);
                             }
+                        }
+
+                        if (dpp.server_info.aws) |aws| {
+                            _ = aws;
+                            @panic("TODO");
                         }
                     }
 
