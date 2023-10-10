@@ -1,5 +1,3 @@
-const HeadersUnmanaged = @import("../../HeadersUnmanaged.zig");
-
 const pipelines = @import("../../pipelines.zig");
 const digestBytesToString = pipelines.digestBytesToString;
 

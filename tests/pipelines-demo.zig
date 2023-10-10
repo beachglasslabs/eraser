@@ -33,7 +33,6 @@ pub fn main() !void {
 
     const argv: []const [:0]const u8 = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, @ptrCast(argv));
-    std.log.info("{s}", .{argv[1..]});
     const cmd_args = try CmdArgs.parse(argv[1..]);
 
     const server_info = eraser.ServerInfo{
