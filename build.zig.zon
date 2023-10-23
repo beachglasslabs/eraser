@@ -1,4 +1,11 @@
 .{
     .name = "eraser",
     .version = "0.0.1",
+    .paths = .{ "src", "build.zig" },
+    .dependencies = .{
+        .@"zig-aws-s3" = .{
+            .url = "https://github.com/beachglasslabs/zig-aws-s3/archive/f28fab57c9c7111c940e749c808789f22f8f9665.tar.gz",
+            .hash = "1220a553a40e2632050df2209a228fa1e75e2a765c378e88518114321390211c76b1",
+        },
+    },
 }

@@ -10,16 +10,19 @@ pub const std_options = struct {
 };
 
 const CmdArgs = struct {
-    gc_auth: ?eraser.SensitiveBytes,
-    aws_auth: ?eraser.SensitiveBytes,
+    gc_auth: ?eraser.SensitiveBytes.Fixed(eraser.ServerInfo.GoogleCloud.auth_token_len),
+    aws: ?noreturn,
 
     pub fn parse(argv: []const []const u8) !CmdArgs {
         var result: CmdArgs = .{
             .gc_auth = null,
-            .aws_auth = null,
+            .aws = null,
         };
-        if (argv.len >= 1) result.gc_auth = eraser.SensitiveBytes.init(argv[0]);
-        if (argv.len >= 2) result.aws_auth = eraser.SensitiveBytes.init(argv[1]);
+        if (argv.len >= 1) result.gc_auth = eraser.SensitiveBytes.init(argv[0]).toFixedLen(eraser.ServerInfo.GoogleCloud.auth_token_len) orelse return error.BadGcAuthKey;
+        // if (argv.len >= 3) result.aws = .{
+        //     .auth = eraser.SensitiveBytes.init(argv[1]).toFixedLen(eraser.ServerInfo.Aws.access_key_id_len) orelse return error.BadAwsAuth,
+        //     .auth_sec = eraser.SensitiveBytes.init(argv[2]).toFixedLen(eraser.ServerInfo.Aws.secret_access_key_len) orelse return error.BadSecretAwsAuth,
+        // };
         return result;
     }
 };
@@ -39,26 +42,16 @@ pub fn main() !void {
         .google_cloud = if (cmd_args.gc_auth) |auth_tok| .{
             .auth_token = auth_tok,
             .bucket_names = &[_][]const u8{
-                // "ec1.blocktube.net",
-                // "ec2.blocktube.net",
-                // "ec3.blocktube.net",
+                "ec1.blocktube.net",
+                "ec2.blocktube.net",
+                "ec3.blocktube.net",
                 "ec4.blocktube.net",
                 "ec5.blocktube.net",
                 "ec6.blocktube.net",
             },
         } else null,
 
-        .aws = if (cmd_args.aws_auth) |auth_tok| .{
-            .access_key = auth_tok,
-            .bucket_names = &[_][]const u8{
-                "ec7.blocktube.net",
-                "ec8.blocktube.net",
-                "ec9.blocktube.net",
-                // "ec10.blocktube.net",
-                // "ec11.blocktube.net",
-                // "ec12.blocktube.net",
-            },
-        } else null,
+        .aws = null,
 
         .shards_required = 3,
     };

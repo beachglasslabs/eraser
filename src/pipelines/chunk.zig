@@ -21,6 +21,8 @@ pub inline fn startOffset(chunk_idx: Count) u64 {
     return (@as(u64, chunk_idx) * size);
 }
 
+pub const name_len = Sha256.digest_length;
+
 pub const Header = struct {
     version: Version = Version.latest,
     /// Represents the SHA of the current chunk's unencrypted data.
@@ -276,7 +278,7 @@ pub fn EncryptedChunkIterator(
 
         pub const NextResult = struct {
             /// The name of the encrypted chunk
-            name: *const [Sha256.digest_length]u8,
+            name: *const [chunk.name_len]u8,
             /// The encrypted data
             encrypted: []const u8,
         };

@@ -1,8 +1,56 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-comptime {
-    _ = buffer_backed_slices;
+pub inline fn srcFmt(src: std.builtin.SourceLocation) SrcFmt {
+    return .{ .src = src };
+}
+pub const SrcFmt = struct {
+    src: std.builtin.SourceLocation,
+    pub fn format(
+        self: SrcFmt,
+        comptime fmt_str: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        const mention_fn = comptime std.mem.indexOfScalar(u8, fmt_str, 'f') != null;
+        _ = options;
+        try writer.print("{s}:{d}:{d}", .{ self.src.file, self.src.line, self.src.column });
+        if (mention_fn) try writer.print(" ({s})", .{self.src.fn_name});
+    }
+};
+
+pub inline fn initNoDefault(comptime T: type, full_init: anytype) T {
+    const FullInit = @TypeOf(full_init);
+    comptime assert(T != FullInit);
+
+    const t_fields = @typeInfo(T).Struct.fields;
+    const init_fields = @typeInfo(FullInit).Struct.fields;
+
+    comptime switch (std.math.order(t_fields.len, init_fields.len)) {
+        .eq => {},
+        .lt => {
+            var msg: []const u8 = "";
+            for (init_fields) |field| {
+                if (@hasField(T, field.name)) continue;
+                msg = msg ++ @typeName(T) ++ " has no field named '" ++ field.name ++ "'\n";
+            }
+            @compileError(msg);
+        },
+        .gt => {
+            var msg: []const u8 = "";
+            for (t_fields) |field| {
+                if (@hasField(FullInit, field.name)) continue;
+                msg = msg ++ "Missing field init for '" ++ field.name ++ "'\n";
+            }
+            @compileError(msg);
+        },
+    };
+
+    var result: T = undefined;
+    inline for (t_fields) |field| {
+        @field(result, field.name) = @field(full_init, field.name);
+    }
+    return result;
 }
 
 pub inline fn sliceBufferedWriter(inner: anytype, buf: []u8) SliceBufferedWriter(@TypeOf(inner)) {
@@ -65,6 +113,50 @@ pub fn HardCodeFmt(comptime fmt_str: []const u8, comptime T: type) type {
     };
 }
 
+pub inline fn lowerCaseFmt(string: []const u8) LowerCaseFmt {
+    return .{ .string = string };
+}
+pub const LowerCaseFmt = struct {
+    string: []const u8,
+
+    pub fn format(
+        self: LowerCaseFmt,
+        comptime fmt_str: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        _ = options;
+        _ = fmt_str;
+        try writeLowerCaseString(writer, self.string);
+    }
+};
+
+pub fn writeLowerCaseString(writer: anytype, bytes: []const u8) @TypeOf(writer).Error!void {
+    if (bytes.len == 0) return;
+
+    var i: usize = 0;
+    if (comptime std.simd.suggestVectorSize(u8)) |vec_len| {
+        while (i + vec_len <= bytes.len) : (i += vec_len) {
+            const Vec = @Vector(vec_len, u8);
+            var vec: Vec = bytes[i..][0..vec_len].*;
+
+            var uppers: @Vector(vec_len, u1) = .{1} ** vec_len;
+            uppers &= @bitCast(vec >= @as(Vec, @splat('A')));
+            uppers &= @bitCast(vec <= @as(Vec, @splat('Z')));
+
+            vec = @select(u8, @as(@Vector(vec_len, bool), @bitCast(uppers)), vec | @as(Vec, @splat(0b00100000)), vec);
+            try writer.writeAll(&@as([vec_len]u8, vec));
+        }
+    }
+
+    for (bytes[i..]) |c| {
+        try writer.writeByte(std.ascii.toLower(c));
+    }
+}
+
+comptime {
+    _ = buffer_backed_slices;
+}
 pub const buffer_backed_slices = struct {
     pub fn SliceLengths(comptime S: type) type {
         return Impl(S).Lengths;
@@ -334,6 +426,16 @@ pub const empty_allocator = std.mem.Allocator{
     },
 };
 
+pub fn fixedLenFmt(
+    comptime fmt_str: []const u8,
+    args: anytype,
+    comptime reference_args: @TypeOf(args),
+) error{ Overflow, Underflow }![std.fmt.count(fmt_str, reference_args)]u8 {
+    const bounded = try boundedFmt(fmt_str, args, reference_args);
+    if (bounded.len != bounded.buffer.len) return error.Underflow;
+    return bounded.constSlice()[0..bounded.buffer.len].*;
+}
+
 pub fn boundedFmt(
     comptime fmt_str: []const u8,
     args: anytype,
@@ -482,6 +584,25 @@ pub fn BoundedBufferArrayAligned(comptime T: type, comptime alignment: comptime_
         }
         fn appendWrite(self: *Self, bytes: []const u8) error{Overflow}!usize {
             try self.appendSlice(bytes);
+            return bytes.len;
+        }
+    };
+}
+
+pub inline fn hasherWriter(hasher: anytype) HasherWriter(@TypeOf(hasher.*)).Writer {
+    return .{ .context = .{ .hasher = hasher } };
+}
+
+pub fn HasherWriter(comptime Hasher: type) type {
+    return struct {
+        hasher: *Hasher,
+        const Self = @This();
+
+        pub const Writer = std.io.Writer(Self, Self.Error, Self.write);
+
+        const Error = error{};
+        fn write(self: Self, bytes: []const u8) Error!usize {
+            self.hasher.update(bytes);
             return bytes.len;
         }
     };

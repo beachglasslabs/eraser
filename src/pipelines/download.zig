@@ -52,16 +52,20 @@ pub fn PipeLine(
         const header_plus_chunk_max_size = chunk.Header.size + chunk.size;
 
         const ErasureCoder = erasure.Coder(W);
+        const QueueItem = union(enum) {
+            download: Download,
+            auth_update: ServerInfo.AuthUpdate,
+
+            const Download = struct {
+                ctx: Ctx,
+                stored_file: eraser.StoredFile,
+                writer: DstWriter,
+            };
+        };
 
         // TODO: should this use a more strict memory order?
         const must_stop_store_mo: std.builtin.AtomicOrder = .Monotonic;
         const must_stop_load_mo: std.builtin.AtomicOrder = .Monotonic;
-
-        const QueueItem = struct {
-            ctx: Ctx,
-            stored_file: eraser.StoredFile,
-            writer: DstWriter,
-        };
 
         pub const InitParams = struct {
             /// should be a thread-safe allocator
@@ -160,14 +164,28 @@ pub fn PipeLine(
             ctx_ptr: anytype,
             params: DownloadParams,
         ) !void {
+            return self.pushToQueue(.{ .download = .{
+                .ctx = Ctx.init(ctx_ptr),
+                .stored_file = params.stored_file.*,
+                .writer = params.writer,
+            } });
+        }
+
+        pub inline fn updateAuth(
+            self: *Self,
+            auth_update: ServerInfo.AuthUpdate,
+        ) std.mem.Allocator.Error!void {
+            return self.pushToQueue(.{ .auth_update = auth_update });
+        }
+
+        inline fn pushToQueue(
+            self: *Self,
+            item: QueueItem,
+        ) std.mem.Allocator.Error!void {
             self.queue_mtx.lock();
             defer self.queue_mtx.unlock();
             self.queue_pop_re.set();
-            try self.queue.pushValue(self.allocator, QueueItem{
-                .ctx = Ctx.init(ctx_ptr),
-                .writer = params.writer,
-                .stored_file = params.stored_file.*,
-            });
+            return self.queue.pushValue(self.allocator, item);
         }
 
         const Ctx = struct {
@@ -218,7 +236,7 @@ pub fn PipeLine(
             const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &dpp.chunk_buffers[1];
 
             while (true) {
-                const down_data: QueueItem = blk: {
+                const queue_item: QueueItem = blk: {
                     dpp.queue_pop_re.wait();
 
                     dpp.queue_mtx.lock();
@@ -229,6 +247,14 @@ pub fn PipeLine(
                         if (dpp.must_stop.load(must_stop_load_mo)) break;
                         continue;
                     };
+                };
+
+                const down_data: QueueItem.Download = switch (queue_item) {
+                    .download => |download| download,
+                    .auth_update => |auth_update| {
+                        dpp.server_info.updateAuth(auth_update);
+                        continue;
+                    },
                 };
                 const down_ctx = down_data.ctx;
                 defer down_ctx.close(down_data.writer);
@@ -261,10 +287,6 @@ pub fn PipeLine(
                     defer gc_headers.deinit();
                     gc_headers.owned = true;
 
-                    var aws_headers = std.http.Headers.init(dpp.allocator);
-                    defer aws_headers.deinit();
-                    aws_headers.owned = true;
-
                     { // populate `requests`
                         var current_index: u8 = 0;
 
@@ -292,7 +314,7 @@ pub fn PipeLine(
                     }
 
                     for (requests.slice()) |*req| {
-                        req.start() catch |err| switch (err) {
+                        req.start(.{}) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         req.finish() catch |err| switch (err) {

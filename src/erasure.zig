@@ -183,6 +183,32 @@ pub fn Coder(comptime T: type) type {
             }
             return size;
         }
+        /// Encode only a single shard, discarding the rest of
+        /// the corresponding data acquired from `reader`.
+        pub fn encodeOneShard(
+            self: Self,
+            /// `std.io.Reader(...)`
+            reader: anytype,
+            /// Which shard to encode
+            writer_idx: u7,
+            /// `std.io.Writer(...)`
+            writer: anytype,
+        ) !void {
+            const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(self.shardCount(), self.shardsRequired()) catch unreachable;
+            while (true) {
+                const data_block = self.block_buffer;
+                const rs = try readDataBlock(T, data_block, reader);
+                try writeCodeBlockShard(T, writer_idx, writer, .{
+                    .exp = exp,
+                    .encoder = self.encoder_bf_mat_bin,
+                    .data_block = data_block,
+                });
+                switch (rs) {
+                    .in_progress => {},
+                    .done => break,
+                }
+            }
+        }
 
         pub inline fn decode(
             self: Self,
@@ -304,21 +330,38 @@ pub fn writeCodeBlock(
         const out_index: u7 = @intCast(out_index_uncasted);
         const current_writer = out_fifos.getWriter(out_index);
         var buffered = util.sliceBufferedWriter(current_writer, values.write_buffer);
-        for (out_index * exp..(out_index + 1) * exp) |row_uncasted| {
-            const row: u8 = @intCast(row_uncasted);
-
-            var value: Word = 0;
-            for (values.encoder.getRow(row), 0..values.encoder.numCols()) |col_val, col_uncasted| {
-                const col_idx: u8 = @intCast(col_uncasted);
-                assert(col_val == 0 or col_val == 1);
-                value ^= values.data_block[col_idx] * col_val;
-            }
-
-            const word_size = @sizeOf(Word);
-            const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
-            try buffered.writer().writeAll(&word);
-        }
+        try writeCodeBlockShard(Word, out_index, buffered.writer(), .{
+            .exp = exp,
+            .encoder = values.encoder,
+            .data_block = values.data_block,
+        });
         try buffered.flush();
+    }
+}
+
+pub fn writeCodeBlockShard(
+    comptime Word: type,
+    writer_idx: u7,
+    writer: anytype,
+    values: struct {
+        exp: galois.BinaryField.Exp,
+        encoder: BinaryFieldMatrix,
+        data_block: []const Word,
+    },
+) !void {
+    for (writer_idx * values.exp..(writer_idx + 1) * values.exp) |row_uncasted| {
+        const row: u8 = @intCast(row_uncasted);
+
+        var value: Word = 0;
+        for (values.encoder.getRow(row), 0..values.encoder.numCols()) |col_val, col_uncasted| {
+            const col_idx: u8 = @intCast(col_uncasted);
+            assert(col_val == 0 or col_val == 1);
+            value ^= values.data_block[col_idx] * col_val;
+        }
+
+        const word_size = @sizeOf(Word);
+        const word: [word_size]u8 = @bitCast(std.mem.nativeToBig(Word, value));
+        try writer.writeAll(&word);
     }
 }
 
