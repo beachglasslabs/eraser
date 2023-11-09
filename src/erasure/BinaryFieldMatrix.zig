@@ -3,7 +3,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const util = @import("../util.zig");
+const util = @import("util");
 const galois = @import("galois.zig");
 const Matrix = @import("Matrix.zig");
 const mulWide = std.math.mulWide;

@@ -1,7 +1,7 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
-const ServerInfo = @import("ServerInfo.zig");
+const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const EncryptedFile = eraser.StoredFile;
 
@@ -10,7 +10,7 @@ const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
-const util = @import("../util.zig");
+const util = @import("util");
 
 pub inline fn pipeLine(
     comptime W: type,
@@ -36,25 +36,23 @@ pub fn PipeLine(
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
-        server_info: ServerInfo,
+        server_info: Providers,
 
         request_uris_buf: []u8,
         requests_buf: []std.http.Client.Request,
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
-        chunk_buffers: *[2][header_plus_chunk_max_size]u8,
+        chunk_buffers: *[2][chunk.total_size]u8,
 
         random: std.rand.Random,
         ec: ErasureCoder,
         thread: ?std.Thread,
         const Self = @This();
 
-        const header_plus_chunk_max_size = chunk.Header.size + chunk.size;
-
         const ErasureCoder = erasure.Coder(W);
         const QueueItem = union(enum) {
             download: Download,
-            auth_update: ServerInfo.AuthUpdate,
+            auth_update: noreturn,
 
             const Download = struct {
                 ctx: Ctx,
@@ -75,7 +73,7 @@ pub fn PipeLine(
             /// initial capacity of the queue
             queue_capacity: usize,
             /// server provider configuration
-            server_info: ServerInfo,
+            server_info: Providers,
         };
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
@@ -84,7 +82,7 @@ pub fn PipeLine(
             errdefer queue.deinit(params.allocator);
 
             const request_uris_buf: []u8 = if (params.server_info.google_cloud) |gc|
-                try params.allocator.alloc(u8, gc.totalObjectUrisByteCount())
+                try params.allocator.alloc(u8, gc.objectUriIteratorBufferSize())
             else
                 &.{};
             errdefer params.allocator.free(request_uris_buf);
@@ -92,7 +90,7 @@ pub fn PipeLine(
             const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
             errdefer params.allocator.free(requests_buf);
 
-            const chunk_buffers = try params.allocator.create([2][header_plus_chunk_max_size]u8);
+            const chunk_buffers = try params.allocator.create([2][chunk.total_size]u8);
             errdefer params.allocator.destroy(chunk_buffers);
 
             const ec = try ErasureCoder.init(params.allocator, .{
@@ -171,13 +169,6 @@ pub fn PipeLine(
             } });
         }
 
-        pub inline fn updateAuth(
-            self: *Self,
-            auth_update: ServerInfo.AuthUpdate,
-        ) std.mem.Allocator.Error!void {
-            return self.pushToQueue(.{ .auth_update = auth_update });
-        }
-
         inline fn pushToQueue(
             self: *Self,
             item: QueueItem,
@@ -232,8 +223,8 @@ pub fn PipeLine(
             var client = std.http.Client{ .allocator = dpp.allocator };
             defer client.deinit();
 
-            const decrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &dpp.chunk_buffers[0];
-            const encrypted_chunk_buffer: *[header_plus_chunk_max_size]u8 = &dpp.chunk_buffers[1];
+            const decrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[0];
+            const encrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[1];
 
             while (true) {
                 const queue_item: QueueItem = blk: {
@@ -252,8 +243,8 @@ pub fn PipeLine(
                 const down_data: QueueItem.Download = switch (queue_item) {
                     .download => |download| download,
                     .auth_update => |auth_update| {
-                        dpp.server_info.updateAuth(auth_update);
-                        continue;
+                        _ = auth_update;
+                        @panic("TODO");
                     },
                 };
                 const down_ctx = down_data.ctx;
@@ -290,16 +281,16 @@ pub fn PipeLine(
                     { // populate `requests`
                         var current_index: u8 = 0;
 
-                        if (dpp.server_info.google_cloud) |gc| {
-                            const authval = gc.authorizationValue();
-                            gc_headers.append("Authorization", &authval) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
+                        if (dpp.server_info.google_cloud) |gc| gc_blk: {
+                            const authval = gc.authorizationValue() orelse break :gc_blk;
+                            gc_headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
                             var iter = gc.objectUriIterator(&current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
                             while (iter.next()) |uri_str| : (current_index += 1) {
                                 if (excluded_index_set.isSet(current_index)) continue;
 
                                 const uri = std.Uri.parse(uri_str) catch unreachable;
-                                const req = client.request(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
+                                const req = client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
@@ -314,7 +305,7 @@ pub fn PipeLine(
                     }
 
                     for (requests.slice()) |*req| {
-                        req.start(.{}) catch |err| switch (err) {
+                        req.send(.{ .raw_uri = true }) catch |err| switch (err) {
                             inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         };
                         req.finish() catch |err| switch (err) {

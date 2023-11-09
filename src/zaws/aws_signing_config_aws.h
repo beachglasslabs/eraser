@@ -19,7 +19,7 @@ struct zig_aws_signing_config_aws_bytes {
 };
 
 // mirrors the fields of the actual `aws_signing_config_aws`,
-// in order to initialise the opaque bag of bytes.
+// in order to initialize the opaque bag of bytes.
 struct zig_aws_signing_config_aws_wrapper {
     enum aws_signing_config_type config_type;
     enum aws_signing_algorithm algorithm;
@@ -40,7 +40,12 @@ struct zig_aws_signing_config_aws_wrapper {
     struct aws_credentials_provider *credentials_provider;
     uint64_t expiration_in_seconds;
 };
-void zig_aws_s3_init_signing_config(
+void zig_aws_s3_signing_config_wrapper_to_bytes(
     struct zig_aws_signing_config_aws_bytes *const sc,
-    struct zig_aws_signing_config_aws_wrapper const *const init
+    struct zig_aws_signing_config_aws_wrapper const *const wrapper
+);
+
+void zig_aws_s3_signing_config_bytes_to_wrapper(
+    struct zig_aws_signing_config_aws_wrapper *const wrapper,
+    struct zig_aws_signing_config_aws_bytes const *const sc
 );

@@ -19,35 +19,37 @@ pub const SrcFmt = struct {
     }
 };
 
-pub inline fn initNoDefault(comptime T: type, full_init: anytype) T {
-    const FullInit = @TypeOf(full_init);
-    comptime assert(T != FullInit);
+pub inline fn initNoDefault(
+    comptime T: type,
+    full_init: FullInit: {
+        const info = switch (@typeInfo(T)) {
+            .Struct => |info| info,
+            else => break :FullInit T,
+        };
 
-    const t_fields = @typeInfo(T).Struct.fields;
-    const init_fields = @typeInfo(FullInit).Struct.fields;
+        var new_fields: [info.fields.len]std.builtin.Type.StructField = info.fields[0..].*;
+        @setEvalBranchQuota(new_fields.len + 100);
+        inline for (&new_fields) |*field| {
+            if (field.is_comptime) continue;
+            field.default_value = null;
+        }
 
-    comptime switch (std.math.order(t_fields.len, init_fields.len)) {
-        .eq => {},
-        .lt => {
-            var msg: []const u8 = "";
-            for (init_fields) |field| {
-                if (@hasField(T, field.name)) continue;
-                msg = msg ++ @typeName(T) ++ " has no field named '" ++ field.name ++ "'\n";
-            }
-            @compileError(msg);
-        },
-        .gt => {
-            var msg: []const u8 = "";
-            for (t_fields) |field| {
-                if (@hasField(FullInit, field.name)) continue;
-                msg = msg ++ "Missing field init for '" ++ field.name ++ "'\n";
-            }
-            @compileError(msg);
-        },
+        var new_info = info;
+        new_info.fields = &new_fields;
+        new_info.decls = &.{};
+        break :FullInit @Type(.{ .Struct = new_info });
+    },
+) T {
+    const fields = switch (@typeInfo(T)) {
+        .Struct => |info| info.fields,
+        inline else => |_, tag| @compileError(
+            "Expected struct, got " ++ @typeName(T) ++ "', which is a '" ++ @tagName(tag) ++ "'",
+        ),
     };
 
     var result: T = undefined;
-    inline for (t_fields) |field| {
+    @setEvalBranchQuota(fields.len + 100);
+    inline for (fields) |field| {
         @field(result, field.name) = @field(full_init, field.name);
     }
     return result;
@@ -174,9 +176,21 @@ pub const buffer_backed_slices = struct {
         lengths: SliceLengths(S),
     ) S {
         const I = Impl(S);
-        const offsets_and_size = I.calcBufferOffsetsAndSize(lengths);
-        assert(buf.len == offsets_and_size[1]);
-        return I.fromBufferImpl(buf, lengths, offsets_and_size[0]);
+        const offsets, const buffer_size = I.calcBufferOffsetsAndSize(lengths);
+        assert(buf.len == buffer_size);
+        return I.fromBufferImpl(buf, lengths, offsets);
+    }
+
+    /// Appends the backing buffer to the array list, and returns the buffer struct.
+    pub inline fn fromArrayList(
+        comptime S: type,
+        array_list: *std.ArrayListAligned(u8, bufferAlignment(S)),
+        lengths: SliceLengths(S),
+    ) std.mem.Allocator.Error!S {
+        const I = Impl(S);
+        const offsets, const buffer_size = I.calcBufferOffsetsAndSize(lengths);
+        try array_list.resize(buffer_size);
+        return I.fromBufferImpl(array_list.items, lengths, offsets);
     }
 
     pub inline fn fromAlloc(
@@ -186,9 +200,7 @@ pub const buffer_backed_slices = struct {
     ) std.mem.Allocator.Error!struct { S, []align(bufferAlignment(S)) u8 } {
         const I = Impl(S);
 
-        const offsets_and_size = I.calcBufferOffsetsAndSize(lengths);
-        const offsets: I.Offsets = offsets_and_size[0];
-        const buffer_size = offsets_and_size[1];
+        const offsets, const buffer_size = I.calcBufferOffsetsAndSize(lengths);
 
         const alloc = try allocator.alignedAlloc(u8, I.max_align, buffer_size);
         errdefer allocator.free(alloc);
@@ -205,11 +217,11 @@ pub const buffer_backed_slices = struct {
 
                 var offset: usize = 0;
                 inline for (ordered_ids) |id| {
-                    const info = fields[@intFromEnum(id)];
-                    const pointer = @typeInfo(info.type).Pointer;
+                    const field_info = fields[@intFromEnum(id)];
+                    const pointer = @typeInfo(field_info.type).Pointer;
                     offset = std.mem.alignForward(usize, offset, pointer.alignment);
-                    @field(offsets, info.name) = offset;
-                    offset += @sizeOf(pointer.child) * @field(lengths, info.name);
+                    @field(offsets, field_info.name) = offset;
+                    offset += @sizeOf(pointer.child) * @field(lengths, field_info.name);
                 }
 
                 return .{ offsets, offset };
@@ -237,7 +249,8 @@ pub const buffer_backed_slices = struct {
                 return result;
             }
 
-            const fields = @typeInfo(S).Struct.fields;
+            const info = @typeInfo(S).Struct;
+            const fields = info.fields;
             const FieldId = std.meta.FieldEnum(S);
 
             const Offsets = std.enums.EnumFieldStruct(FieldId, usize, null);
@@ -267,7 +280,7 @@ pub const buffer_backed_slices = struct {
                 }
                 break :blk .{
                     .layout = .Auto,
-                    .is_tuple = false,
+                    .is_tuple = info.is_tuple,
                     .backing_integer = null,
                     .decls = &.{},
                     .fields = &new_fields,
@@ -301,6 +314,60 @@ pub const buffer_backed_slices = struct {
         };
     }
 };
+
+pub fn MetadataBasedAllocHelpers(comptime mem_align: comptime_int) type {
+    return struct {
+        pub const alignment = mem_align;
+        pub const Metadata = extern struct {
+            size: usize,
+
+            pub const padded_size = std.mem.alignForward(usize, @sizeOf(Metadata), alignment);
+
+            pub inline fn backingAllocation(md: *align(alignment) Metadata) []align(alignment) u8 {
+                const base_ptr: [*]align(alignment) u8 = @alignCast(@ptrCast(md));
+                return base_ptr[0 .. Metadata.padded_size + md.size];
+            }
+        };
+
+        pub inline fn getMetadata(ptr: [*]align(alignment) u8) *align(alignment) Metadata {
+            const base_ptr = ptr - Metadata.padded_size;
+            return std.mem.bytesAsValue(Metadata, base_ptr[0..@sizeOf(Metadata)]);
+        }
+
+        pub fn alloc(ally: std.mem.Allocator, size: usize) ?[*]align(alignment) u8 {
+            if (size == 0) return null;
+            const aligned_len = Metadata.padded_size + size;
+            const allocation = ally.alignedAlloc(u8, alignment, aligned_len) catch return null;
+            std.mem.bytesAsValue(Metadata, allocation[0..@sizeOf(Metadata)]).* = .{
+                .size = size,
+            };
+            return allocation[Metadata.padded_size..].ptr;
+        }
+
+        pub fn realloc(ally: std.mem.Allocator, old_ptr: [*]align(alignment) u8, new_size: usize) ?[*]align(alignment) u8 {
+            const old_metadata = getMetadata(old_ptr);
+            const old_allocation = old_metadata.backingAllocation();
+
+            if (new_size == 0) {
+                ally.free(old_allocation);
+                return null;
+            }
+
+            const new_allocation = ally.realloc(old_allocation, Metadata.padded_size + new_size) catch return null;
+            const new_metadata = std.mem.bytesAsValue(Metadata, new_allocation[0..@sizeOf(Metadata)]);
+            new_metadata.* = .{
+                .size = new_size,
+            };
+            return new_allocation[Metadata.padded_size..].ptr;
+        }
+
+        pub fn free(ally: std.mem.Allocator, ptr: [*]align(alignment) u8) void {
+            const metadata = getMetadata(ptr);
+            const allocation = metadata.backingAllocation();
+            ally.free(allocation);
+        }
+    };
+}
 
 pub const InlineSlicer = struct {
     Elem: type,

@@ -3,22 +3,32 @@ const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
-const util = @import("../util.zig");
+const util = @import("util");
 const pipelines = @import("../pipelines.zig");
 const digestBytesToString = pipelines.digestBytesToString;
 const digestStringToBytes = pipelines.digestStringToBytes;
 
 const chunk = @This();
 
-pub const size: comptime_int = 15 * bytes_per_megabyte;
+/// Size of the entire chunk, header and data together.
+pub const total_size: comptime_int = Header.size + data_size;
+
+/// Size of the data after the header.
+pub const data_size: comptime_int = 15 * bytes_per_megabyte;
+
 const bytes_per_megabyte = 1_000_000;
 
-pub const Count = std.math.IntFittingRange(1, std.math.divCeil(u64, std.math.maxInt(u64), chunk.size) catch unreachable);
+pub const Count = std.math.IntFittingRange(1, std.math.divCeil(u64, std.math.maxInt(u64), chunk.data_size) catch unreachable);
+
+/// The number of chunks required to represent a file of size `file_size`.
 pub inline fn countForFileSize(file_size: u64) Count {
-    return @intCast(std.math.divCeil(u64, file_size, chunk.size) catch unreachable);
+    return @intCast(std.math.divCeil(u64, file_size, chunk.data_size) catch unreachable);
 }
+
+/// The starting offset in bytes of the chunk of index `chunk_idx`.
+/// The first chunk is at the start offset 0.
 pub inline fn startOffset(chunk_idx: Count) u64 {
-    return (@as(u64, chunk_idx) * size);
+    return @as(u64, chunk_idx) * data_size;
 }
 
 pub const name_len = Sha256.digest_length;
@@ -110,13 +120,12 @@ pub const Version = extern struct {
     major: u16,
     minor: u16,
     patch: u16,
-
-    comptime {
-        assert(@sizeOf(Version) == @sizeOf([3]u16));
-    }
-
     const latest: Version = .{ .major = 0, .minor = 0, .patch = 0 };
+
     pub const size = @sizeOf(Version);
+    comptime {
+        assert(size == @sizeOf([3]u16));
+    }
 
     pub fn order(self: Version, other: Version) std.math.Order {
         const major = std.math.order(self.major, other.major);
@@ -246,7 +255,7 @@ pub inline fn encryptedChunkIterator(
         chunk_count: chunk.Count,
         /// decrypted_chunk_buffer = &buffer[0]
         /// encrypted_chunk_buffer = &buffer[1]
-        buffers: *[2][Header.size + chunk.size]u8,
+        buffers: *[2][Header.size + chunk.data_size]u8,
     },
 ) EncryptedChunkIterator(@TypeOf(reader), @TypeOf(seeker)) {
     return .{
@@ -270,7 +279,7 @@ pub fn EncryptedChunkIterator(
         reader: Reader,
         seeker: SeekableStream,
         full_file_digest: [Sha256.digest_length]u8,
-        buffers: *[2][Header.size + chunk.size]u8,
+        buffers: *[2][Header.size + chunk.data_size]u8,
         chunk_count: chunk.Count,
         chunk_idx: chunk.Count,
         next_chunk_info: chunk.ChunkRef,
@@ -291,8 +300,8 @@ pub fn EncryptedChunkIterator(
                 key: *const [Aes256Gcm.key_length]u8,
             },
         ) (Reader.Error || SeekableStream.SeekError)!?NextResult {
-            const decrypted_chunk_buffer: *[Header.size + chunk.size]u8 = &self.buffers[0];
-            const encrypted_chunk_buffer: *[Header.size + chunk.size]u8 = &self.buffers[1];
+            const decrypted_chunk_buffer: *[Header.size + chunk.data_size]u8 = &self.buffers[0];
+            const encrypted_chunk_buffer: *[Header.size + chunk.data_size]u8 = &self.buffers[1];
 
             if (self.chunk_idx == 0) return null;
             self.chunk_idx -= 1;
@@ -301,7 +310,7 @@ pub fn EncryptedChunkIterator(
 
             const decrypted_chunk_blob = blk: {
                 const header_buffer: *[chunk.Header.size]u8 = decrypted_chunk_buffer[0..chunk.Header.size];
-                const data_buffer: *[chunk.size]u8 = decrypted_chunk_buffer[header_buffer.len..];
+                const data_buffer: *[chunk.data_size]u8 = decrypted_chunk_buffer[header_buffer.len..];
                 self.seeker.seekTo(offset) catch |err| switch (err) {
                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                 };

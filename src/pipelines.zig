@@ -5,7 +5,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const chunk = @import("pipelines/chunk.zig");
 pub const erasure = @import("erasure.zig");
 pub const SensitiveBytes = @import("SensitiveBytes.zig");
-pub const ServerInfo = @import("pipelines/ServerInfo.zig");
+pub const Providers = @import("pipelines/Providers.zig");
 
 const upload = @import("pipelines/upload.zig");
 pub const uploadPipeline = upload.pipeLine;
@@ -19,7 +19,7 @@ comptime {
     _ = chunk;
     _ = erasure;
     _ = SensitiveBytes;
-    _ = ServerInfo;
+    _ = Providers;
     _ = upload;
     _ = download;
 }

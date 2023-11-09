@@ -5,29 +5,41 @@
 typedef struct zig_aws_signing_config_aws_bytes wrapped;
 typedef struct aws_signing_config_aws unwrapped;
 
-// initialisation
-void zig_aws_s3_init_signing_config(
+#define SIGNING_CONFIG_ASSIGN(dst, src) \
+    (dst)->config_type                     = (src)->config_type;                     \
+    (dst)->algorithm                       = (src)->algorithm;                       \
+    (dst)->signature_type                  = (src)->signature_type;                  \
+    (dst)->region                          = (src)->region;                          \
+    (dst)->service                         = (src)->service;                         \
+    (dst)->date                            = (src)->date;                            \
+    (dst)->should_sign_header              = (src)->should_sign_header;              \
+    (dst)->should_sign_header_ud           = (src)->should_sign_header_ud;           \
+                                                                                     \
+    (dst)->flags.use_double_uri_encode     = (src)->flags.use_double_uri_encode;     \
+    (dst)->flags.should_normalize_uri_path = (src)->flags.should_normalize_uri_path; \
+    (dst)->flags.omit_session_token        = (src)->flags.omit_session_token;        \
+                                                                                     \
+    (dst)->signed_body_value               = (src)->signed_body_value;               \
+    (dst)->signed_body_header              = (src)->signed_body_header;              \
+    (dst)->credentials                     = (src)->credentials;                     \
+    (dst)->credentials_provider            = (src)->credentials_provider;            \
+    (dst)->expiration_in_seconds           = (src)->expiration_in_seconds;
+
+void zig_aws_s3_signing_config_wrapper_to_bytes(
     struct zig_aws_signing_config_aws_bytes *const sc_w,
-    struct zig_aws_signing_config_aws_wrapper const *const init
+    struct zig_aws_signing_config_aws_wrapper const *const wrapper
 ) {
     unwrapped *const sc = (unwrapped *)sc_w->bytes;
     AWS_ZERO_STRUCT(*sc);
-    sc->config_type = init->config_type;
-    sc->algorithm = init->algorithm;
-    sc->signature_type = init->signature_type;
-    sc->region = init->region;
-    sc->service = init->service;
-    sc->date = init->date;
-    sc->should_sign_header = init->should_sign_header;
-    sc->should_sign_header_ud = init->should_sign_header_ud;
-
-    sc->flags.use_double_uri_encode = init->flags.use_double_uri_encode;
-    sc->flags.should_normalize_uri_path = init->flags.should_normalize_uri_path;
-    sc->flags.omit_session_token = init->flags.omit_session_token;
-
-    sc->signed_body_value = init->signed_body_value;
-    sc->signed_body_header = init->signed_body_header;
-    sc->credentials = init->credentials;
-    sc->credentials_provider = init->credentials_provider;
-    sc->expiration_in_seconds = init->expiration_in_seconds;
+    SIGNING_CONFIG_ASSIGN(sc, wrapper);
 }
+
+void zig_aws_s3_signing_config_bytes_to_wrapper(
+    struct zig_aws_signing_config_aws_wrapper *const wrapper,
+    struct zig_aws_signing_config_aws_bytes const *const sc_w
+) {
+    unwrapped const *const sc = (unwrapped *)sc_w->bytes;
+    AWS_ZERO_STRUCT(*wrapper);
+    SIGNING_CONFIG_ASSIGN(wrapper, sc);
+}
+

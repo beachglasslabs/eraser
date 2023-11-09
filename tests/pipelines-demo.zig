@@ -9,49 +9,38 @@ pub const std_options = struct {
     pub const log_level: std.log.Level = .debug;
 };
 
-const CmdArgs = struct {
-    gc_auth: ?eraser.SensitiveBytes.Fixed(eraser.ServerInfo.GoogleCloud.auth_token_len),
-    aws: ?noreturn,
-
-    pub fn parse(argv: []const []const u8) !CmdArgs {
-        var result: CmdArgs = .{
-            .gc_auth = null,
-            .aws = null,
-        };
-        if (argv.len >= 1) result.gc_auth = eraser.SensitiveBytes.init(argv[0]).toFixedLen(eraser.ServerInfo.GoogleCloud.auth_token_len) orelse return error.BadGcAuthKey;
-        // if (argv.len >= 3) result.aws = .{
-        //     .auth = eraser.SensitiveBytes.init(argv[1]).toFixedLen(eraser.ServerInfo.Aws.access_key_id_len) orelse return error.BadAwsAuth,
-        //     .auth_sec = eraser.SensitiveBytes.init(argv[2]).toFixedLen(eraser.ServerInfo.Aws.secret_access_key_len) orelse return error.BadSecretAwsAuth,
-        // };
-        return result;
-    }
-};
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
+        .stack_trace_frames = 32,
     }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const argv: []const [:0]const u8 = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, @ptrCast(argv));
-    const cmd_args = try CmdArgs.parse(argv[1..]);
-
-    const server_info = eraser.ServerInfo{
-        .google_cloud = if (cmd_args.gc_auth) |auth_tok| .{
-            .auth_token = auth_tok,
+    const server_info = eraser.Providers{
+        .google_cloud = .{
+            .auth_token = null,
             .bucket_names = &[_][]const u8{
                 "ec1.blocktube.net",
                 "ec2.blocktube.net",
                 "ec3.blocktube.net",
-                "ec4.blocktube.net",
-                "ec5.blocktube.net",
-                "ec6.blocktube.net",
+                // "ec4.blocktube.net",
+                // "ec5.blocktube.net",
+                // "ec6.blocktube.net",
             },
-        } else null,
+        },
 
-        .aws = null,
+        .aws = .{
+            .region = .{ .geo = "us".*, .cardinal = .east, .number = 1 },
+            .buckets = &.{
+                .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec7.blocktube.net" },
+                .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec8.blocktube.net" },
+                .{ .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 }, .name = "ec9.blocktube.net" },
+                // .{ .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 }, .name = "ec10.blocktube.net" },
+                // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec11.blocktube.net" },
+                // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec12.blocktube.net" },
+            },
+        },
 
         .shards_required = 3,
     };
@@ -132,6 +121,9 @@ pub fn main() !void {
 
         encode,
         decode,
+
+        @"auth-aws",
+        @"auth-gc",
     };
 
     std.log.info("Available commands: {s}", .{comptime std.meta.fieldNames(Command)});
@@ -302,6 +294,52 @@ pub fn main() !void {
                 wait_ctx.close_re.wait();
                 root_node.end();
                 wait_ctx.close_re.reset();
+            },
+            .@"auth-gc" => {
+                const auth_token = tokenizer.next() orelse {
+                    std.log.err("Missing auth token", .{});
+                    continue;
+                };
+                const GoogleCloud = eraser.Providers.GoogleCloud;
+                try upload_pipeline.updateAuth(.{
+                    .gc = eraser.SensitiveBytes.Bounded(GoogleCloud.max_auth_token_len).init(auth_token) orelse {
+                        std.log.err("Bad auth token", .{});
+                        continue;
+                    },
+                    .aws = null,
+                });
+            },
+            .@"auth-aws" => {
+                const access_key_id = tokenizer.next() orelse {
+                    std.log.err("Missing access key id", .{});
+                    continue;
+                };
+                const secret_access_key = tokenizer.next() orelse {
+                    std.log.err("Missing secret access key", .{});
+                    continue;
+                };
+                const session_token = tokenizer.next() orelse {
+                    std.log.err("Missing session token", .{});
+                    continue;
+                };
+                const Aws = eraser.Providers.Aws;
+                try upload_pipeline.updateAuth(.{
+                    .gc = null,
+                    .aws = .{
+                        .access_key_id = eraser.SensitiveBytes.Fixed(Aws.access_key_id_len).init(access_key_id) orelse {
+                            std.log.err("Bad access key id", .{});
+                            continue;
+                        },
+                        .secret_access_key = eraser.SensitiveBytes.Fixed(Aws.secret_access_key_len).init(secret_access_key) orelse {
+                            std.log.err("Bad secret access key", .{});
+                            continue;
+                        },
+                        .session_token = eraser.SensitiveBytes.Fixed(Aws.session_token_len).init(session_token) orelse {
+                            std.log.err("Bad session token", .{});
+                            continue;
+                        },
+                    },
+                });
             },
         }
     }

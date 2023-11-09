@@ -7,7 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mulWide = std.math.mulWide;
 
-const util = @import("util.zig");
+const util = @import("util");
 
 comptime {
     if (@import("builtin").is_test) {
@@ -175,7 +175,7 @@ pub fn Coder(comptime T: type) type {
                     .in_progress => size += self.dataBlockSize(),
                     .done => {
                         var buffer = [_]u8{0} ** word_size;
-                        std.mem.writeIntBig(T, &buffer, data_block[data_block.len - 1]);
+                        std.mem.writeInt(T, &buffer, data_block[data_block.len - 1], .big);
                         size += buffer[buffer.len - 1];
                         break;
                     },
@@ -198,8 +198,9 @@ pub fn Coder(comptime T: type) type {
             while (true) {
                 const data_block = self.block_buffer;
                 const rs = try readDataBlock(T, data_block, reader);
-                try writeCodeBlockShard(T, writer_idx, writer, .{
+                try writeCodeBlockShard(T, writer, .{
                     .exp = exp,
+                    .writer_idx = writer_idx,
                     .encoder = self.encoder_bf_mat_bin,
                     .data_block = data_block,
                 });
@@ -298,8 +299,8 @@ pub fn readDataBlock(
     @memset(block_buffer_bytes[block_size..], block_size);
 
     switch (native_endian) {
-        .Big => {},
-        .Little => if (comptime word_size > 1) {
+        .big => {},
+        .little => if (comptime word_size > 1) {
             for (block_buffer) |*word| word.* = @byteSwap(word.*);
         },
     }
@@ -326,13 +327,14 @@ pub fn writeCodeBlock(
     const exp: galois.BinaryField.Exp = calcGaloisFieldExponent(values.shard_count, values.shards_required) catch unreachable;
     assert(@divExact(values.data_block.len, values.shards_required) == exp);
 
-    for (0..values.shard_count) |out_index_uncasted| {
-        const out_index: u7 = @intCast(out_index_uncasted);
-        const current_writer = out_fifos.getWriter(out_index);
+    for (0..values.shard_count) |writer_idx_uncasted| {
+        const writer_idx: u7 = @intCast(writer_idx_uncasted);
+        const current_writer = out_fifos.getWriter(writer_idx);
         var buffered = util.sliceBufferedWriter(current_writer, values.write_buffer);
-        try writeCodeBlockShard(Word, out_index, buffered.writer(), .{
+        try writeCodeBlockShard(Word, buffered.writer(), .{
             .exp = exp,
-            .encoder = values.encoder,
+            .writer_idx = writer_idx,
+            .encoder = values.encoder.matrix,
             .data_block = values.data_block,
         });
         try buffered.flush();
@@ -341,20 +343,24 @@ pub fn writeCodeBlock(
 
 pub fn writeCodeBlockShard(
     comptime Word: type,
-    writer_idx: u7,
     writer: anytype,
     values: struct {
         exp: galois.BinaryField.Exp,
-        encoder: BinaryFieldMatrix,
+        writer_idx: u7,
+        encoder: Matrix,
         data_block: []const Word,
     },
 ) !void {
-    for (writer_idx * values.exp..(writer_idx + 1) * values.exp) |row_uncasted| {
+    const exp = values.exp;
+    const writer_idx = values.writer_idx;
+    const encoder = values.encoder;
+
+    for (writer_idx * exp..(writer_idx + 1) * exp) |row_uncasted| {
         const row: u8 = @intCast(row_uncasted);
 
         var value: Word = 0;
-        for (values.encoder.getRow(row), 0..values.encoder.numCols()) |col_val, col_uncasted| {
-            const col_idx: u8 = @intCast(col_uncasted);
+        for (encoder.getRow(row), 0..encoder.numCols()) |col_val, col_idx_uncasted| {
+            const col_idx: u8 = @intCast(col_idx_uncasted);
             assert(col_val == 0 or col_val == 1);
             value ^= values.data_block[col_idx] * col_val;
         }
@@ -404,7 +410,7 @@ pub fn readCodeBlock(
             assert(read_size == buffer.len);
         }
 
-        block_int.* = std.mem.readIntBig(Word, &buffer);
+        block_int.* = std.mem.readInt(Word, &buffer, .big);
     }
 
     var buffer = [_]u8{0} ** word_size;
@@ -442,7 +448,7 @@ pub fn writeDataBlock(
         }
 
         var buf = [_]u8{0} ** word_size;
-        std.mem.writeIntBig(T, &buf, val);
+        std.mem.writeInt(T, &buf, val, .big);
         break :blk buf[buf.len - 1];
     };
 
@@ -455,7 +461,7 @@ pub fn writeDataBlock(
         }
 
         var word = [_]u8{0} ** word_size;
-        std.mem.writeIntBig(T, &word, val);
+        std.mem.writeInt(T, &word, val, .big);
 
         if ((written_size + word.len) <= data_block_size) {
             try out_fifo_writer.writeAll(&word);

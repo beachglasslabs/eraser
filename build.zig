@@ -33,11 +33,27 @@ pub fn build(b: *Build) void {
     });
 
     // main modules
+    const util_mod = b.createModule(.{
+        .source_file = Build.LazyPath.relative("src/util.zig"),
+    });
+    const zaws_mod = b.createModule(.{
+        .source_file = Build.LazyPath.relative("src/zaws.zig"),
+        .dependencies = &.{
+            .{ .name = "util", .module = util_mod },
+        },
+    });
     const erasure_mod = b.addModule("erasure", .{
         .source_file = Build.LazyPath.relative("src/erasure.zig"),
+        .dependencies = &.{
+            .{ .name = "util", .module = util_mod },
+        },
     });
     const pipelines_mod = b.addModule("eraser", .{
         .source_file = Build.LazyPath.relative("src/pipelines.zig"),
+        .dependencies = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "zaws", .module = zaws_mod },
+        },
     });
 
     const aws_include_dir: Build.LazyPath = blk: {
@@ -78,6 +94,8 @@ pub fn build(b: *Build) void {
         .files = &.{
             "src/zaws/aws_signing_config_aws.c",
             "src/zaws/aws_s3_client_new.c",
+            "src/zaws/aws_meta_request.c",
+            "src/zaws/aws_credentials_new.c",
         },
     });
 
@@ -117,20 +135,6 @@ pub fn build(b: *Build) void {
     pipeline_demo_run.step.dependOn(b.getInstallStep());
     pipeline_demo_run.stdio = .inherit;
 
-    if (b.option([]const u8, "gc-auth-tok", "Google cloud auth token")) |auth_tok| {
-        pipeline_demo_run.addArg(auth_tok);
-    }
-    blk: {
-        const maybe_aws_auth = b.option([]const u8, "aws-auth", "AWS auth token");
-        const maybe_aws_auth_sec = b.option([]const u8, "aws-auth-sec", "AWS auth token");
-
-        const aws_auth = maybe_aws_auth orelse break :blk;
-        const aws_auth_sec = maybe_aws_auth_sec orelse break :blk;
-
-        pipeline_demo_run.addArg(aws_auth);
-        pipeline_demo_run.addArg(aws_auth_sec);
-    }
-
     const unit_test_exe = b.addTest(.{
         .root_source_file = Build.LazyPath.relative("src/pipelines.zig"),
         .target = target,
@@ -138,6 +142,7 @@ pub fn build(b: *Build) void {
     });
     const unit_tests_run = b.addRunArtifact(unit_test_exe);
     unit_test_step.dependOn(&unit_tests_run.step);
+    unit_test_exe.addModule("util", util_mod);
 
     const difftest_exe = b.addTest(.{
         .name = "diff-test",
