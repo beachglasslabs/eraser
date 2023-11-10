@@ -17,6 +17,7 @@ pub const zaws = @import("zaws");
 const Aws = @This();
 region: Region,
 buckets: []const Bucket,
+ctx: *Ctx,
 
 pub const Bucket = struct { region: Region, name: []const u8 };
 

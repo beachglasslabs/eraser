@@ -36,7 +36,7 @@ pub fn PipeLine(
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
-        server_info: Providers,
+        providers: Providers,
 
         request_uris_buf: []u8,
         requests_buf: []std.http.Client.Request,
@@ -73,7 +73,7 @@ pub fn PipeLine(
             /// initial capacity of the queue
             queue_capacity: usize,
             /// server provider configuration
-            server_info: Providers,
+            providers: Providers,
         };
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
@@ -81,27 +81,27 @@ pub fn PipeLine(
             var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
             errdefer queue.deinit(params.allocator);
 
-            const request_uris_buf: []u8 = if (params.server_info.google_cloud) |gc|
+            const request_uris_buf: []u8 = if (params.providers.google_cloud) |gc|
                 try params.allocator.alloc(u8, gc.objectUriIteratorBufferSize())
             else
                 &.{};
             errdefer params.allocator.free(request_uris_buf);
 
-            const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.server_info.bucketCount());
+            const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.providers.bucketCount());
             errdefer params.allocator.free(requests_buf);
 
             const chunk_buffers = try params.allocator.create([2][chunk.total_size]u8);
             errdefer params.allocator.destroy(chunk_buffers);
 
             const ec = try ErasureCoder.init(params.allocator, .{
-                .shard_count = @intCast(params.server_info.bucketCount()),
-                .shards_required = params.server_info.shards_required,
+                .shard_count = @intCast(params.providers.bucketCount()),
+                .shards_required = params.providers.shards_required,
             });
             errdefer ec.deinit(params.allocator);
 
             return .{
                 .allocator = params.allocator,
-                .server_info = params.server_info,
+                .providers = params.providers,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
@@ -281,7 +281,7 @@ pub fn PipeLine(
                     { // populate `requests`
                         var current_index: u8 = 0;
 
-                        if (dpp.server_info.google_cloud) |gc| gc_blk: {
+                        if (dpp.providers.google_cloud) |gc| gc_blk: {
                             const authval = gc.authorizationValue() orelse break :gc_blk;
                             gc_headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
@@ -298,8 +298,10 @@ pub fn PipeLine(
                             }
                         }
 
-                        if (dpp.server_info.aws) |aws| {
-                            _ = aws;
+                        if (dpp.providers.aws) |aws| {
+                            const ctx = aws.ctx;
+                            _ = ctx;
+
                             @panic("TODO");
                         }
                     }

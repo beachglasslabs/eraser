@@ -17,21 +17,29 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const server_info = eraser.Providers{
+    const aws_region: eraser.Providers.Aws.Region = .{ .geo = "us".*, .cardinal = .east, .number = 1 };
+    var aws_ctx: eraser.Providers.Aws.Ctx = undefined;
+    try aws_ctx.init(allocator, .{
+        .region = aws_region,
+        .log_level = .warn,
+    });
+    defer aws_ctx.deinit();
+
+    const providers = eraser.Providers{
         .google_cloud = .{
             .auth_token = null,
             .bucket_names = &[_][]const u8{
-                "ec1.blocktube.net",
-                "ec2.blocktube.net",
-                "ec3.blocktube.net",
-                // "ec4.blocktube.net",
-                // "ec5.blocktube.net",
-                // "ec6.blocktube.net",
+                // "ec1.blocktube.net",
+                // "ec2.blocktube.net",
+                // "ec3.blocktube.net",
+                "ec4.blocktube.net",
+                "ec5.blocktube.net",
+                "ec6.blocktube.net",
             },
         },
 
         .aws = .{
-            .region = .{ .geo = "us".*, .cardinal = .east, .number = 1 },
+            .region = aws_region,
             .buckets = &.{
                 .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec7.blocktube.net" },
                 .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec8.blocktube.net" },
@@ -40,6 +48,7 @@ pub fn main() !void {
                 // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec11.blocktube.net" },
                 // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec12.blocktube.net" },
             },
+            .ctx = &aws_ctx,
         },
 
         .shards_required = 3,
@@ -93,7 +102,7 @@ pub fn main() !void {
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
-        .server_info = server_info,
+        .providers = providers,
     });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
     try upload_pipeline.start();
@@ -102,7 +111,7 @@ pub fn main() !void {
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
-        .server_info = server_info,
+        .providers = providers,
     });
     defer download_pipeline.deinit(.finish_remaining_downloads);
     try download_pipeline.start();
