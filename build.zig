@@ -8,7 +8,8 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const confirm_clear_buckets = b.option(bool, "clear-buckets", "Confirm clearing all buckets of all objects (FOR TESTING PURPOSES ONLY).");
+    const clear_buckets_google_cloud = b.option(bool, "clear-buckets-google-cloud", "Confirm clearing google cloud buckets");
+    const clear_buckets_aws_profile_name = b.option([]const u8, "clear-buckets-aws-profile-name", "Profile name used to clear AWS buckets");
 
     const shard_count = b.option(u7, "shard-count", "Erasure shard count to specify for executables and tests");
     const shards_required = b.option(u7, "shards-required", "Erasure shard size to specify for executables and tests");
@@ -162,18 +163,19 @@ pub fn build(b: *Build) void {
     const difftest_run = b.addRunArtifact(difftest_exe);
     difftest_step.dependOn(&difftest_run.step);
 
-    clear_buckets_step.dependOn(step: {
-        if (!(confirm_clear_buckets orelse false))
-            break :step failureStep(b, error.FailedToConfirm, "Must specify `-Dclear-buckets` to confirm running step `clear-buckets`");
-
-        const clear_buckets_exe = b.addExecutable(.{
-            .name = "clear-buckets",
-            .root_source_file = Build.LazyPath.relative("scripts/clear-buckets.zig"),
-            .optimize = optimize,
-        });
-        const clear_buckets_run = b.addRunArtifact(clear_buckets_exe);
-        break :step &clear_buckets_run.step;
+    const clear_buckets_exe = b.addExecutable(.{
+        .name = "clear-buckets",
+        .root_source_file = Build.LazyPath.relative("scripts/clear-buckets.zig"),
+        .optimize = optimize,
     });
+    const clear_buckets_run = b.addRunArtifact(clear_buckets_exe);
+    clear_buckets_step.dependOn(&clear_buckets_run.step);
+    if (clear_buckets_google_cloud orelse false) {
+        clear_buckets_run.setEnvironmentVariable("ZIG_GOOGLE_CLOUD", "");
+    }
+    if (clear_buckets_aws_profile_name) |profile_name| {
+        clear_buckets_run.setEnvironmentVariable("ZIG_AWS_PROFILE_NAME", profile_name);
+    }
 }
 
 const WriteCompileFlags = struct {
@@ -219,37 +221,3 @@ const WriteCompileFlags = struct {
         try buffered.flush();
     }
 };
-fn failureStep(
-    b: *Build,
-    err: anyerror,
-    msg: []const u8,
-) *Build.Step {
-    const log = std.log.default;
-    const msg_duped = b.dupe(msg);
-
-    const FailStep = struct {
-        step: Build.Step,
-        msg: []const u8,
-        err: anyerror,
-
-        fn make(step: *Build.Step, _: *std.Progress.Node) anyerror!void {
-            const failure = @fieldParentPtr(@This(), "step", step);
-            log.err("{s}", .{failure.msg});
-            return failure.err;
-        }
-    };
-
-    const failure: *FailStep = b.allocator.create(FailStep) catch |e| @panic(@errorName(e));
-    failure.* = .{
-        .step = Build.Step.init(.{
-            .id = .custom,
-            .name = b.fmt("Failure '{s}'", .{@errorName(err)}),
-            .owner = b,
-            .makeFn = FailStep.make,
-        }),
-        .msg = msg_duped,
-        .err = err,
-    };
-
-    return &failure.step;
-}
