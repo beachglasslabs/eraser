@@ -11,6 +11,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("util");
+const zaws = @import("zaws");
 
 pub inline fn pipeLine(
     comptime W: type,
@@ -37,6 +38,7 @@ pub fn PipeLine(
         queue: ManagedQueue(QueueItem),
 
         providers: Providers,
+        providers_mtx: std.Thread.Mutex,
 
         request_uris_buf: []u8,
         requests_buf: []std.http.Client.Request,
@@ -52,7 +54,6 @@ pub fn PipeLine(
         const ErasureCoder = erasure.Coder(W);
         const QueueItem = union(enum) {
             download: Download,
-            auth_update: noreturn,
 
             const Download = struct {
                 ctx: Ctx,
@@ -101,12 +102,14 @@ pub fn PipeLine(
 
             return .{
                 .allocator = params.allocator,
-                .providers = params.providers,
 
                 .must_stop = std.atomic.Atomic(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
                 .queue = queue,
+
+                .providers = params.providers,
+                .providers_mtx = .{},
 
                 .request_uris_buf = request_uris_buf,
                 .requests_buf = requests_buf,
@@ -167,6 +170,18 @@ pub fn PipeLine(
                 .stored_file = params.stored_file.*,
                 .writer = params.writer,
             } });
+        }
+
+        pub fn updateGoogleCloudAuthTok(
+            self: *Self,
+            auth_tok: eraser.SensitiveBytes.Bounded(Providers.GoogleCloud.max_auth_token_len),
+        ) void {
+            self.providers_mtx.lock();
+            defer self.providers_mtx.unlock();
+
+            if (self.providers.google_cloud) |*gc| {
+                gc.auth_token = auth_tok;
+            }
         }
 
         inline fn pushToQueue(
@@ -242,10 +257,6 @@ pub fn PipeLine(
 
                 const down_data: QueueItem.Download = switch (queue_item) {
                     .download => |download| download,
-                    .auth_update => |auth_update| {
-                        _ = auth_update;
-                        @panic("TODO");
-                    },
                 };
                 const down_ctx = down_data.ctx;
                 defer down_ctx.close(down_data.writer);
@@ -271,83 +282,238 @@ pub fn PipeLine(
                     }
                     chunks_encountered += 1;
 
-                    var requests = util.BoundedBufferArray(std.http.Client.Request){ .buffer = dpp.requests_buf };
-                    defer for (requests.slice()) |*req| req.deinit();
+                    const chunk_name = &current_chunk_info.chunk_blob_digest;
+
+                    var shard_datas = ContiguousStringAppender{};
+                    defer shard_datas.deinit(dpp.allocator);
 
                     var gc_headers = std.http.Headers.init(dpp.allocator);
                     defer gc_headers.deinit();
                     gc_headers.owned = true;
 
-                    { // populate `requests`
+                    {
                         var current_index: u8 = 0;
 
-                        if (dpp.providers.google_cloud) |gc| gc_blk: {
+                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.google_cloud) |gc| gc_blk: {
                             const authval = gc.authorizationValue() orelse break :gc_blk;
                             gc_headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
                             var iter = gc.objectUriIterator(&current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
-                            while (iter.next()) |uri_str| : (current_index += 1) {
-                                if (excluded_index_set.isSet(current_index)) continue;
+                            while (iter.next()) |uri_str| {
+                                {
+                                    if (current_index == dpp.providers.bucketCount()) break;
+                                    defer current_index += 1;
+                                    if (excluded_index_set.isSet(current_index)) continue;
+                                }
 
                                 const uri = std.Uri.parse(uri_str) catch unreachable;
-                                const req = client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
+                                var req = client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
-                                requests.appendAssumingCapacity(req);
+                                defer req.deinit();
+
+                                // zig fmt: off
+                                req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                // zig fmt: on
+
+                                var fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 }).init();
+
+                                fifo.pump(req.reader(), shard_datas.buffer.writer(dpp.allocator)) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
+                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
                             }
-                        }
+                        };
 
-                        if (dpp.providers.aws) |aws| {
+                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.aws) |aws| {
                             const ctx = aws.ctx;
-                            _ = ctx;
 
-                            @panic("TODO");
-                        }
+                            for (aws.buckets) |bucket| {
+                                {
+                                    if (current_index == dpp.providers.bucketCount()) break;
+                                    defer current_index += 1;
+                                    if (excluded_index_set.isSet(current_index)) continue;
+                                }
+
+                                const region_str_bytes = bucket.region.toBytes();
+
+                                const request_path = "/".* ++ eraser.digestBytesToString(chunk_name);
+
+                                const host_name_str = std.fmt.allocPrint(dpp.allocator, "{s}.s3.amazonaws.com", .{bucket.name}) catch |e| @panic(@errorName(e));
+                                defer dpp.allocator.free(host_name_str);
+
+                                const req_message = zaws.HttpMessage.newRequest(&ctx.aws_ally) orelse @panic("Failed to initialise HTTP message");
+                                defer req_message.release();
+
+                                req_message.setRequestMethod("GET") catch |e| @panic(@errorName(e));
+                                req_message.setRequestPath(&request_path) catch |e| @panic(@errorName(e));
+
+                                const ReqCtx = struct {
+                                    re: std.Thread.ResetEvent = .{},
+                                    maybe_err: BodyError!void = {},
+                                    allocator: std.mem.Allocator,
+                                    shard_datas: *ContiguousStringAppender,
+
+                                    const BodyError = std.mem.Allocator.Error || error{};
+
+                                    fn bodyCallback(
+                                        meta_request: ?*zaws.c.aws_s3_meta_request,
+                                        body: [*c]const zaws.c.aws_byte_cursor,
+                                        range_start: u64,
+                                        user_data: ?*anyopaque,
+                                    ) callconv(.C) c_int {
+                                        _ = range_start;
+                                        _ = meta_request;
+                                        const req_ctx: *@This() = @alignCast(@ptrCast(user_data.?));
+                                        defer req_ctx.re.set();
+
+                                        req_ctx.shard_datas.buffer.appendSlice(req_ctx.allocator, zaws.byteCursorToSlice(body[0]).?) catch |err| {
+                                            req_ctx.maybe_err = err;
+                                            return zaws.c.AWS_OP_SUCCESS;
+                                        };
+
+                                        return zaws.c.AWS_OP_SUCCESS;
+                                    }
+
+                                    fn finishCallback(
+                                        meta_request: ?*zaws.c.aws_s3_meta_request,
+                                        meta_request_result: [*c]const zaws.c.aws_s3_meta_request_result,
+                                        user_data: ?*anyopaque,
+                                    ) callconv(.C) void {
+                                        _ = meta_request;
+                                        _ = meta_request_result;
+                                        const req_ctx: *@This() = @alignCast(@ptrCast(user_data.?));
+                                        defer req_ctx.re.set();
+                                    }
+                                };
+                                var req_ctx: ReqCtx = .{
+                                    .allocator = dpp.allocator,
+                                    .shard_datas = &shard_datas,
+                                };
+
+                                // TODO: get this working with https
+                                var endpoint_uri = zaws.Uri.initFromBuilderOptions(&ctx.aws_ally, .{
+                                    // .scheme = zaws.byteCursorFromSlice(@constCast("https")),
+                                    .scheme = zaws.byteCursorFromSlice(@constCast("http")),
+
+                                    .host_name = zaws.byteCursorFromSlice(host_name_str),
+                                    .path = zaws.byteCursorFromSlice(@constCast(&request_path)),
+
+                                    // .port = 443,
+                                    .port = 80,
+
+                                    .query_params = null,
+                                    .query_string = .{},
+                                }) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: Handle " ++ @errorName(e)),
+                                };
+                                defer endpoint_uri.cleanUp();
+
+                                const signing_config = zaws.signing_config.wrapperToBytes(.{
+                                    .config_type = zaws.c.AWS_SIGNING_CONFIG_AWS,
+                                    .algorithm = zaws.c.AWS_SIGNING_ALGORITHM_V4,
+                                    .signature_type = zaws.c.AWS_ST_HTTP_REQUEST_HEADERS,
+
+                                    .date = zaws.DateTime.initNow().value,
+                                    .region = zaws.byteCursorFromSlice(@constCast(region_str_bytes.constSlice())), // this should just get read, the C API just doesn't express this constness
+                                    .service = zaws.byteCursorFromSlice(@constCast("s3")), // this should just get read, the C API just doesn't express this constness
+
+                                    .should_sign_header = null,
+                                    .should_sign_header_ud = null,
+
+                                    .flags = .{
+                                        .use_double_uri_encode = false,
+                                    },
+
+                                    .signed_body_header = zaws.c.AWS_SBHT_X_AMZ_CONTENT_SHA256,
+                                    .signed_body_value = zaws.byteCursorFromSlice(null), // leave empty to make AWS calculate it
+
+                                    .credentials = null,
+                                    .credentials_provider = ctx.credentials_provider.ptr,
+
+                                    .expiration_in_seconds = 0,
+                                });
+
+                                const req = ctx.client.makeMetaRequest(.{
+                                    .type = zaws.c.AWS_S3_META_REQUEST_TYPE_GET_OBJECT,
+                                    .signing_config = &signing_config,
+                                    .message = req_message.ptr,
+
+                                    .send_filepath = zaws.byteCursorFromSlice(null),
+                                    .send_async_stream = null,
+                                    .checksum_config = null,
+
+                                    .user_data = &req_ctx,
+                                    .headers_callback = null,
+                                    .body_callback = ReqCtx.bodyCallback,
+                                    .finish_callback = ReqCtx.finishCallback,
+                                    .shutdown_callback = null,
+                                    .progress_callback = null,
+                                    .telemetry_callback = null,
+                                    .upload_review_callback = null,
+
+                                    .endpoint = &endpoint_uri.value,
+                                    .resume_token = null,
+                                }) orelse @panic("Failed to create meta request");
+                                defer req.release();
+
+                                req_ctx.re.wait();
+                                req_ctx.maybe_err catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
+                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
+                            }
+                        };
                     }
 
-                    for (requests.slice()) |*req| {
-                        req.send(.{ .raw_uri = true }) catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        req.finish() catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                        req.wait() catch |err| switch (err) {
-                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                        };
-                    }
+                    const shard_data_cursors = dpp.allocator.alloc(usize, shard_datas.count()) catch |e| @panic(@errorName(e));
+                    defer dpp.allocator.free(shard_data_cursors);
+                    @memset(shard_data_cursors, 0);
 
                     const ReadersCtx = struct {
-                        requests: []std.http.Client.Request,
+                        shard_datas: *const ContiguousStringAppender,
+                        cursors: []usize,
                         down_ctx: Ctx,
 
                         const ReaderCtx = struct {
-                            inner: Inner,
+                            shard_data: []const u8,
+                            cursor: *usize,
                             down_ctx: Ctx,
 
-                            const Inner = std.http.Client.Request.Reader;
-                            fn read(self: @This(), buf: []u8) Inner.Error!usize {
-                                const result = try self.inner.read(buf);
-                                return result;
+                            const ReadError = error{};
+                            fn read(self: @This(), buf: []u8) !usize {
+                                var fbs = std.io.fixedBufferStream(self.shard_data[self.cursor.*..]);
+                                const read_count = try fbs.reader().read(buf);
+                                self.cursor.* += read_count;
+                                return read_count;
                             }
                         };
-                        pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.Inner.Error, ReaderCtx.read) {
+                        pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.ReadError, ReaderCtx.read) {
                             return .{ .context = .{
-                                .inner = ctx.requests[reader_idx].reader(),
+                                .shard_data = ctx.shard_datas.getString(reader_idx),
+                                .cursor = &ctx.cursors[reader_idx],
                                 .down_ctx = ctx.down_ctx,
                             } };
                         }
                     };
+
                     const readers_ctx = ReadersCtx{
-                        .requests = requests.slice(),
+                        .shard_datas = &shard_datas,
+                        .cursors = shard_data_cursors,
                         .down_ctx = down_ctx,
                     };
 
                     var ecd_fbs = std.io.fixedBufferStream(encrypted_chunk_buffer);
                     _ = dpp.ec.decodeCtx(excluded_index_set, ecd_fbs.writer(), readers_ctx) catch |err| switch (err) {
                         inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        inline error.EndOfStream => |e| @panic("Decide how to handle " ++ @errorName(e)),
                         inline error.NoSpaceLeft => |e| @panic("Decide how to handle " ++ @errorName(e)),
                     };
                     const encrypted_blob_data: []const u8 = ecd_fbs.getWritten();
@@ -382,4 +548,78 @@ pub fn PipeLine(
             }
         }
     };
+}
+
+const ContiguousStringAppender = struct {
+    ends: std.ArrayListUnmanaged(u64) = .{},
+    buffer: std.ArrayListUnmanaged(u8) = .{},
+
+    fn deinit(csa: *ContiguousStringAppender, allocator: std.mem.Allocator) void {
+        csa.ends.deinit(allocator);
+        csa.buffer.deinit(allocator);
+    }
+
+    inline fn count(csa: ContiguousStringAppender) usize {
+        return csa.ends.items.len;
+    }
+
+    inline fn finishCurrent(csa: *ContiguousStringAppender, allocator: std.mem.Allocator) !void {
+        try csa.ends.append(allocator, csa.buffer.items.len);
+    }
+
+    inline fn getString(csa: ContiguousStringAppender, index: usize) []const u8 {
+        assert(csa.ends.items.len != 0);
+
+        const ends = csa.ends.items;
+        const buffer: []const u8 = csa.buffer.items;
+
+        // zig fmt: off
+        const start_idx = if (index != 0       ) ends[index - 1] else 0;
+        const end_idx   = if (index != ends.len) ends[index    ] else buffer.len;
+        // zig fmt: on
+
+        return buffer[start_idx..end_idx];
+    }
+
+    inline fn iterator(csa: *const ContiguousStringAppender) Iterator {
+        return .{
+            .csa = csa,
+            .index = 0,
+        };
+    }
+
+    const Iterator = struct {
+        csa: *const ContiguousStringAppender,
+        index: usize,
+
+        inline fn next(iter: *Iterator) ?[]const u8 {
+            if (iter.csa.count() == iter.index) return null;
+            defer iter.index += 1;
+            return iter.csa.getString(iter.index);
+        }
+    };
+};
+
+test ContiguousStringAppender {
+    var csa = ContiguousStringAppender{};
+    defer csa.deinit(std.testing.allocator);
+
+    try csa.buffer.writer(std.testing.allocator).print("1 + 2 = {d}", .{1 + 2});
+    try csa.finishCurrent(std.testing.allocator);
+
+    try csa.buffer.appendSlice(std.testing.allocator, "foo bar baz");
+    try csa.finishCurrent(std.testing.allocator);
+
+    try csa.buffer.appendSlice(std.testing.allocator, "fizz buzz");
+    try csa.finishCurrent(std.testing.allocator);
+
+    var i: usize = 0;
+    var iter = csa.iterator();
+    while (iter.next()) |str| : (i += 1) {
+        try std.testing.expectEqualStrings(([_][]const u8{
+            "1 + 2 = 3",
+            "foo bar baz",
+            "fizz buzz",
+        })[i], str);
+    }
 }

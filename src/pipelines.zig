@@ -15,6 +15,8 @@ const download = @import("pipelines/download.zig");
 pub const downloadPipeLine = download.pipeLine;
 pub const DownloadPipeLine = download.PipeLine;
 
+pub const zaws = @import("zaws");
+
 comptime {
     _ = chunk;
     _ = erasure;

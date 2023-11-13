@@ -28,7 +28,7 @@ pub const session_token_len = 912;
 pub const CredentialsInit = struct {
     access_key_id: SensitiveBytes.Fixed(access_key_id_len),
     secret_access_key: SensitiveBytes.Fixed(secret_access_key_len),
-    session_token: SensitiveBytes.Fixed(session_token_len),
+    session_token: SensitiveBytes.Bounded(session_token_len),
 };
 
 pub const Ctx = struct {
@@ -53,10 +53,30 @@ pub const Ctx = struct {
 
     const CredentialsProviderDelegate = struct {
         current_creds: ?zaws.Credentials,
+        mutex: std.Thread.Mutex = .{},
+
+        pub fn deinit(delegate: *CredentialsProviderDelegate) void {
+            delegate.updateCreds(null);
+        }
+
+        pub inline fn updateCreds(
+            delegate: *CredentialsProviderDelegate,
+            new_creds: ?zaws.Credentials,
+        ) void {
+            delegate.mutex.lock();
+            defer delegate.mutex.unlock();
+
+            if (delegate.current_creds) |creds| creds.release();
+            if (new_creds) |creds| creds.acquire();
+            delegate.current_creds = new_creds;
+        }
 
         fn getCredentials(delegate_ud: ?*anyopaque, maybe_onGet: ?*const zaws.c.aws_on_get_credentials_callback_fn, on_get_ud: ?*anyopaque) callconv(.C) c_int {
             const delegate: *CredentialsProviderDelegate = @alignCast(@ptrCast(delegate_ud.?));
             const onGet = maybe_onGet.?;
+
+            delegate.mutex.lock();
+            defer delegate.mutex.unlock();
 
             const is_available = delegate.current_creds != null;
             const err_code = if (is_available) zaws.c.AWS_ERROR_SUCCESS else zaws.c.AWS_ERROR_UNKNOWN;
@@ -170,7 +190,7 @@ pub const Ctx = struct {
         assert(aws_ctx.aws_ally.impl.? == @as(*anyopaque, &aws_ctx.zig_ally));
         aws_ctx.client.release();
         aws_ctx.credentials_provider.release();
-        if (aws_ctx.credentials_provider_delegate.current_creds) |creds| creds.release();
+        aws_ctx.credentials_provider_delegate.deinit();
         aws_ctx.client_bootstrap.release();
         aws_ctx.resolver.release();
         aws_ctx.event_loop_group.release();

@@ -309,14 +309,13 @@ pub fn main() !void {
                     std.log.err("Missing auth token", .{});
                     continue;
                 };
-                const GoogleCloud = eraser.Providers.GoogleCloud;
-                try upload_pipeline.updateAuth(.{
-                    .gc = eraser.SensitiveBytes.Bounded(GoogleCloud.max_auth_token_len).init(auth_token) orelse {
-                        std.log.err("Bad auth token", .{});
-                        continue;
-                    },
-                    .aws = null,
-                });
+
+                const auth_tok_bounded = eraser.SensitiveBytes.Bounded(eraser.Providers.GoogleCloud.max_auth_token_len).init(auth_token) orelse {
+                    std.log.err("Bad auth token", .{});
+                    continue;
+                };
+                upload_pipeline.updateGoogleCloudAuthTok(auth_tok_bounded);
+                download_pipeline.updateGoogleCloudAuthTok(auth_tok_bounded);
             },
             .@"auth-aws" => {
                 const access_key_id = tokenizer.next() orelse {
@@ -331,24 +330,10 @@ pub fn main() !void {
                     std.log.err("Missing session token", .{});
                     continue;
                 };
-                const Aws = eraser.Providers.Aws;
-                try upload_pipeline.updateAuth(.{
-                    .gc = null,
-                    .aws = .{
-                        .access_key_id = eraser.SensitiveBytes.Fixed(Aws.access_key_id_len).init(access_key_id) orelse {
-                            std.log.err("Bad access key id", .{});
-                            continue;
-                        },
-                        .secret_access_key = eraser.SensitiveBytes.Fixed(Aws.secret_access_key_len).init(secret_access_key) orelse {
-                            std.log.err("Bad secret access key", .{});
-                            continue;
-                        },
-                        .session_token = eraser.SensitiveBytes.Fixed(Aws.session_token_len).init(session_token) orelse {
-                            std.log.err("Bad session token", .{});
-                            continue;
-                        },
-                    },
-                });
+
+                const new_creds = eraser.zaws.Credentials.new(&aws_ctx.aws_ally, access_key_id, secret_access_key, session_token, 0) orelse return error.AwsFailedToInitCredentials;
+                defer new_creds.release();
+                aws_ctx.credentials_provider_delegate.updateCreds(new_creds);
             },
         }
     }

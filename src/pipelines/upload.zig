@@ -42,6 +42,7 @@ pub fn PipeLine(
         queue: ManagedQueue(QueueItem),
 
         providers: Providers,
+        providers_mtx: std.Thread.Mutex,
 
         full_request_uri_buf: []u8,
         request_uri_bufs: RequestUriBuffers,
@@ -58,21 +59,12 @@ pub fn PipeLine(
         const ErasureCoder = erasure.Coder(W);
         const QueueItem = union(enum) {
             file: Upload,
-            auth_update: struct {
-                aws: ?zaws.Credentials,
-                gc: ?eraser.SensitiveBytes.Bounded(Providers.GoogleCloud.max_auth_token_len),
-            },
 
             const Upload = struct {
                 ctx: Ctx,
                 src: Src,
                 full_size: u64,
             };
-        };
-
-        pub const AuthUpdate = struct {
-            aws: ?Providers.Aws.CredentialsInit,
-            gc: ?eraser.SensitiveBytes.Bounded(Providers.GoogleCloud.max_auth_token_len),
         };
 
         // TODO: should this use a more strict memory order?
@@ -124,6 +116,7 @@ pub fn PipeLine(
                 .queue = queue,
 
                 .providers = params.providers,
+                .providers_mtx = .{},
 
                 .full_request_uri_buf = full_request_uri_buf,
                 .request_uri_bufs = request_uri_bufs,
@@ -212,23 +205,16 @@ pub fn PipeLine(
             } });
         }
 
-        pub fn updateAuth(self: *Self, vals: AuthUpdate) !void {
-            try self.pushToQueue(.{
-                .auth_update = .{
-                    .gc = vals.gc,
-                    .aws = blk: {
-                        const aws = self.providers.aws orelse break :blk null;
-                        const aws_init = vals.aws orelse break :blk null;
-                        break :blk zaws.Credentials.new(
-                            &aws.ctx.aws_ally,
-                            aws_init.access_key_id.getSensitiveSlice(),
-                            aws_init.secret_access_key.getSensitiveSlice(),
-                            aws_init.session_token.getSensitiveSlice(),
-                            std.math.maxInt(u64), // XXX TODO: these credentials do expire, but I don't know what to put here, this is just for testing
-                        ) orelse return error.FailedToInitAwsCredentials;
-                    },
-                },
-            });
+        pub fn updateGoogleCloudAuthTok(
+            self: *Self,
+            auth_tok: eraser.SensitiveBytes.Bounded(Providers.GoogleCloud.max_auth_token_len),
+        ) void {
+            self.providers_mtx.lock();
+            defer self.providers_mtx.unlock();
+
+            if (self.providers.google_cloud) |*gc| {
+                gc.auth_token = auth_tok;
+            }
         }
 
         inline fn pushToQueue(
@@ -333,21 +319,6 @@ pub fn PipeLine(
 
                 const up_data: QueueItem.Upload = switch (queue_item) {
                     .file => |file| file,
-                    .auth_update => |auth_update| {
-                        if (auth_update.gc) |auth_tok| {
-                            if (upp.providers.google_cloud) |*gc| {
-                                gc.auth_token = auth_tok;
-                            }
-                        }
-                        if (auth_update.aws) |new_creds| {
-                            const aws_ctx = upp.providers.aws.?.ctx;
-                            if (aws_ctx.credentials_provider_delegate.current_creds) |old_creds| {
-                                old_creds.release();
-                            }
-                            aws_ctx.credentials_provider_delegate.current_creds = new_creds;
-                        }
-                        continue;
-                    },
                 };
 
                 const up_ctx = up_data.ctx;
@@ -525,17 +496,16 @@ pub fn PipeLine(
                                     meta_request_result: [*c]const zaws.c.aws_s3_meta_request_result,
                                     user_data: ?*anyopaque,
                                 ) callconv(.C) void {
+                                    _ = meta_request;
                                     _ = meta_request_result;
                                     const req_ctx: *@This() = @alignCast(@ptrCast(user_data.?));
-                                    _ = meta_request;
                                     req_ctx.re.set();
                                 }
                             };
                             var req_ctx: ReqCtx = .{};
 
-                            // TODO: get this working with HTTPS
-                            var endpoint_uri: zaws.c.aws_uri = undefined;
-                            switch (zaws.c.aws_uri_init_from_builder_options(&endpoint_uri, &ctx.aws_ally, @constCast(&zaws.c.aws_uri_builder_options{
+                            // TODO: get this working with https
+                            var endpoint_uri = zaws.Uri.initFromBuilderOptions(&ctx.aws_ally, .{
                                 // .scheme = zaws.byteCursorFromSlice(@constCast("https")),
                                 .scheme = zaws.byteCursorFromSlice(@constCast("http")),
 
@@ -547,16 +517,10 @@ pub fn PipeLine(
 
                                 .query_params = null,
                                 .query_string = .{},
-                            }))) {
-                                zaws.c.AWS_OP_SUCCESS => {},
-                                zaws.c.AWS_OP_ERR => zaws.lastError().toError() catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: Handle " ++ @errorName(e)),
-                                },
-                                else => unreachable,
-                            }
-                            defer zaws.c.aws_uri_clean_up(&endpoint_uri);
-
-                            std.debug.print("uri_str: {s}\n", .{endpoint_uri.uri_str.buffer[0..endpoint_uri.uri_str.len]});
+                            }) catch |err| switch (err) {
+                                inline else => |e| @panic("TODO: Handle " ++ @errorName(e)),
+                            };
+                            defer endpoint_uri.cleanUp();
 
                             const signing_config = zaws.signing_config.wrapperToBytes(.{
                                 .config_type = zaws.c.AWS_SIGNING_CONFIG_AWS,
@@ -601,7 +565,7 @@ pub fn PipeLine(
                                 .telemetry_callback = null,
                                 .upload_review_callback = null,
 
-                                .endpoint = &endpoint_uri,
+                                .endpoint = &endpoint_uri.value,
                                 .resume_token = null,
                             }) orelse @panic("Failed to create meta request");
                             defer req.release();

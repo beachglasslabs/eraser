@@ -185,6 +185,10 @@ pub const ClientBootstrap = struct {
 pub const Credentials = struct {
     ptr: *c.aws_credentials,
 
+    pub inline fn acquire(creds: Credentials) void {
+        c.aws_credentials_acquire(creds.ptr);
+    }
+
     pub inline fn release(creds: Credentials) void {
         return c.aws_credentials_release(creds.ptr);
     }
@@ -365,6 +369,41 @@ pub const HttpMessage = struct {
 
     pub inline fn setBodyStream(msg: HttpMessage, body_stream: ?InputStream) void {
         return c.aws_http_message_set_body_stream(msg.ptr, if (body_stream) |bs| bs.ptr else null);
+    }
+};
+
+pub const Uri = struct {
+    value: zaws.c.aws_uri,
+
+    pub inline fn cleanUp(uri: *Uri) void {
+        c.aws_uri_clean_up(&uri.value);
+    }
+
+    pub inline fn initParse(allocator: *zaws.Allocator, str: []const u8) Error!Uri {
+        var result: Uri = .{ .value = undefined };
+        return switch (c.aws_uri_init_parse(
+            &result.value,
+            allocator,
+            &byteCursorFromSlice(@constCast(str)), // this should only be read and never written to, the C API just doesn't express this constness
+        )) {
+            c.AWS_OP_SUCCESS => result,
+            c.AWS_OP_ERR => if (lastError().toError()) |_| unreachable else |e| e,
+            else => unreachable,
+        };
+    }
+
+    pub const BuilderOptions = c.aws_uri_builder_options;
+    pub inline fn initFromBuilderOptions(allocator: *zaws.Allocator, options: BuilderOptions) Error!Uri {
+        var result: Uri = .{ .value = undefined };
+        return switch (c.aws_uri_init_from_builder_options(
+            &result.value,
+            allocator,
+            @constCast(&options),
+        )) {
+            c.AWS_OP_SUCCESS => result,
+            c.AWS_OP_ERR => if (lastError().toError()) |_| unreachable else |e| e,
+            else => unreachable,
+        };
     }
 };
 
