@@ -156,6 +156,26 @@ pub fn writeLowerCaseString(writer: anytype, bytes: []const u8) @TypeOf(writer).
     }
 }
 
+pub inline fn pumpReaderToWriterThroughFifo(
+    src_reader: anytype,
+    dest_writer: anytype,
+    comptime pump_type: enum { static, slice },
+    pump_buf: switch (pump_type) {
+        .static => comptime_int,
+        .slice => []u8,
+    },
+) !void {
+    const Fifo = std.fifo.LinearFifo(u8, switch (pump_type) {
+        .static => .{ .Static = pump_buf },
+        .slice => .Slice,
+    });
+    var fifo = switch (pump_type) {
+        .static => Fifo.init(),
+        .slice => Fifo.init(pump_buf),
+    };
+    try fifo.pump(src_reader, dest_writer);
+}
+
 comptime {
     _ = buffer_backed_slices;
 }

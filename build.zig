@@ -1,10 +1,9 @@
 const std = @import("std");
 const Build = std.Build;
 
-const zas3 = @import("zig-aws-s3");
-
 pub fn build(b: *Build) void {
     // build options
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -19,86 +18,36 @@ pub fn build(b: *Build) void {
     const difftest_rng_seed = b.option(u64, "dt-rng-seed", "Seed used for RNG");
 
     // top level steps
+
     const erasure_demo_step = b.step("erasure-demo", "Run the app");
     const pipeline_demo_step = b.step("pipeline-demo", "Run the library test executable");
     const unit_test_step = b.step("unit-test", "Run library tests");
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
     const clear_buckets_step = b.step("clear-buckets", "Clear all buckets of all objects (INVOKES `gcloud`, FOR TESTING PURPOSES ONLY).");
-    const lsp_install_step = b.step("lsp-install", "Install generated files for LSPs to more easily find");
-
-    // dependencies
-    const zig_aws_s3_dep = b.dependency("zig-aws-s3", .{
-        .target = target,
-        .optimize = optimize,
-        .cmake_exe = b.option([]const u8, "cmake_exe", "CMake executable path") orelse "cmake",
-    });
 
     // main modules
+
     const util_mod = b.createModule(.{
         .source_file = Build.LazyPath.relative("src/util.zig"),
     });
-    const zaws_mod = b.createModule(.{
-        .source_file = Build.LazyPath.relative("src/zaws.zig"),
-        .dependencies = &.{
-            .{ .name = "util", .module = util_mod },
-        },
+    const aws_mod = b.createModule(.{
+        .source_file = Build.LazyPath.relative("src/aws.zig"),
     });
     const erasure_mod = b.addModule("erasure", .{
         .source_file = Build.LazyPath.relative("src/erasure.zig"),
         .dependencies = &.{
             .{ .name = "util", .module = util_mod },
+            .{ .name = "aws", .module = aws_mod },
         },
     });
     const pipelines_mod = b.addModule("eraser", .{
         .source_file = Build.LazyPath.relative("src/pipelines.zig"),
         .dependencies = &.{
             .{ .name = "util", .module = util_mod },
-            .{ .name = "zaws", .module = zaws_mod },
         },
     });
-
-    const aws_include_dir: Build.LazyPath = blk: {
-        const cached = zas3.awsIncludeDir(zig_aws_s3_dep);
-        const called_from_zls = b.option(bool, "called-from-zls", "This flag should be passed by ZLS") orelse false;
-
-        // this helps the C LSP
-        const wcf = WriteCompileFlags.create(b, .{
-            .aws_include_dir = cached,
-        });
-        lsp_install_step.dependOn(&wcf.step);
-
-        // this is done here to help ZLS do autocompletion
-        const install_dir = b.addInstallDirectory(.{
-            .source_dir = cached,
-            .install_dir = .{ .custom = "lsp" },
-            .install_subdir = "aws-include",
-        });
-        lsp_install_step.dependOn(&install_dir.step);
-
-        if (!called_from_zls) break :blk cached; // use cached path if this is just a normal build invokation
-        break :blk .{ .path = b.getInstallPath(install_dir.options.install_dir, install_dir.options.install_subdir) };
-    };
 
     // everything else
-
-    const zaws_include_dir: Build.LazyPath = .{ .path = "src" };
-    const zaws_obj_file = b.addObject(.{
-        .name = "zaws",
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    zaws_obj_file.addIncludePath(aws_include_dir);
-    zaws_obj_file.addIncludePath(zaws_include_dir);
-    zaws_obj_file.addCSourceFiles(.{
-        .flags = &.{},
-        .files = &.{
-            "src/zaws/aws_signing_config_aws.c",
-            "src/zaws/aws_s3_client_new.c",
-            "src/zaws/aws_meta_request.c",
-            "src/zaws/aws_credentials_new.c",
-        },
-    });
 
     const erasure_demo_exe = b.addExecutable(.{
         .name = "erasure-demo",
@@ -123,13 +72,6 @@ pub fn build(b: *Build) void {
     });
     b.installArtifact(pipeline_demo_exe);
     pipeline_demo_exe.addModule("eraser", pipelines_mod);
-    pipeline_demo_exe.linkLibC();
-
-    zas3.linkAwsLibs(pipeline_demo_exe, zig_aws_s3_dep);
-    pipeline_demo_exe.addIncludePath(aws_include_dir);
-
-    pipeline_demo_exe.addIncludePath(zaws_include_dir);
-    pipeline_demo_exe.addObject(zaws_obj_file);
 
     const pipeline_demo_run = b.addRunArtifact(pipeline_demo_exe);
     pipeline_demo_step.dependOn(&pipeline_demo_run.step);

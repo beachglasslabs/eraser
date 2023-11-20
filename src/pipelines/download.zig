@@ -1,6 +1,7 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
+const iso8601 = @import("../iso-8601.zig");
 const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const EncryptedFile = eraser.StoredFile;
@@ -11,7 +12,6 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("util");
-const zaws = @import("zaws");
 
 pub inline fn pipeLine(
     comptime W: type,
@@ -37,8 +37,9 @@ pub fn PipeLine(
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
 
-        providers: Providers,
-        providers_mtx: std.Thread.Mutex,
+        providers: *const Providers,
+        /// This mutex protects the `providers` field.
+        providers_mtx: *std.Thread.Mutex,
 
         request_uris_buf: []u8,
         requests_buf: []std.http.Client.Request,
@@ -73,8 +74,11 @@ pub fn PipeLine(
             random: std.rand.Random,
             /// initial capacity of the queue
             queue_capacity: usize,
-            /// server provider configuration
-            providers: Providers,
+
+            /// server providers
+            providers: *const Providers,
+            /// server providers mutex. locks access to the given `providers` pointer.
+            providers_mtx: *std.Thread.Mutex,
         };
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
@@ -109,7 +113,7 @@ pub fn PipeLine(
                 .queue = queue,
 
                 .providers = params.providers,
-                .providers_mtx = .{},
+                .providers_mtx = params.providers_mtx,
 
                 .request_uris_buf = request_uris_buf,
                 .requests_buf = requests_buf,
@@ -235,8 +239,8 @@ pub fn PipeLine(
         };
 
         fn downloadPipeLineThread(dpp: *Self) void {
-            var client = std.http.Client{ .allocator = dpp.allocator };
-            defer client.deinit();
+            var http_client = std.http.Client{ .allocator = dpp.allocator };
+            defer http_client.deinit();
 
             const decrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[0];
             const encrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[1];
@@ -307,7 +311,105 @@ pub fn PipeLine(
                                 }
 
                                 const uri = std.Uri.parse(uri_str) catch unreachable;
-                                var req = client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
+                                var req = http_client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+                                defer req.deinit();
+
+                                // zig fmt: off
+                                req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                // zig fmt: on
+
+                                switch (req.response.status) {
+                                    .ok => {},
+                                    else => @panic("TODO: Handle other response statuses"),
+                                }
+
+                                util.pumpReaderToWriterThroughFifo(req.reader(), shard_datas.buffer.writer(dpp.allocator), .static, 4096) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
+                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
+                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                };
+                            }
+                        };
+
+                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.aws) |aws| aws_blk: {
+                            const credentials = aws.credentials orelse break :aws_blk;
+
+                            var headers = std.http.Headers.init(dpp.allocator);
+                            defer headers.deinit();
+
+                            const method: std.http.Method = .GET;
+
+                            const date_time = dt: {
+                                var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00Z".len) = .{};
+
+                                const epoch_secs = std.time.epoch.EpochSeconds{
+                                    .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
+                                };
+                                const year, const month, const day = ymd: {
+                                    const epoch_day = epoch_secs.getEpochDay();
+                                    const year_day = epoch_day.calculateYearDay();
+                                    const month_day = year_day.calculateMonthDay();
+                                    break :ymd .{ year_day.year, month_day.month, month_day.day_index + 1 };
+                                };
+                                const hour, const minute, const second = hms: {
+                                    const ds = epoch_secs.getDaySeconds();
+                                    break :hms .{ ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() };
+                                };
+
+                                iso8601.writeYearMonthDayTo(date_time.writer(), year, month, day, .{ .want_dashes = false }) catch unreachable;
+                                date_time.writer().print("T{d:0>2}{d:0>2}{d:0>2}Z", .{ hour, minute, second }) catch unreachable;
+                                break :dt date_time;
+                            };
+
+                            var uri_str_buf = std.ArrayList(u8).init(dpp.allocator);
+                            defer uri_str_buf.deinit();
+
+                            for (aws.buckets) |bucket| {
+                                {
+                                    if (current_index == dpp.providers.bucketCount()) break;
+                                    defer current_index += 1;
+                                    if (excluded_index_set.isSet(current_index)) continue;
+                                }
+
+                                const region_str = bucket.region.toBytes();
+                                const uri = std.Uri.parse(str: {
+                                    uri_str_buf.clearRetainingCapacity();
+                                    uri_str_buf.writer().print("{[bucket]}/{[object]s}", .{
+                                        .bucket = bucket.fmtUri(.{ .protocol = "http", .style = .path }),
+                                        .object = eraser.digestBytesToString(chunk_name),
+                                    }) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    };
+                                    break :str uri_str_buf.items;
+                                }) catch |err| switch (err) {
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+
+                                headers.clearRetainingCapacity();
+                                Providers.Aws.http.sortAndAddHeaders(dpp.allocator, &headers, .{
+                                    .request_method = @tagName(method),
+                                    .request_uri = uri,
+
+                                    .date_time = date_time.constSlice(),
+                                    .service = "s3",
+                                    .region = region_str.constSlice(),
+
+                                    .access_key_id = credentials.access_key_id.getSensitiveSlice(),
+                                    .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
+                                    .session_token = credentials.session_token.getSensitiveSlice(),
+
+                                    .payload_sign = .{ .special = .unsigned_payload },
+                                }) catch |err| @panic(switch (err) {
+                                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                                });
+
+                                var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
@@ -322,148 +424,6 @@ pub fn PipeLine(
                                 var fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 }).init();
 
                                 fifo.pump(req.reader(), shard_datas.buffer.writer(dpp.allocator)) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
-                                };
-                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
-                                };
-                            }
-                        };
-
-                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.aws) |aws| {
-                            const ctx = aws.ctx;
-
-                            for (aws.buckets) |bucket| {
-                                {
-                                    if (current_index == dpp.providers.bucketCount()) break;
-                                    defer current_index += 1;
-                                    if (excluded_index_set.isSet(current_index)) continue;
-                                }
-
-                                const region_str_bytes = bucket.region.toBytes();
-
-                                const request_path = "/".* ++ eraser.digestBytesToString(chunk_name);
-
-                                const host_name_str = std.fmt.allocPrint(dpp.allocator, "{s}.s3.amazonaws.com", .{bucket.name}) catch |e| @panic(@errorName(e));
-                                defer dpp.allocator.free(host_name_str);
-
-                                const req_message = zaws.HttpMessage.newRequest(&ctx.aws_ally) orelse @panic("Failed to initialise HTTP message");
-                                defer req_message.release();
-
-                                req_message.setRequestMethod("GET") catch |e| @panic(@errorName(e));
-                                req_message.setRequestPath(&request_path) catch |e| @panic(@errorName(e));
-
-                                const ReqCtx = struct {
-                                    re: std.Thread.ResetEvent = .{},
-                                    maybe_err: BodyError!void = {},
-                                    allocator: std.mem.Allocator,
-                                    shard_datas: *ContiguousStringAppender,
-
-                                    const BodyError = std.mem.Allocator.Error || error{};
-
-                                    fn bodyCallback(
-                                        meta_request: ?*zaws.c.aws_s3_meta_request,
-                                        body: [*c]const zaws.c.aws_byte_cursor,
-                                        range_start: u64,
-                                        user_data: ?*anyopaque,
-                                    ) callconv(.C) c_int {
-                                        _ = range_start;
-                                        _ = meta_request;
-                                        const req_ctx: *@This() = @alignCast(@ptrCast(user_data.?));
-                                        defer req_ctx.re.set();
-
-                                        req_ctx.shard_datas.buffer.appendSlice(req_ctx.allocator, zaws.byteCursorToSlice(body[0]).?) catch |err| {
-                                            req_ctx.maybe_err = err;
-                                            return zaws.c.AWS_OP_SUCCESS;
-                                        };
-
-                                        return zaws.c.AWS_OP_SUCCESS;
-                                    }
-
-                                    fn finishCallback(
-                                        meta_request: ?*zaws.c.aws_s3_meta_request,
-                                        meta_request_result: [*c]const zaws.c.aws_s3_meta_request_result,
-                                        user_data: ?*anyopaque,
-                                    ) callconv(.C) void {
-                                        _ = meta_request;
-                                        _ = meta_request_result;
-                                        const req_ctx: *@This() = @alignCast(@ptrCast(user_data.?));
-                                        defer req_ctx.re.set();
-                                    }
-                                };
-                                var req_ctx: ReqCtx = .{
-                                    .allocator = dpp.allocator,
-                                    .shard_datas = &shard_datas,
-                                };
-
-                                // TODO: get this working with https
-                                var endpoint_uri = zaws.Uri.initFromBuilderOptions(&ctx.aws_ally, .{
-                                    // .scheme = zaws.byteCursorFromSlice(@constCast("https")),
-                                    .scheme = zaws.byteCursorFromSlice(@constCast("http")),
-
-                                    .host_name = zaws.byteCursorFromSlice(host_name_str),
-                                    .path = zaws.byteCursorFromSlice(@constCast(&request_path)),
-
-                                    // .port = 443,
-                                    .port = 80,
-
-                                    .query_params = null,
-                                    .query_string = .{},
-                                }) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: Handle " ++ @errorName(e)),
-                                };
-                                defer endpoint_uri.cleanUp();
-
-                                const signing_config = zaws.signing_config.wrapperToBytes(.{
-                                    .config_type = zaws.c.AWS_SIGNING_CONFIG_AWS,
-                                    .algorithm = zaws.c.AWS_SIGNING_ALGORITHM_V4,
-                                    .signature_type = zaws.c.AWS_ST_HTTP_REQUEST_HEADERS,
-
-                                    .date = zaws.DateTime.initNow().value,
-                                    .region = zaws.byteCursorFromSlice(@constCast(region_str_bytes.constSlice())), // this should just get read, the C API just doesn't express this constness
-                                    .service = zaws.byteCursorFromSlice(@constCast("s3")), // this should just get read, the C API just doesn't express this constness
-
-                                    .should_sign_header = null,
-                                    .should_sign_header_ud = null,
-
-                                    .flags = .{
-                                        .use_double_uri_encode = false,
-                                    },
-
-                                    .signed_body_header = zaws.c.AWS_SBHT_X_AMZ_CONTENT_SHA256,
-                                    .signed_body_value = zaws.byteCursorFromSlice(null), // leave empty to make AWS calculate it
-
-                                    .credentials = null,
-                                    .credentials_provider = ctx.credentials_provider.ptr,
-
-                                    .expiration_in_seconds = 0,
-                                });
-
-                                const req = ctx.client.makeMetaRequest(.{
-                                    .type = zaws.c.AWS_S3_META_REQUEST_TYPE_GET_OBJECT,
-                                    .signing_config = &signing_config,
-                                    .message = req_message.ptr,
-
-                                    .send_filepath = zaws.byteCursorFromSlice(null),
-                                    .send_async_stream = null,
-                                    .checksum_config = null,
-
-                                    .user_data = &req_ctx,
-                                    .headers_callback = null,
-                                    .body_callback = ReqCtx.bodyCallback,
-                                    .finish_callback = ReqCtx.finishCallback,
-                                    .shutdown_callback = null,
-                                    .progress_callback = null,
-                                    .telemetry_callback = null,
-                                    .upload_review_callback = null,
-
-                                    .endpoint = &endpoint_uri.value,
-                                    .resume_token = null,
-                                }) orelse @panic("Failed to create meta request");
-                                defer req.release();
-
-                                req_ctx.re.wait();
-                                req_ctx.maybe_err catch |err| switch (err) {
                                     inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
                                 };
                                 shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {

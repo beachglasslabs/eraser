@@ -17,15 +17,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const aws_region: eraser.Providers.Aws.Region = .{ .geo = "us".*, .cardinal = .east, .number = 1 };
-    var aws_ctx: eraser.Providers.Aws.Ctx = undefined;
-    try aws_ctx.init(allocator, .{
-        .region = aws_region,
-        .log_level = .warn,
-    });
-    defer aws_ctx.deinit();
-
-    const providers = eraser.Providers{
+    var providers_mtx: std.Thread.Mutex = .{};
+    var providers = eraser.Providers{
         .google_cloud = .{
             .auth_token = null,
             .bucket_names = &[_][]const u8{
@@ -39,7 +32,7 @@ pub fn main() !void {
         },
 
         .aws = .{
-            .region = aws_region,
+            .credentials = null,
             .buckets = &.{
                 .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec7.blocktube.net" },
                 .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec8.blocktube.net" },
@@ -48,11 +41,13 @@ pub fn main() !void {
                 // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec11.blocktube.net" },
                 // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec12.blocktube.net" },
             },
-            .ctx = &aws_ctx,
         },
 
         .shards_required = 3,
     };
+
+    var aws_credentials_session_token_buffer = std.ArrayList(u8).init(allocator);
+    defer aws_credentials_session_token_buffer.deinit();
 
     var default_prng = std.rand.DefaultPrng.init(1243);
     var thread_safe_prng = eraser.threadSafeRng(default_prng.random());
@@ -102,7 +97,8 @@ pub fn main() !void {
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
-        .providers = providers,
+        .providers = &providers,
+        .providers_mtx = &providers_mtx,
     });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
     try upload_pipeline.start();
@@ -111,7 +107,8 @@ pub fn main() !void {
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
-        .providers = providers,
+        .providers = &providers,
+        .providers_mtx = &providers_mtx,
     });
     defer download_pipeline.deinit(.finish_remaining_downloads);
     try download_pipeline.start();
@@ -309,31 +306,60 @@ pub fn main() !void {
                     std.log.err("Missing auth token", .{});
                     continue;
                 };
-
                 const auth_tok_bounded = eraser.SensitiveBytes.Bounded(eraser.Providers.GoogleCloud.max_auth_token_len).init(auth_token) orelse {
                     std.log.err("Bad auth token", .{});
                     continue;
                 };
-                upload_pipeline.updateGoogleCloudAuthTok(auth_tok_bounded);
-                download_pipeline.updateGoogleCloudAuthTok(auth_tok_bounded);
+
+                providers_mtx.lock();
+                defer providers_mtx.unlock();
+
+                const gcloud: *eraser.Providers.GoogleCloud = if (providers.google_cloud) |*gcloud| gcloud else {
+                    std.log.err("Google cloud is not enabled as a provider", .{});
+                    continue;
+                };
+                gcloud.auth_token = auth_tok_bounded;
             },
             .@"auth-aws" => {
-                const access_key_id = tokenizer.next() orelse {
+                const Aws = eraser.Providers.Aws;
+
+                const access_key_id: []const u8 = tokenizer.next() orelse {
                     std.log.err("Missing access key id", .{});
                     continue;
                 };
-                const secret_access_key = tokenizer.next() orelse {
+                const secret_access_key: []const u8 = tokenizer.next() orelse {
                     std.log.err("Missing secret access key", .{});
                     continue;
                 };
-                const session_token = tokenizer.next() orelse {
-                    std.log.err("Missing session token", .{});
-                    continue;
+                const session_token: []const u8 = sess: {
+                    const session_token = tokenizer.next() orelse {
+                        std.log.err("Missing session token", .{});
+                        continue;
+                    };
+                    aws_credentials_session_token_buffer.clearRetainingCapacity();
+                    const copied = try aws_credentials_session_token_buffer.addManyAsSlice(session_token.len);
+                    @memcpy(copied, session_token);
+                    break :sess copied;
+                };
+                const new_creds = .{
+                    .access_key_id = eraser.SensitiveBytes.Fixed(Aws.auth.access_key_id_len).init(access_key_id) orelse {
+                        std.log.err("Bad access key id", .{});
+                        continue;
+                    },
+                    .secret_access_key = eraser.SensitiveBytes.Fixed(Aws.auth.secret_access_key_len).init(secret_access_key) orelse {
+                        std.log.err("Bad access key id", .{});
+                        continue;
+                    },
+                    .session_token = eraser.SensitiveBytes.init(session_token),
                 };
 
-                const new_creds = eraser.zaws.Credentials.new(&aws_ctx.aws_ally, access_key_id, secret_access_key, session_token, 0) orelse return error.AwsFailedToInitCredentials;
-                defer new_creds.release();
-                aws_ctx.credentials_provider_delegate.updateCreds(new_creds);
+                providers_mtx.lock();
+                defer providers_mtx.unlock();
+                const aws: *Aws = if (providers.aws) |*aws| aws else {
+                    std.log.err("AWS is not enabled as a provider", .{});
+                    continue;
+                };
+                aws.credentials = new_creds;
             },
         }
     }

@@ -10,8 +10,8 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const util = @import("util");
 
 const GoogleCloud = @This();
-auth_token: ?SensitiveBytes.Bounded(max_auth_token_len),
 bucket_names: []const []const u8,
+auth_token: ?SensitiveBytes.Bounded(max_auth_token_len),
 
 pub const authorization_value_fmt = "Bearer {[auth_token]s}";
 pub const object_uri_fmt = "https://storage.googleapis.com/{[bucket]}/{[object]}";
