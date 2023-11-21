@@ -564,7 +564,7 @@ test Coder {
     };
 
     var prng = std.rand.DefaultPrng.init(0xdeadbeef);
-    var random = prng.random();
+    const random = prng.random();
 
     for (test_data) |data| {
         inline for ([_]type{ u8, u16, u32 }) |T| {

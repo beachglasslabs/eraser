@@ -353,10 +353,10 @@ pub fn PipeLine(
                 });
 
                 var bytes_uploaded: u64 = 0;
-                _ = bytes_uploaded;
                 const upload_size = upp.ec.totalEncodedSize(
                     chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
                 );
+                defer assert(bytes_uploaded == upload_size);
 
                 while (true) {
                     const result = eci.next(.{
@@ -423,7 +423,7 @@ pub fn PipeLine(
                         headers.append("Content-Length", shard_upload_size_str.constSlice()) catch |err| @panic(@errorName(err));
                         headers.append("Authorization", auth_val.constSlice()) catch |err| @panic(@errorName(err));
 
-                        var iter = gc.objectUriIterator(chunk_name, upp.request_uri_bufs.gc);
+                        var iter = gc.objectUriIterator("http", chunk_name, upp.request_uri_bufs.gc);
                         while (iter.next()) |uri_str| {
                             if (shard_datas_sent == shard_datas.len) break;
                             const shard_data: []const u8 = shard_datas[shard_datas_sent].slice();
@@ -445,6 +445,8 @@ pub fn PipeLine(
                             req.finish() catch |err| @panic(switch (err) {
                                 inline else => |e| "Decide how to handle " ++ @errorName(e),
                             });
+                            bytes_uploaded += shard_data.len;
+                            up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
                         }
                     };
 
@@ -548,6 +550,8 @@ pub fn PipeLine(
                                 .ok => {},
                                 else => @panic("TODO: Handle other response statuses"),
                             }
+                            bytes_uploaded += shard_data.len;
+                            up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
                         }
                     };
                 }

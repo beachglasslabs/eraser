@@ -42,7 +42,6 @@ pub fn PipeLine(
         providers_mtx: *std.Thread.Mutex,
 
         request_uris_buf: []u8,
-        requests_buf: []std.http.Client.Request,
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
         chunk_buffers: *[2][chunk.total_size]u8,
@@ -92,9 +91,6 @@ pub fn PipeLine(
                 &.{};
             errdefer params.allocator.free(request_uris_buf);
 
-            const requests_buf = try params.allocator.alloc(std.http.Client.Request, params.providers.bucketCount());
-            errdefer params.allocator.free(requests_buf);
-
             const chunk_buffers = try params.allocator.create([2][chunk.total_size]u8);
             errdefer params.allocator.destroy(chunk_buffers);
 
@@ -116,7 +112,6 @@ pub fn PipeLine(
                 .providers_mtx = params.providers_mtx,
 
                 .request_uris_buf = request_uris_buf,
-                .requests_buf = requests_buf,
                 .chunk_buffers = chunk_buffers,
 
                 .random = params.random,
@@ -147,7 +142,6 @@ pub fn PipeLine(
             self.queue.deinit(self.allocator);
 
             self.allocator.destroy(self.chunk_buffers);
-            self.allocator.free(self.requests_buf);
             self.allocator.free(self.request_uris_buf);
 
             self.ec.deinit(self.allocator);
@@ -245,6 +239,10 @@ pub fn PipeLine(
             const decrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[0];
             const encrypted_chunk_buffer: *[chunk.total_size]u8 = &dpp.chunk_buffers[1];
 
+            const Request = std.http.Client.Request;
+            var requests = std.ArrayList(Request).init(dpp.allocator);
+            defer requests.deinit();
+
             while (true) {
                 const queue_item: QueueItem = blk: {
                     dpp.queue_pop_re.wait();
@@ -288,21 +286,20 @@ pub fn PipeLine(
 
                     const chunk_name = &current_chunk_info.chunk_blob_digest;
 
-                    var shard_datas = ContiguousStringAppender{};
-                    defer shard_datas.deinit(dpp.allocator);
-
-                    var gc_headers = std.http.Headers.init(dpp.allocator);
-                    defer gc_headers.deinit();
-                    gc_headers.owned = true;
+                    requests.clearRetainingCapacity();
+                    defer for (requests.items) |*req| req.deinit();
 
                     {
                         var current_index: u8 = 0;
 
                         if (current_index != dpp.providers.bucketCount()) if (dpp.providers.google_cloud) |gc| gc_blk: {
+                            var gc_headers = std.http.Headers.init(dpp.allocator);
+                            defer gc_headers.deinit();
+
                             const authval = gc.authorizationValue() orelse break :gc_blk;
                             gc_headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
-                            var iter = gc.objectUriIterator(&current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
+                            var iter = gc.objectUriIterator("http", &current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
                             while (iter.next()) |uri_str| {
                                 {
                                     if (current_index == dpp.providers.bucketCount()) break;
@@ -315,7 +312,7 @@ pub fn PipeLine(
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
-                                defer req.deinit();
+                                errdefer req.deinit();
 
                                 // zig fmt: off
                                 req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
@@ -328,11 +325,8 @@ pub fn PipeLine(
                                     else => @panic("TODO: Handle other response statuses"),
                                 }
 
-                                util.pumpReaderToWriterThroughFifo(req.reader(), shard_datas.buffer.writer(dpp.allocator), .static, 4096) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
-                                };
-                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                requests.append(req) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                 };
                             }
                         };
@@ -413,7 +407,7 @@ pub fn PipeLine(
                                     error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
                                 };
-                                defer req.deinit();
+                                errdefer req.deinit();
 
                                 // zig fmt: off
                                 req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
@@ -421,52 +415,44 @@ pub fn PipeLine(
                                 req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
                                 // zig fmt: on
 
-                                var fifo = std.fifo.LinearFifo(u8, .{ .Static = 4096 }).init();
+                                switch (req.response.status) {
+                                    .ok => {},
+                                    else => @panic("TODO: Handle other response statuses"),
+                                }
 
-                                fifo.pump(req.reader(), shard_datas.buffer.writer(dpp.allocator)) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
-                                };
-                                shard_datas.finishCurrent(dpp.allocator) catch |err| switch (err) {
-                                    inline else => |e| @panic("TODO: handle " ++ @errorName(e)),
+                                requests.append(req) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                 };
                             }
                         };
                     }
 
-                    const shard_data_cursors = dpp.allocator.alloc(usize, shard_datas.count()) catch |e| @panic(@errorName(e));
-                    defer dpp.allocator.free(shard_data_cursors);
-                    @memset(shard_data_cursors, 0);
-
                     const ReadersCtx = struct {
-                        shard_datas: *const ContiguousStringAppender,
-                        cursors: []usize,
+                        requests: []Request,
                         down_ctx: Ctx,
 
                         const ReaderCtx = struct {
-                            shard_data: []const u8,
-                            cursor: *usize,
+                            request: *Request,
                             down_ctx: Ctx,
 
-                            const ReadError = error{};
+                            const ReadError = Request.ReadError;
                             fn read(self: @This(), buf: []u8) !usize {
-                                var fbs = std.io.fixedBufferStream(self.shard_data[self.cursor.*..]);
-                                const read_count = try fbs.reader().read(buf);
-                                self.cursor.* += read_count;
-                                return read_count;
+                                const bytes_read = self.request.read(buf);
+                                return bytes_read;
                             }
                         };
                         pub inline fn getReader(ctx: @This(), reader_idx: u7) std.io.Reader(ReaderCtx, ReaderCtx.ReadError, ReaderCtx.read) {
-                            return .{ .context = .{
-                                .shard_data = ctx.shard_datas.getString(reader_idx),
-                                .cursor = &ctx.cursors[reader_idx],
-                                .down_ctx = ctx.down_ctx,
-                            } };
+                            return .{
+                                .context = .{
+                                    .request = &ctx.requests[reader_idx],
+                                    .down_ctx = ctx.down_ctx,
+                                },
+                            };
                         }
                     };
 
                     const readers_ctx = ReadersCtx{
-                        .shard_datas = &shard_datas,
-                        .cursors = shard_data_cursors,
+                        .requests = requests.items,
                         .down_ctx = down_ctx,
                     };
 
@@ -508,78 +494,4 @@ pub fn PipeLine(
             }
         }
     };
-}
-
-const ContiguousStringAppender = struct {
-    ends: std.ArrayListUnmanaged(u64) = .{},
-    buffer: std.ArrayListUnmanaged(u8) = .{},
-
-    fn deinit(csa: *ContiguousStringAppender, allocator: std.mem.Allocator) void {
-        csa.ends.deinit(allocator);
-        csa.buffer.deinit(allocator);
-    }
-
-    inline fn count(csa: ContiguousStringAppender) usize {
-        return csa.ends.items.len;
-    }
-
-    inline fn finishCurrent(csa: *ContiguousStringAppender, allocator: std.mem.Allocator) !void {
-        try csa.ends.append(allocator, csa.buffer.items.len);
-    }
-
-    inline fn getString(csa: ContiguousStringAppender, index: usize) []const u8 {
-        assert(csa.ends.items.len != 0);
-
-        const ends = csa.ends.items;
-        const buffer: []const u8 = csa.buffer.items;
-
-        // zig fmt: off
-        const start_idx = if (index != 0       ) ends[index - 1] else 0;
-        const end_idx   = if (index != ends.len) ends[index    ] else buffer.len;
-        // zig fmt: on
-
-        return buffer[start_idx..end_idx];
-    }
-
-    inline fn iterator(csa: *const ContiguousStringAppender) Iterator {
-        return .{
-            .csa = csa,
-            .index = 0,
-        };
-    }
-
-    const Iterator = struct {
-        csa: *const ContiguousStringAppender,
-        index: usize,
-
-        inline fn next(iter: *Iterator) ?[]const u8 {
-            if (iter.csa.count() == iter.index) return null;
-            defer iter.index += 1;
-            return iter.csa.getString(iter.index);
-        }
-    };
-};
-
-test ContiguousStringAppender {
-    var csa = ContiguousStringAppender{};
-    defer csa.deinit(std.testing.allocator);
-
-    try csa.buffer.writer(std.testing.allocator).print("1 + 2 = {d}", .{1 + 2});
-    try csa.finishCurrent(std.testing.allocator);
-
-    try csa.buffer.appendSlice(std.testing.allocator, "foo bar baz");
-    try csa.finishCurrent(std.testing.allocator);
-
-    try csa.buffer.appendSlice(std.testing.allocator, "fizz buzz");
-    try csa.finishCurrent(std.testing.allocator);
-
-    var i: usize = 0;
-    var iter = csa.iterator();
-    while (iter.next()) |str| : (i += 1) {
-        try std.testing.expectEqualStrings(([_][]const u8{
-            "1 + 2 = 3",
-            "foo bar baz",
-            "fizz buzz",
-        })[i], str);
-    }
 }

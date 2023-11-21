@@ -724,14 +724,14 @@ pub inline fn choose(comptime l: []const u8, comptime k: u8) ChosenType(l.len, k
             return ret;
         }
 
-        var c = choose(l[1..], k - 1);
+        const chosen = choose(l[1..], k - 1);
         var i = 0;
         for (0..(l.len - 1)) |m| {
-            for (0..c.len) |n| {
-                if (l[m] >= c[n][0]) continue;
+            for (0..chosen.len) |n| {
+                if (l[m] >= chosen[n][0]) continue;
                 ret[i][0] = l[m];
-                for (0..c[n].len) |j| {
-                    ret[i][j + 1] = c[n][j];
+                for (0..chosen[n].len) |j| {
+                    ret[i][j + 1] = chosen[n][j];
                 }
                 i += 1;
             }

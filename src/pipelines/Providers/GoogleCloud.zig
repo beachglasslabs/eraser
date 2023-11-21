@@ -14,7 +14,7 @@ bucket_names: []const []const u8,
 auth_token: ?SensitiveBytes.Bounded(max_auth_token_len),
 
 pub const authorization_value_fmt = "Bearer {[auth_token]s}";
-pub const object_uri_fmt = "https://storage.googleapis.com/{[bucket]}/{[object]}";
+pub const object_uri_fmt = "{[protocol]s}://storage.googleapis.com/{[bucket]}/{[object]}";
 
 pub const max_auth_token_len = 220;
 pub const max_authorization_value_len = std.fmt.count(authorization_value_fmt, .{ .auth_token = "*" ** max_auth_token_len });
@@ -22,6 +22,7 @@ pub const max_authorization_value_len = std.fmt.count(authorization_value_fmt, .
 pub inline fn objectUriIteratorBufferSize(gc: *const GoogleCloud) usize {
     var result: usize = 0;
     for (gc.bucket_names) |name| result = @max(result, std.fmt.count(object_uri_fmt, .{
+        .protocol = "https",
         .bucket = util.hardCodeFmt("s", name),
         .object = util.hardCodeFmt("s", &comptime eraser.digestBytesToString("F" ** eraser.chunk.name_len)),
     }));
@@ -38,11 +39,14 @@ pub inline fn authorizationValue(gc: *const GoogleCloud) ?std.BoundedArray(u8, m
 /// Asserts `buffer.len == gc.totalObjectUriBytes()`
 pub inline fn objectUriIterator(
     gc: *const GoogleCloud,
+    protocol: []const u8,
     object: *const [Sha256.digest_length]u8,
     buffer: []u8,
 ) ObjectUriIterator {
     assert(gc.objectUriIteratorBufferSize() == buffer.len);
+    assert(protocol.len < "https".len);
     return .{
+        .protocol = protocol,
         .bucket_names = gc.bucket_names,
         .buffer = buffer,
         .object = object.*,
@@ -50,6 +54,7 @@ pub inline fn objectUriIterator(
 }
 
 pub const ObjectUriIterator = struct {
+    protocol: []const u8,
     index: usize = 0,
     bucket_names: []const []const u8,
     buffer: []u8,
@@ -63,6 +68,7 @@ pub const ObjectUriIterator = struct {
 
         const object_name_str = digestBytesToString(&iter.object);
         return std.fmt.bufPrint(iter.buffer, object_uri_fmt, .{
+            .protocol = iter.protocol,
             .bucket = util.hardCodeFmt("s", bucket),
             .object = util.hardCodeFmt("s", &object_name_str),
         }) catch unreachable;
