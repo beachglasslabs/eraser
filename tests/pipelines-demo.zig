@@ -4,6 +4,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const eraser = @import("eraser");
+const Providers = eraser.Providers;
 
 pub const std_options = struct {
     pub const log_level: std.log.Level = .debug;
@@ -19,31 +20,46 @@ pub fn main() !void {
 
     var providers_mtx: std.Thread.Mutex = .{};
     var providers = eraser.Providers{
+        .shards_required = 3,
+        .shard_buckets = &.{
+            // .{ .gcloud = .{ .name = "ec1.blocktube.net" } },
+            // .{ .gcloud = .{ .name = "ec2.blocktube.net" } },
+            // .{ .gcloud = .{ .name = "ec3.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec4.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec5.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec6.blocktube.net" } },
+
+            .{ .aws = .{ .name = "ec7.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } } },
+            .{ .aws = .{ .name = "ec8.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } } },
+            .{ .aws = .{ .name = "ec9.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } } },
+            // .{ .aws = .{ .name = "ec10.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } } },
+            // .{ .aws = .{ .name = "ec11.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
+            // .{ .aws = .{ .name = "ec12.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
+        },
+
         .google_cloud = .{
             .auth_token = null,
-            .bucket_names = &[_][]const u8{
-                // "ec1.blocktube.net",
-                // "ec2.blocktube.net",
-                // "ec3.blocktube.net",
-                "ec4.blocktube.net",
-                "ec5.blocktube.net",
-                "ec6.blocktube.net",
-            },
+            // .bucket_names = &.{
+            //     // .{ .name = "ec1.blocktube.net" },
+            //     // .{ .name = "ec2.blocktube.net" },
+            //     // .{ .name = "ec3.blocktube.net" },
+            //     .{ .name = "ec4.blocktube.net" },
+            //     .{ .name = "ec5.blocktube.net" },
+            //     .{ .name = "ec6.blocktube.net" },
+            // },
         },
 
         .aws = .{
             .credentials = null,
-            .buckets = &.{
-                .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec7.blocktube.net" },
-                .{ .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 }, .name = "ec8.blocktube.net" },
-                .{ .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 }, .name = "ec9.blocktube.net" },
-                // .{ .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 }, .name = "ec10.blocktube.net" },
-                // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec11.blocktube.net" },
-                // .{ .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 }, .name = "ec12.blocktube.net" },
-            },
+            // .buckets = &.{
+            //     .{ .name = "ec7.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } },
+            //     .{ .name = "ec8.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } },
+            //     .{ .name = "ec9.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } },
+            //     // .{ .name = "ec10.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } },
+            //     // .{ .name = "ec11.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } },
+            //     // .{ .name = "ec12.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } },
+            // },
         },
-
-        .shards_required = 3,
     };
 
     var aws_credentials_session_token_buffer = std.ArrayList(u8).init(allocator);
@@ -314,10 +330,7 @@ pub fn main() !void {
                 providers_mtx.lock();
                 defer providers_mtx.unlock();
 
-                const gcloud: *eraser.Providers.GoogleCloud = if (providers.google_cloud) |*gcloud| gcloud else {
-                    std.log.err("Google cloud is not enabled as a provider", .{});
-                    continue;
-                };
+                const gcloud: *eraser.Providers.GoogleCloud = &providers.google_cloud;
                 gcloud.auth_token = auth_tok_bounded;
             },
             .@"auth-aws" => {
@@ -355,10 +368,7 @@ pub fn main() !void {
 
                 providers_mtx.lock();
                 defer providers_mtx.unlock();
-                const aws: *Aws = if (providers.aws) |*aws| aws else {
-                    std.log.err("AWS is not enabled as a provider", .{});
-                    continue;
-                };
+                const aws: *Aws = &providers.aws;
                 aws.credentials = new_creds;
             },
         }

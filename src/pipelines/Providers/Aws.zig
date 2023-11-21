@@ -14,7 +14,6 @@ pub const auth = aws.auth;
 pub const http = aws.http;
 
 const Aws = @This();
-buckets: []const Bucket,
 credentials: ?Credentials,
 
 pub const Credentials = struct {
@@ -28,8 +27,11 @@ pub const Bucket = struct {
     name: []const u8,
 
     pub const WriteUriOptions = struct {
+        /// e.g. "http", "https".
         protocol: []const u8,
         style: Style,
+        /// If set to a non-null, writes this as the sub-object path of the bucket URI.
+        object: ?[]const u8,
 
         pub const Style = enum { path, virtual_hosted };
     };
@@ -48,6 +50,9 @@ pub const Bucket = struct {
                     .region = bucket.region.fmt(),
                     .name = bucket.name,
                 });
+                if (options.object) |object| {
+                    try writer.print("/{s}", .{object});
+                }
             },
         }
     }

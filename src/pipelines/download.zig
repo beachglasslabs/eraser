@@ -1,7 +1,7 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
-const iso8601 = @import("../iso-8601.zig");
+const iso8601 = @import("../iso8601.zig");
 const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const EncryptedFile = eraser.StoredFile;
@@ -41,7 +41,6 @@ pub fn PipeLine(
         /// This mutex protects the `providers` field.
         providers_mtx: *std.Thread.Mutex,
 
-        request_uris_buf: []u8,
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
         chunk_buffers: *[2][chunk.total_size]u8,
@@ -85,17 +84,11 @@ pub fn PipeLine(
             var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
             errdefer queue.deinit(params.allocator);
 
-            const request_uris_buf: []u8 = if (params.providers.google_cloud) |gc|
-                try params.allocator.alloc(u8, gc.objectUriIteratorBufferSize())
-            else
-                &.{};
-            errdefer params.allocator.free(request_uris_buf);
-
             const chunk_buffers = try params.allocator.create([2][chunk.total_size]u8);
             errdefer params.allocator.destroy(chunk_buffers);
 
             const ec = try ErasureCoder.init(params.allocator, .{
-                .shard_count = @intCast(params.providers.bucketCount()),
+                .shard_count = @intCast(params.providers.shard_buckets.len),
                 .shards_required = params.providers.shards_required,
             });
             errdefer ec.deinit(params.allocator);
@@ -111,7 +104,6 @@ pub fn PipeLine(
                 .providers = params.providers,
                 .providers_mtx = params.providers_mtx,
 
-                .request_uris_buf = request_uris_buf,
                 .chunk_buffers = chunk_buffers,
 
                 .random = params.random,
@@ -142,7 +134,6 @@ pub fn PipeLine(
             self.queue.deinit(self.allocator);
 
             self.allocator.destroy(self.chunk_buffers);
-            self.allocator.free(self.request_uris_buf);
 
             self.ec.deinit(self.allocator);
         }
@@ -283,148 +274,145 @@ pub fn PipeLine(
                         } else break;
                     }
                     chunks_encountered += 1;
-
                     const chunk_name = &current_chunk_info.chunk_blob_digest;
 
                     requests.clearRetainingCapacity();
                     defer for (requests.items) |*req| req.deinit();
 
                     {
+                        var uri_str_buf = std.ArrayList(u8).init(dpp.allocator);
+                        defer uri_str_buf.deinit();
+
+                        var headers = std.http.Headers.init(dpp.allocator);
+                        defer headers.deinit();
+
                         var current_index: u8 = 0;
-
-                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.google_cloud) |gc| gc_blk: {
-                            var gc_headers = std.http.Headers.init(dpp.allocator);
-                            defer gc_headers.deinit();
-
-                            const authval = gc.authorizationValue() orelse break :gc_blk;
-                            gc_headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
-
-                            var iter = gc.objectUriIterator("http", &current_chunk_info.chunk_blob_digest, dpp.request_uris_buf);
-                            while (iter.next()) |uri_str| {
-                                {
-                                    if (current_index == dpp.providers.bucketCount()) break;
-                                    defer current_index += 1;
-                                    if (excluded_index_set.isSet(current_index)) continue;
-                                }
-
-                                const uri = std.Uri.parse(uri_str) catch unreachable;
-                                var req = http_client.open(.GET, uri, gc_headers, .{}) catch |err| switch (err) {
-                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                };
-                                errdefer req.deinit();
-
-                                // zig fmt: off
-                                req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                // zig fmt: on
-
-                                switch (req.response.status) {
-                                    .ok => {},
-                                    else => @panic("TODO: Handle other response statuses"),
-                                }
-
-                                requests.append(req) catch |err| switch (err) {
-                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                };
+                        for (dpp.providers.shard_buckets) |shard_bucket| {
+                            {
+                                if (current_index == dpp.providers.shard_buckets.len) break;
+                                defer current_index += 1;
+                                if (excluded_index_set.isSet(current_index)) continue;
                             }
-                        };
 
-                        if (current_index != dpp.providers.bucketCount()) if (dpp.providers.aws) |aws| aws_blk: {
-                            const credentials = aws.credentials orelse break :aws_blk;
+                            dpp.providers_mtx.lock();
+                            defer dpp.providers_mtx.unlock();
 
-                            var headers = std.http.Headers.init(dpp.allocator);
-                            defer headers.deinit();
+                            switch (shard_bucket) {
+                                .gcloud => |bucket| {
+                                    const gc = dpp.providers.google_cloud;
+                                    const authval = gc.authorizationValue() orelse continue;
 
-                            const method: std.http.Method = .GET;
+                                    headers.clearRetainingCapacity();
+                                    headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
 
-                            const date_time = dt: {
-                                var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00Z".len) = .{};
-
-                                const epoch_secs = std.time.epoch.EpochSeconds{
-                                    .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
-                                };
-                                const year, const month, const day = ymd: {
-                                    const epoch_day = epoch_secs.getEpochDay();
-                                    const year_day = epoch_day.calculateYearDay();
-                                    const month_day = year_day.calculateMonthDay();
-                                    break :ymd .{ year_day.year, month_day.month, month_day.day_index + 1 };
-                                };
-                                const hour, const minute, const second = hms: {
-                                    const ds = epoch_secs.getDaySeconds();
-                                    break :hms .{ ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() };
-                                };
-
-                                iso8601.writeYearMonthDayTo(date_time.writer(), year, month, day, .{ .want_dashes = false }) catch unreachable;
-                                date_time.writer().print("T{d:0>2}{d:0>2}{d:0>2}Z", .{ hour, minute, second }) catch unreachable;
-                                break :dt date_time;
-                            };
-
-                            var uri_str_buf = std.ArrayList(u8).init(dpp.allocator);
-                            defer uri_str_buf.deinit();
-
-                            for (aws.buckets) |bucket| {
-                                {
-                                    if (current_index == dpp.providers.bucketCount()) break;
-                                    defer current_index += 1;
-                                    if (excluded_index_set.isSet(current_index)) continue;
-                                }
-
-                                const region_str = bucket.region.toBytes();
-                                const uri = std.Uri.parse(str: {
-                                    uri_str_buf.clearRetainingCapacity();
-                                    uri_str_buf.writer().print("{[bucket]}/{[object]s}", .{
-                                        .bucket = bucket.fmtUri(.{ .protocol = "http", .style = .path }),
-                                        .object = eraser.digestBytesToString(chunk_name),
+                                    const uri = std.Uri.parse(str: {
+                                        uri_str_buf.clearRetainingCapacity();
+                                        bucket.writeUriTo(uri_str_buf.writer(), .{
+                                            .protocol = "http",
+                                            .object = &eraser.digestBytesToString(chunk_name),
+                                        }) catch |err| switch (err) {
+                                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                        };
+                                        break :str uri_str_buf.items;
                                     }) catch |err| switch (err) {
+                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                    };
+
+                                    var req = http_client.open(.GET, uri, headers, .{}) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                    };
+                                    errdefer req.deinit();
+
+                                    // zig fmt: off
+                                    req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    // zig fmt: on
+
+                                    switch (req.response.status) {
+                                        .ok => {},
+                                        else => @panic("TODO: Handle other response statuses"),
+                                    }
+
+                                    requests.append(req) catch |err| switch (err) {
                                         error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     };
-                                    break :str uri_str_buf.items;
-                                }) catch |err| switch (err) {
-                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                };
+                                },
+                                .aws => |bucket| {
+                                    const aws = dpp.providers.aws;
+                                    const credentials = aws.credentials orelse continue;
 
-                                headers.clearRetainingCapacity();
-                                Providers.Aws.http.sortAndAddHeaders(dpp.allocator, &headers, .{
-                                    .request_method = @tagName(method),
-                                    .request_uri = uri,
+                                    const date_time = dt: {
+                                        var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00+00:00".len) = .{};
+                                        const epoch_secs = std.time.epoch.EpochSeconds{
+                                            .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
+                                        };
+                                        iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
+                                            .ymd = .dont_want_dashes,
+                                            .hms = .dont_want_colons,
+                                        }) catch unreachable;
+                                        break :dt date_time;
+                                    };
 
-                                    .date_time = date_time.constSlice(),
-                                    .service = "s3",
-                                    .region = region_str.constSlice(),
+                                    const region_str = bucket.region.toBytes();
+                                    const uri = std.Uri.parse(str: {
+                                        uri_str_buf.clearRetainingCapacity();
+                                        bucket.writeUriTo(uri_str_buf.writer(), .{
+                                            .protocol = "http",
+                                            .style = .path,
+                                            .object = &eraser.digestBytesToString(chunk_name),
+                                        }) catch |err| switch (err) {
+                                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                        };
+                                        break :str uri_str_buf.items;
+                                    }) catch |err| switch (err) {
+                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                    };
 
-                                    .access_key_id = credentials.access_key_id.getSensitiveSlice(),
-                                    .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
-                                    .session_token = credentials.session_token.getSensitiveSlice(),
+                                    headers.clearRetainingCapacity();
 
-                                    .payload_sign = .{ .special = .unsigned_payload },
-                                }) catch |err| @panic(switch (err) {
-                                    inline else => |e| "Decide how to handle " ++ @errorName(e),
-                                });
+                                    const method: std.http.Method = .GET;
+                                    Providers.Aws.http.sortAndAddHeaders(dpp.allocator, &headers, .{
+                                        .request_method = @tagName(method),
+                                        .request_uri = uri,
 
-                                var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
-                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                };
-                                errdefer req.deinit();
+                                        .date_time = date_time.constSlice(),
+                                        .service = "s3",
+                                        .region = region_str.constSlice(),
 
-                                // zig fmt: off
-                                req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                // zig fmt: on
+                                        .access_key_id = credentials.access_key_id.getSensitiveSlice(),
+                                        .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
+                                        .session_token = credentials.session_token.getSensitiveSlice(),
 
-                                switch (req.response.status) {
-                                    .ok => {},
-                                    else => @panic("TODO: Handle other response statuses"),
-                                }
+                                        .payload_sign = .{ .special = .unsigned_payload },
+                                    }) catch |err| @panic(switch (err) {
+                                        inline else => |e| "Decide how to handle " ++ @errorName(e),
+                                    });
 
-                                requests.append(req) catch |err| switch (err) {
-                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                };
+                                    var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                    };
+                                    errdefer req.deinit();
+
+                                    // zig fmt: off
+                                    req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    // zig fmt: on
+
+                                    switch (req.response.status) {
+                                        .ok => {},
+                                        else => @panic("TODO: Handle other response statuses"),
+                                    }
+
+                                    requests.append(req) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    };
+                                },
                             }
-                        };
+                        }
                     }
 
                     const ReadersCtx = struct {

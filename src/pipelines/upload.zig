@@ -1,7 +1,7 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
-const iso8601 = @import("../iso-8601.zig");
+const iso8601 = @import("../iso8601.zig");
 const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const StoredFile = eraser.StoredFile;
@@ -44,9 +44,6 @@ pub fn PipeLine(
         providers: *const Providers,
         /// This mutex protects the `providers` field.
         providers_mtx: *std.Thread.Mutex,
-
-        full_request_uri_buf: []u8,
-        request_uri_bufs: RequestUriBuffers,
 
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
@@ -95,18 +92,11 @@ pub fn PipeLine(
             var queue = try ManagedQueue(QueueItem).initCapacity(params.allocator, params.queue_capacity);
             errdefer queue.deinit(params.allocator);
 
-            const request_uris_buf_res = try util.buffer_backed_slices.fromAlloc(RequestUriBuffers, params.allocator, .{
-                .gc = if (params.providers.google_cloud) |gc| gc.objectUriIteratorBufferSize() else 0,
-            });
-            const request_uri_bufs: RequestUriBuffers = request_uris_buf_res[0];
-            const full_request_uri_buf = request_uris_buf_res[1];
-            errdefer params.allocator.free(full_request_uri_buf);
-
             const chunk_buffers = try params.allocator.create([2][chunk.total_size]u8);
             errdefer params.allocator.destroy(chunk_buffers);
 
             const ec = try ErasureCoder.init(params.allocator, .{
-                .shard_count = @intCast(params.providers.bucketCount()),
+                .shard_count = @intCast(params.providers.shard_buckets.len),
                 .shards_required = params.providers.shards_required,
             });
             errdefer ec.deinit(params.allocator);
@@ -121,9 +111,6 @@ pub fn PipeLine(
 
                 .providers = params.providers,
                 .providers_mtx = params.providers_mtx,
-
-                .full_request_uri_buf = full_request_uri_buf,
-                .request_uri_bufs = request_uri_bufs,
 
                 .chunk_buffers = chunk_buffers,
 
@@ -160,7 +147,6 @@ pub fn PipeLine(
             self.queue.deinit(self.allocator);
 
             self.allocator.destroy(self.chunk_buffers);
-            self.allocator.free(self.full_request_uri_buf);
 
             self.ec.deinit(self.allocator);
         }
@@ -359,15 +345,16 @@ pub fn PipeLine(
                 defer assert(bytes_uploaded == upload_size);
 
                 while (true) {
-                    const result = eci.next(.{
-                        .npub = &nonce_generator.new(),
-                        .key = &test_key,
-                    }) catch |err| switch (err) {
-                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                    } orelse break;
-
-                    const chunk_name = result.name;
-                    const encrypted_chunk_blob = result.encrypted;
+                    const chunk_name: *const [chunk.digest_len]u8, //
+                    const encrypted_chunk_blob: []const u8 = blk: {
+                        const eci_result = eci.next(.{
+                            .npub = &nonce_generator.new(),
+                            .key = &test_key,
+                        }) catch |err| switch (err) {
+                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                        } orelse break;
+                        break :blk .{ eci_result.name, eci_result.encrypted };
+                    };
 
                     // the number of bytes that will be sent in each request
                     const shard_upload_size = upp.ec.encodedSizePerShard(encrypted_chunk_blob.len);
@@ -412,148 +399,141 @@ pub fn PipeLine(
                     var shard_datas_sent: usize = 0;
                     defer assert(shard_datas_sent == shard_datas.len);
 
-                    if (shard_datas_sent != shard_datas.len) if (upp.providers.google_cloud) |gc| gc_blk: {
-                        // the headers are cloned for each request, so can deinitialize this safely
-                        var headers = std.http.Headers.init(upp.allocator);
-                        defer headers.deinit();
-                        headers.owned = false; // since it's cloned anyway, we don't need to clone the values bound to this scope
+                    var uri_str_buf = std.ArrayList(u8).init(upp.allocator);
+                    defer uri_str_buf.deinit();
 
-                        const auth_val = gc.authorizationValue() orelse break :gc_blk;
+                    // the headers are cloned for each request, so can deinitialize this safely
+                    var headers = std.http.Headers.init(upp.allocator);
+                    defer headers.deinit();
 
-                        headers.append("Content-Length", shard_upload_size_str.constSlice()) catch |err| @panic(@errorName(err));
-                        headers.append("Authorization", auth_val.constSlice()) catch |err| @panic(@errorName(err));
+                    const method: std.http.Method = .PUT;
 
-                        var iter = gc.objectUriIterator("http", chunk_name, upp.request_uri_bufs.gc);
-                        while (iter.next()) |uri_str| {
-                            if (shard_datas_sent == shard_datas.len) break;
-                            const shard_data: []const u8 = shard_datas[shard_datas_sent].slice();
-                            shard_datas_sent += 1;
-
-                            const uri = std.Uri.parse(uri_str) catch unreachable;
-                            var req = http_client.open(.PUT, uri, headers, .{}) catch |err| switch (err) {
-                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            defer req.deinit();
-
-                            req.send(.{}) catch |err| switch (err) {
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            req.writeAll(shard_data) catch |err| switch (err) {
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            req.finish() catch |err| @panic(switch (err) {
-                                inline else => |e| "Decide how to handle " ++ @errorName(e),
-                            });
-                            bytes_uploaded += shard_data.len;
-                            up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
-                        }
-                    };
-
-                    if (shard_datas_sent != shard_datas.len) if (upp.providers.aws) |aws| aws_blk: {
-                        const credentials = aws.credentials orelse break :aws_blk;
-
-                        var headers = std.http.Headers.init(upp.allocator);
-                        defer headers.deinit();
-
-                        const method: std.http.Method = .PUT;
-
-                        const date_time = dt: {
-                            var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00Z".len) = .{};
-
-                            const epoch_secs = std.time.epoch.EpochSeconds{
-                                .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
-                            };
-                            const year, const month, const day = ymd: {
-                                const epoch_day = epoch_secs.getEpochDay();
-                                const year_day = epoch_day.calculateYearDay();
-                                const month_day = year_day.calculateMonthDay();
-                                break :ymd .{ year_day.year, month_day.month, month_day.day_index + 1 };
-                            };
-                            const hour, const minute, const second = hms: {
-                                const ds = epoch_secs.getDaySeconds();
-                                break :hms .{ ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() };
-                            };
-
-                            iso8601.writeYearMonthDayTo(date_time.writer(), year, month, day, .{ .want_dashes = false }) catch unreachable;
-                            date_time.writer().print("T{d:0>2}{d:0>2}{d:0>2}Z", .{ hour, minute, second }) catch unreachable;
-                            break :dt date_time;
+                    const date_time = dt: {
+                        var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00Z".len) = .{};
+                        const epoch_secs = std.time.epoch.EpochSeconds{
+                            .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
                         };
-
-                        var uri_str_buf = std.ArrayList(u8).init(upp.allocator);
-                        defer uri_str_buf.deinit();
-
-                        for (aws.buckets) |bucket| {
-                            if (shard_datas_sent == shard_datas.len) break;
-                            const shard_data: []const u8 = shard_datas[shard_datas_sent].slice();
-                            shard_datas_sent += 1;
-
-                            const region_str = bucket.region.toBytes();
-                            const uri = std.Uri.parse(str: {
-                                uri_str_buf.clearRetainingCapacity();
-                                uri_str_buf.writer().print("{[bucket]}/{[object]s}", .{
-                                    .bucket = bucket.fmtUri(.{ .protocol = "http", .style = .path }),
-                                    .object = eraser.digestBytesToString(chunk_name),
-                                }) catch |err| switch (err) {
-                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                };
-                                break :str uri_str_buf.items;
-                            }) catch |err| switch (err) {
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-
-                            const payload_digest = digest: {
-                                var shard_digest: [Sha256.digest_length]u8 = undefined;
-                                Sha256.hash(shard_data, &shard_digest, .{});
-                                break :digest shard_digest;
-                            };
-                            headers.clearRetainingCapacity();
-                            Providers.Aws.http.sortAndAddHeaders(upp.allocator, &headers, .{
-                                .request_method = @tagName(method),
-                                .request_uri = uri,
-
-                                .date_time = date_time.constSlice(),
-                                .service = "s3",
-                                .region = region_str.constSlice(),
-
-                                .access_key_id = credentials.access_key_id.getSensitiveSlice(),
-                                .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
-                                .session_token = credentials.session_token.getSensitiveSlice(),
-
-                                .payload_sign = .{ .digest = &payload_digest },
-                            }) catch |err| @panic(switch (err) {
-                                inline else => |e| "Decide how to handle " ++ @errorName(e),
-                            });
-                            headers.append("content-length", shard_upload_size_str.constSlice()) catch |err| @panic(switch (err) {
-                                inline else => |e| "Decide how to handle " ++ @errorName(e),
-                            });
-
-                            var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
-                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            defer req.deinit();
-                            req.send(.{ .raw_uri = false }) catch |err| switch (err) {
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            req.writeAll(shard_data) catch |err| switch (err) {
-                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                            };
-                            req.finish() catch |err| @panic(switch (err) {
-                                inline else => |e| "Decide how to handle " ++ @errorName(e),
-                            });
-                            req.wait() catch |err| @panic(switch (err) {
-                                inline else => |e| "Decide how to handle " ++ @errorName(e),
-                            });
-
-                            switch (req.response.status) {
-                                .ok => {},
-                                else => @panic("TODO: Handle other response statuses"),
-                            }
-                            bytes_uploaded += shard_data.len;
-                            up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
-                        }
+                        iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
+                            .ymd = .dont_want_dashes,
+                            .hms = .dont_want_colons,
+                        }) catch unreachable;
+                        break :dt date_time;
                     };
+
+                    for (upp.providers.shard_buckets) |shard_bucket| {
+                        upp.providers_mtx.lock();
+                        defer upp.providers_mtx.unlock();
+
+                        if (shard_datas_sent == shard_datas.len) break;
+                        const shard_data: []const u8 = shard_datas[shard_datas_sent].slice();
+
+                        switch (shard_bucket) {
+                            .gcloud => |bucket| {
+                                const gc = upp.providers.google_cloud;
+                                const auth_val = gc.authorizationValue() orelse continue;
+                                defer shard_datas_sent += 1;
+
+                                headers.append("Content-Length", shard_upload_size_str.constSlice()) catch |err| @panic(@errorName(err));
+                                headers.append("Authorization", auth_val.constSlice()) catch |err| @panic(@errorName(err));
+
+                                const uri = std.Uri.parse(str: {
+                                    uri_str_buf.clearRetainingCapacity();
+                                    bucket.writeUriTo(uri_str_buf.writer(), .{
+                                        .protocol = "http",
+                                        .object = chunk_name,
+                                    }) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    };
+                                    break :str uri_str_buf.items;
+                                }) catch unreachable;
+
+                                var req = http_client.open(.PUT, uri, headers, .{}) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+                                defer req.deinit();
+
+                                // zig fmt: off
+                                req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
+                                req.writeAll(shard_data) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
+                                req.finish() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
+                                req.wait() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
+                                // zig fmt: on
+
+                                switch (req.response.status) {
+                                    .ok => {},
+                                    else => @panic("TODO: Handle other response statuses"),
+                                }
+                            },
+                            .aws => |bucket| {
+                                const aws = upp.providers.aws;
+                                const credentials = aws.credentials orelse continue;
+                                defer shard_datas_sent += 1;
+
+                                const region_str = bucket.region.toBytes();
+                                const uri = std.Uri.parse(str: {
+                                    uri_str_buf.clearRetainingCapacity();
+                                    bucket.writeUriTo(uri_str_buf.writer(), .{
+                                        .protocol = "http",
+                                        .style = .path,
+                                        .object = &eraser.digestBytesToString(chunk_name),
+                                    }) catch |err| switch (err) {
+                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    };
+                                    break :str uri_str_buf.items;
+                                }) catch |err| switch (err) {
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+
+                                const payload_digest = digest: {
+                                    var shard_digest: [Sha256.digest_length]u8 = undefined;
+                                    Sha256.hash(shard_data, &shard_digest, .{});
+                                    break :digest shard_digest;
+                                };
+                                headers.clearRetainingCapacity();
+                                Providers.Aws.http.sortAndAddHeaders(upp.allocator, &headers, .{
+                                    .request_method = @tagName(method),
+                                    .request_uri = uri,
+
+                                    .date_time = date_time.constSlice(),
+                                    .service = "s3",
+                                    .region = region_str.constSlice(),
+
+                                    .access_key_id = credentials.access_key_id.getSensitiveSlice(),
+                                    .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
+                                    .session_token = credentials.session_token.getSensitiveSlice(),
+
+                                    .payload_sign = .{ .digest = &payload_digest },
+                                }) catch |err| @panic(switch (err) {
+                                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                                });
+                                headers.append("content-length", shard_upload_size_str.constSlice()) catch |err| @panic(switch (err) {
+                                    inline else => |e| "Decide how to handle " ++ @errorName(e),
+                                });
+
+                                var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
+                                    error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                    inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                                };
+                                defer req.deinit();
+
+                                // zig fmt: off
+                                req.send(.{ .raw_uri = false }) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
+                                req.writeAll(shard_data) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
+                                req.finish() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
+                                req.wait() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
+                                // zig fmt: on
+
+                                switch (req.response.status) {
+                                    .ok => {},
+                                    else => @panic("TODO: Handle other response statuses"),
+                                }
+                            },
+                        }
+
+                        bytes_uploaded += shard_data.len;
+                        up_ctx.update(@intCast((bytes_uploaded * 100) / upload_size));
+                    }
                 }
 
                 stored_file = eci.storedFile();

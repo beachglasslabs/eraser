@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const aws = @import("../aws.zig");
-const iso8601 = @import("../iso-8601.zig");
+const iso8601 = @import("../iso8601.zig");
 
 pub const AddHeadersError = std.mem.Allocator.Error || iso8601.YearMonthDay.ParseError || error{
     MissingTimeInDateTime,
@@ -55,21 +55,10 @@ pub fn sortAndAddHeaders(
 
     const date_bounded_array = blk: {
         var date_str: std.BoundedArray(u8, "2000-12-31".len) = .{};
-
         const time_sep_idx = std.mem.indexOfScalar(u8, params.date_time, 'T') orelse return error.MissingTimeInDateTime;
         const year_month_day = try iso8601.YearMonthDay.parse(params.date_time[0..time_sep_idx]);
-        const year = switch (year_month_day.year) {
-            .basic => |basic| basic,
-            .extended => return error.DateTimeExtendedYear,
-        };
-
-        iso8601.writeYearMonthDayTo(
-            date_str.writer(),
-            year,
-            year_month_day.getMonth(),
-            year_month_day.getDay(),
-            .{ .want_dashes = false },
-        ) catch unreachable;
+        if (year_month_day.year != .basic) return error.DateTimeExtendedYear;
+        year_month_day.writeTo(date_str.writer(), .dont_want_dashes) catch unreachable;
         break :blk date_str;
     };
     const date_str: []const u8 = date_bounded_array.constSlice();
