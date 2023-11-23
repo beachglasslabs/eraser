@@ -4,10 +4,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const base64 = std.base64;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const util = @import("util");
 
 pub const access_key_id_len = "AKIAIOSFODNN7EXAMPLE".len;
 pub const secret_access_key_len = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".len;
@@ -628,7 +626,7 @@ test calcSignature {
                 .{ "x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
                 .{ "x-amz-date", "20130524T000000Z" },
             },
-            .hash = .{ .digest = &comptime util.hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
+            .hash = .{ .digest = &comptime hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
         },
 
         .{
@@ -650,7 +648,7 @@ test calcSignature {
             \\20130524/us-east-1/s3/aws4_request
             \\7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972
             ,
-            .signature = &comptime util.hexToBytes("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41") catch |e| @compileError(@errorName(e)),
+            .signature = &comptime hexToBytes("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41") catch |e| @compileError(@errorName(e)),
             .authorization = "AWS4-HMAC-SHA256 " ++
                 "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " ++
                 "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, " ++
@@ -676,7 +674,7 @@ test calcSignature {
                 .{ "x-amz-date", "20130524T000000Z" },
                 .{ "x-amz-storage-class", "REDUCED_REDUNDANCY" },
             },
-            .hash = .{ .digest = &comptime util.hexToBytes("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072") catch |e| @compileError(@errorName(e)) },
+            .hash = .{ .digest = &comptime hexToBytes("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072") catch |e| @compileError(@errorName(e)) },
         },
         .{
             .canon_req =
@@ -698,7 +696,7 @@ test calcSignature {
             \\20130524/us-east-1/s3/aws4_request
             \\9e0e90d9c76de8fa5b200d8c849cd5b8dc7a3be3951ddb7f6a76b4158342019d
             ,
-            .signature = &comptime util.hexToBytes("98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd") catch |e| @compileError(@errorName(e)),
+            .signature = &comptime hexToBytes("98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd") catch |e| @compileError(@errorName(e)),
             .authorization = "AWS4-HMAC-SHA256 " ++
                 "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " ++
                 "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, " ++
@@ -724,7 +722,7 @@ test calcSignature {
                 .{ "x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
                 .{ "x-amz-date", "20130524T000000Z" },
             },
-            .hash = .{ .digest = &comptime util.hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
+            .hash = .{ .digest = &comptime hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
         },
         .{
             .canon_req =
@@ -744,7 +742,7 @@ test calcSignature {
             \\20130524/us-east-1/s3/aws4_request
             \\9766c798316ff2757b517bc739a67f6213b4ab36dd5da2f94eaebf79c77395ca
             ,
-            .signature = &comptime util.hexToBytes("fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543") catch |e| @compileError(@errorName(e)),
+            .signature = &comptime hexToBytes("fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543") catch |e| @compileError(@errorName(e)),
             .authorization = "AWS4-HMAC-SHA256 " ++
                 "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " ++
                 "SignedHeaders=host;x-amz-content-sha256;x-amz-date, " ++
@@ -771,7 +769,7 @@ test calcSignature {
                 .{ "x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
                 .{ "x-amz-date", "20130524T000000Z" },
             },
-            .hash = .{ .digest = &comptime util.hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
+            .hash = .{ .digest = &comptime hexToBytes("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") catch |e| @compileError(@errorName(e)) },
         },
         .{
             .canon_req =
@@ -791,7 +789,7 @@ test calcSignature {
             \\20130524/us-east-1/s3/aws4_request
             \\df57d21db20da04d7fa30298dd4488ba3a2b47ca3a489c74750e0f1e7df1b9b7
             ,
-            .signature = &comptime util.hexToBytes("34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7") catch |e| @compileError(@errorName(e)),
+            .signature = &comptime hexToBytes("34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7") catch |e| @compileError(@errorName(e)),
             .authorization = "AWS4-HMAC-SHA256 " ++
                 "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " ++
                 "SignedHeaders=host;x-amz-content-sha256;x-amz-date, " ++
@@ -929,4 +927,12 @@ test UriQueryStringParser {
         .{ "bar", null },
         .{ "", null },
     });
+}
+
+inline fn hexToBytes(hex_str: anytype) ![@divExact(hex_str.len, 2)]u8 {
+    var result: [@divExact(hex_str.len, 2)]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&result, hex_str);
+    assert(bytes.len == result.len);
+    assert(bytes.ptr == &result);
+    return result;
 }
