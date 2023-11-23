@@ -1,7 +1,6 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
-const iso8601 = @import("../iso8601.zig");
 const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const StoredFile = eraser.StoredFile;
@@ -36,7 +35,7 @@ pub fn PipeLine(
 
         allocator: std.mem.Allocator,
 
-        must_stop: std.atomic.Atomic(bool),
+        must_stop: std.atomic.Value(bool),
         queue_mtx: std.Thread.Mutex,
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
@@ -104,7 +103,7 @@ pub fn PipeLine(
             return .{
                 .allocator = params.allocator,
 
-                .must_stop = std.atomic.Atomic(bool).init(false),
+                .must_stop = std.atomic.Value(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
                 .queue = queue,
@@ -413,7 +412,7 @@ pub fn PipeLine(
                         const epoch_secs = std.time.epoch.EpochSeconds{
                             .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
                         };
-                        iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
+                        Providers.Aws.iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
                             .ymd = .dont_want_dashes,
                             .hms = .dont_want_colons,
                         }) catch unreachable;
@@ -440,7 +439,7 @@ pub fn PipeLine(
                                     uri_str_buf.clearRetainingCapacity();
                                     bucket.writeUriTo(uri_str_buf.writer(), .{
                                         .protocol = "http",
-                                        .object = chunk_name,
+                                        .object = &eraser.digestBytesToString(chunk_name),
                                     }) catch |err| switch (err) {
                                         error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
                                     };
@@ -491,9 +490,10 @@ pub fn PipeLine(
                                     break :digest shard_digest;
                                 };
                                 headers.clearRetainingCapacity();
-                                Providers.Aws.http.sortAndAddHeaders(upp.allocator, &headers, .{
+                                Providers.Aws.http.sortAndAddAuthHeaders(upp.allocator, &headers, .{
                                     .request_method = @tagName(method),
                                     .request_uri = uri,
+                                    .request_uri_already_encoded = true,
 
                                     .date_time = date_time.constSlice(),
                                     .service = "s3",

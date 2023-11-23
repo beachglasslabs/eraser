@@ -25,25 +25,28 @@ pub fn build(b: *Build) void {
     const difftest_step = b.step("diff-test", "Test for correct behaviour of the executable in encoding and decoding inputs specified via '-Ddt=[path]'");
     const clear_buckets_step = b.step("clear-buckets", "Clear all buckets of all objects (INVOKES `gcloud`, FOR TESTING PURPOSES ONLY).");
 
+    // dependencies
+
+    const zaws_dep = b.dependency("zaws", .{});
+
     // main modules
+
+    const zaws_mod = zaws_dep.module("zaws");
 
     const util_mod = b.createModule(.{
         .source_file = Build.LazyPath.relative("src/util.zig"),
-    });
-    const aws_mod = b.createModule(.{
-        .source_file = Build.LazyPath.relative("src/aws.zig"),
     });
     const erasure_mod = b.addModule("erasure", .{
         .source_file = Build.LazyPath.relative("src/erasure.zig"),
         .dependencies = &.{
             .{ .name = "util", .module = util_mod },
-            .{ .name = "aws", .module = aws_mod },
         },
     });
     const pipelines_mod = b.addModule("eraser", .{
         .source_file = Build.LazyPath.relative("src/pipelines.zig"),
         .dependencies = &.{
             .{ .name = "util", .module = util_mod },
+            .{ .name = "zaws", .module = zaws_mod },
         },
     });
 

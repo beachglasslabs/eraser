@@ -1,7 +1,6 @@
 const chunk = @import("chunk.zig");
 const eraser = @import("../pipelines.zig");
 const erasure = eraser.erasure;
-const iso8601 = @import("../iso8601.zig");
 const Providers = @import("Providers.zig");
 const ManagedQueue = @import("../managed_queue.zig").ManagedQueue;
 const EncryptedFile = eraser.StoredFile;
@@ -32,7 +31,7 @@ pub fn PipeLine(
 
         allocator: std.mem.Allocator,
 
-        must_stop: std.atomic.Atomic(bool),
+        must_stop: std.atomic.Value(bool),
         queue_mtx: std.Thread.Mutex,
         queue_pop_re: std.Thread.ResetEvent,
         queue: ManagedQueue(QueueItem),
@@ -96,7 +95,7 @@ pub fn PipeLine(
             return .{
                 .allocator = params.allocator,
 
-                .must_stop = std.atomic.Atomic(bool).init(false),
+                .must_stop = std.atomic.Value(bool).init(false),
                 .queue_mtx = .{},
                 .queue_pop_re = .{},
                 .queue = queue,
@@ -332,7 +331,15 @@ pub fn PipeLine(
 
                                     switch (req.response.status) {
                                         .ok => {},
-                                        else => @panic("TODO: Handle other response statuses"),
+                                        else => |status| {
+                                            std.debug.print("\nGCloud Status: {}\nGCloud Headers:\n---\n{}\n---\n", .{ status, req.response.headers });
+                                            {
+                                                std.debug.getStderrMutex().lock();
+                                                defer std.debug.getStderrMutex().unlock();
+                                                util.pumpReaderToWriterThroughFifo(req.reader(), std.io.getStdErr().writer(), .static, 4096) catch {};
+                                            }
+                                            @panic("TODO: Handle other response statuses");
+                                        },
                                     }
 
                                     requests.append(req) catch |err| switch (err) {
@@ -348,7 +355,7 @@ pub fn PipeLine(
                                         const epoch_secs = std.time.epoch.EpochSeconds{
                                             .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
                                         };
-                                        iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
+                                        Providers.Aws.iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
                                             .ymd = .dont_want_dashes,
                                             .hms = .dont_want_colons,
                                         }) catch unreachable;
@@ -373,9 +380,10 @@ pub fn PipeLine(
                                     headers.clearRetainingCapacity();
 
                                     const method: std.http.Method = .GET;
-                                    Providers.Aws.http.sortAndAddHeaders(dpp.allocator, &headers, .{
+                                    Providers.Aws.http.sortAndAddAuthHeaders(dpp.allocator, &headers, .{
                                         .request_method = @tagName(method),
                                         .request_uri = uri,
+                                        .request_uri_already_encoded = true,
 
                                         .date_time = date_time.constSlice(),
                                         .service = "s3",

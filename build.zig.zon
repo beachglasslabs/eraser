@@ -2,5 +2,10 @@
     .name = "eraser",
     .version = "0.0.1",
     .paths = .{ "src", "build.zig" },
-    .dependencies = .{},
+    .dependencies = .{
+        .zaws = .{
+            .url = "https://github.com/beachglasslabs/zaws/archive/799921cda531efd7c30cadb840971dedf06fc794.tar.gz",
+            .hash = "122093f682cb370d87949d172f514f88a82ba0e1addd1ada5510ec85d6804190ccd4",
+        },
+    },
 }

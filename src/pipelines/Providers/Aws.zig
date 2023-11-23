@@ -9,9 +9,10 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const util = @import("util");
-const aws = @import("../../aws.zig");
-pub const auth = aws.auth;
-pub const http = aws.http;
+const zaws = @import("zaws");
+pub const auth = zaws.auth;
+pub const http = zaws.http;
+pub const iso8601 = zaws.iso8601;
 
 const Aws = @This();
 credentials: ?Credentials,
