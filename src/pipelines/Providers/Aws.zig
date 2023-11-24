@@ -1,8 +1,6 @@
 const eraser = @import("../../pipelines.zig");
 const digestBytesToString = eraser.digestBytesToString;
 
-const SensitiveBytes = @import("../../SensitiveBytes.zig");
-
 const std = @import("std");
 const assert = std.debug.assert;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -18,9 +16,14 @@ const Aws = @This();
 credentials: ?Credentials,
 
 pub const Credentials = struct {
-    access_key_id: SensitiveBytes.Fixed(auth.access_key_id_len),
-    secret_access_key: SensitiveBytes.Fixed(auth.secret_access_key_len),
-    session_token: SensitiveBytes,
+    access_key_id: AccessKeyId,
+    secret_access_key: SecretAccessKey,
+    session_token: SessionToken,
+
+    pub const AccessKeyId = struct { string: [auth.access_key_id_len]u8 };
+    pub const SecretAccessKey = struct { string: [auth.secret_access_key_len]u8 };
+    /// Must contain a non-null string for temporary credentials.
+    pub const SessionToken = struct { string: ?[]const u8 };
 };
 
 pub const Bucket = struct {

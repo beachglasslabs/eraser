@@ -37,8 +37,8 @@ pub fn PipeLine(
         queue: ManagedQueue(QueueItem),
 
         providers: *const Providers,
-        /// This mutex protects the `providers` field.
-        providers_mtx: *std.Thread.Mutex,
+        /// This mutex protects the `providers.auth` field.
+        providers_auth_mtx: *std.Thread.Mutex,
 
         /// decrypted_chunk_buffer = &chunk_buffer[0]
         /// encrypted_chunk_buffer = &chunk_buffer[1]
@@ -74,8 +74,8 @@ pub fn PipeLine(
 
             /// server providers
             providers: *const Providers,
-            /// server providers mutex. locks access to the given `providers` pointer.
-            providers_mtx: *std.Thread.Mutex,
+            /// server providers mutex. locks access to `providers.auth`.
+            providers_auth_mtx: *std.Thread.Mutex,
         };
 
         pub const InitError = std.mem.Allocator.Error || ErasureCoder.InitError;
@@ -101,7 +101,7 @@ pub fn PipeLine(
                 .queue = queue,
 
                 .providers = params.providers,
-                .providers_mtx = params.providers_mtx,
+                .providers_auth_mtx = params.providers_auth_mtx,
 
                 .chunk_buffers = chunk_buffers,
 
@@ -158,18 +158,6 @@ pub fn PipeLine(
                 .stored_file = params.stored_file.*,
                 .writer = params.writer,
             } });
-        }
-
-        pub fn updateGoogleCloudAuthTok(
-            self: *Self,
-            auth_tok: eraser.SensitiveBytes.Bounded(Providers.GoogleCloud.max_auth_token_len),
-        ) void {
-            self.providers_mtx.lock();
-            defer self.providers_mtx.unlock();
-
-            if (self.providers.google_cloud) |*gc| {
-                gc.auth_token = auth_tok;
-            }
         }
 
         inline fn pushToQueue(
@@ -233,6 +221,27 @@ pub fn PipeLine(
             var requests = std.ArrayList(Request).init(dpp.allocator);
             defer requests.deinit();
 
+            // backing buffer for all of the URIs for the shards of a chunk.
+            const chunk_shards_uris_str_buf = dpp.allocator.alloc(u8, size: {
+                var counter = std.io.countingWriter(std.io.null_writer);
+                for (dpp.providers.shard_buckets) |shard_bucket| switch (shard_bucket) {
+                    .gcloud => |bucket| bucket.writeUriTo(counter.writer(), .{
+                        .protocol = "https",
+                        .object = &eraser.digestBytesToString("\xAA" ** Sha256.digest_length),
+                    }) catch |err| switch (err) {},
+
+                    .aws => |bucket| bucket.writeUriTo(counter.writer(), .{
+                        .protocol = "https",
+                        .style = .path,
+                        .object = &eraser.digestBytesToString("\xAA" ** Sha256.digest_length),
+                    }) catch |err| switch (err) {},
+                };
+                break :size counter.bytes_written;
+            }) catch |err| switch (err) {
+                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+            };
+            defer dpp.allocator.free(chunk_shards_uris_str_buf);
+
             while (true) {
                 const queue_item: QueueItem = blk: {
                     dpp.queue_pop_re.wait();
@@ -279,13 +288,13 @@ pub fn PipeLine(
                     defer for (requests.items) |*req| req.deinit();
 
                     {
-                        var uri_str_buf = std.ArrayList(u8).init(dpp.allocator);
-                        defer uri_str_buf.deinit();
-
+                        // the headers are cloned for each request, so we re-use this as a buffer.
                         var headers = std.http.Headers.init(dpp.allocator);
                         defer headers.deinit();
 
                         var current_index: u8 = 0;
+
+                        var uris_str_fbs = std.io.fixedBufferStream(chunk_shards_uris_str_buf);
                         for (dpp.providers.shard_buckets) |shard_bucket| {
                             {
                                 if (current_index == dpp.providers.shard_buckets.len) break;
@@ -293,94 +302,70 @@ pub fn PipeLine(
                                 if (excluded_index_set.isSet(current_index)) continue;
                             }
 
-                            dpp.providers_mtx.lock();
-                            defer dpp.providers_mtx.unlock();
-
-                            switch (shard_bucket) {
-                                .gcloud => |bucket| {
-                                    const gc = dpp.providers.google_cloud;
-                                    const authval = gc.authorizationValue() orelse continue;
-
-                                    headers.clearRetainingCapacity();
-                                    headers.append("Authorization", authval.constSlice()) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
-
-                                    const uri = std.Uri.parse(str: {
-                                        uri_str_buf.clearRetainingCapacity();
-                                        bucket.writeUriTo(uri_str_buf.writer(), .{
-                                            .protocol = "http",
-                                            .object = &eraser.digestBytesToString(chunk_name),
-                                        }) catch |err| switch (err) {
-                                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                        };
-                                        break :str uri_str_buf.items;
-                                    }) catch |err| switch (err) {
-                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                    };
-
-                                    var req = http_client.open(.GET, uri, headers, .{}) catch |err| switch (err) {
-                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                    };
-                                    errdefer req.deinit();
-
+                            const method: std.http.Method = switch (shard_bucket) {
+                                .gcloud, .aws => .GET,
+                            };
+                            const uri = std.Uri.parse(str: {
+                                const uri_start = uris_str_fbs.pos;
+                                switch (shard_bucket) {
                                     // zig fmt: off
-                                    req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                    req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                    req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                                    .gcloud => |bucket| bucket.writeUriTo(uris_str_fbs.writer(), .{
+                                        .protocol = "http",
+                                        .object = &eraser.digestBytesToString(chunk_name),
+                                    }) catch |err| switch (err) { error.NoSpaceLeft => unreachable },
+                                    .aws => |bucket| bucket.writeUriTo(uris_str_fbs.writer(), .{
+                                        .protocol = "http",
+                                        .object = &eraser.digestBytesToString(chunk_name),
+                                        .style = .path,
+                                    }) catch |err| switch (err) { error.NoSpaceLeft => unreachable },
                                     // zig fmt: on
+                                }
+                                break :str chunk_shards_uris_str_buf[uri_start..uris_str_fbs.pos];
+                            }) catch unreachable;
 
-                                    switch (req.response.status) {
-                                        .ok => {},
-                                        else => |status| {
-                                            std.debug.print("\nGCloud Status: {}\nGCloud Headers:\n---\n{}\n---\n", .{ status, req.response.headers });
-                                            {
-                                                std.debug.getStderrMutex().lock();
-                                                defer std.debug.getStderrMutex().unlock();
-                                                util.pumpReaderToWriterThroughFifo(req.reader(), std.io.getStdErr().writer(), .static, 4096) catch {};
-                                            }
-                                            @panic("TODO: Handle other response statuses");
-                                        },
-                                    }
+                            headers.clearRetainingCapacity();
+                            switch (shard_bucket) {
+                                .gcloud => {
+                                    var auth_val_buf: [Providers.GoogleCloud.max_authorization_value_len]u8 = undefined;
+                                    const auth_val: []const u8 = while (true) {
+                                        // TODO: use better synchronization primitive to wait for this.
+                                        // TODO: notify a callback of some sort that credentials are being awaited.
+                                        dpp.providers_auth_mtx.lock();
+                                        defer dpp.providers_auth_mtx.unlock();
 
-                                    requests.append(req) catch |err| switch (err) {
-                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                        const gc = dpp.providers.auth.gcloud;
+                                        break gc.getAuthorizationValue(&auth_val_buf) orelse continue;
                                     };
+
+                                    headers.append("Authorization", auth_val) catch |err| @panic(@errorName(@as(std.mem.Allocator.Error, err)));
                                 },
                                 .aws => |bucket| {
-                                    const aws = dpp.providers.aws;
-                                    const credentials = aws.credentials orelse continue;
+                                    const Aws = Providers.Aws;
+                                    const region_str = bucket.region.toBytes();
+                                    const credentials: Aws.Credentials = while (true) {
+                                        // TODO: use better synchronization primitive to wait for this.
+                                        // TODO: notify a callback of some sort that credentials are being awaited.
+                                        dpp.providers_auth_mtx.lock();
+                                        defer dpp.providers_auth_mtx.unlock();
 
+                                        const aws = dpp.providers.auth.aws;
+                                        break aws.credentials orelse {
+                                            std.Thread.yield() catch {};
+                                            continue;
+                                        };
+                                    };
                                     const date_time = dt: {
                                         var date_time: std.BoundedArray(u8, "2000-12-31T00:00:00+00:00".len) = .{};
                                         const epoch_secs = std.time.epoch.EpochSeconds{
                                             .secs = std.math.cast(u64, std.time.timestamp()) orelse @panic("TODO: handle timestamp before epoch"),
                                         };
-                                        Providers.Aws.iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
+                                        Aws.iso8601.writeEpochYMDHMS(date_time.writer(), epoch_secs, .{
                                             .ymd = .dont_want_dashes,
                                             .hms = .dont_want_colons,
                                         }) catch unreachable;
                                         break :dt date_time;
                                     };
-
-                                    const region_str = bucket.region.toBytes();
-                                    const uri = std.Uri.parse(str: {
-                                        uri_str_buf.clearRetainingCapacity();
-                                        bucket.writeUriTo(uri_str_buf.writer(), .{
-                                            .protocol = "http",
-                                            .style = .path,
-                                            .object = &eraser.digestBytesToString(chunk_name),
-                                        }) catch |err| switch (err) {
-                                            error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                        };
-                                        break :str uri_str_buf.items;
-                                    }) catch |err| switch (err) {
-                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                    };
-
-                                    headers.clearRetainingCapacity();
-
-                                    const method: std.http.Method = .GET;
-                                    Providers.Aws.http.sortAndAddAuthHeaders(dpp.allocator, &headers, .{
+                                    Aws.http.sortAndAddAuthHeaders(dpp.allocator, &headers, .{
                                         .request_method = @tagName(method),
                                         .request_uri = uri,
                                         .request_uri_already_encoded = true,
@@ -389,37 +374,45 @@ pub fn PipeLine(
                                         .service = "s3",
                                         .region = region_str.constSlice(),
 
-                                        .access_key_id = credentials.access_key_id.getSensitiveSlice(),
-                                        .secret_access_key = credentials.secret_access_key.getSensitiveSlice(),
-                                        .session_token = credentials.session_token.getSensitiveSlice(),
+                                        .access_key_id = &credentials.access_key_id.string,
+                                        .secret_access_key = &credentials.secret_access_key.string,
+                                        .session_token = credentials.session_token.string,
 
                                         .payload_sign = .{ .special = .unsigned_payload },
                                     }) catch |err| @panic(switch (err) {
                                         inline else => |e| "Decide how to handle " ++ @errorName(e),
                                     });
-
-                                    var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
-                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                        inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
-                                    };
-                                    errdefer req.deinit();
-
-                                    // zig fmt: off
-                                    req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                    req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                    req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
-                                    // zig fmt: on
-
-                                    switch (req.response.status) {
-                                        .ok => {},
-                                        else => @panic("TODO: Handle other response statuses"),
-                                    }
-
-                                    requests.append(req) catch |err| switch (err) {
-                                        error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
-                                    };
                                 },
                             }
+
+                            var req = http_client.open(method, uri, headers, .{}) catch |err| switch (err) {
+                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                                inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                            };
+                            errdefer req.deinit();
+
+                            // zig fmt: off
+                            req.send(.{}) catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                            req.finish() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                            req.wait() catch |err| switch (err) { inline else => |e| @panic("TODO: handle " ++ @errorName(e)) };
+                            // zig fmt: on
+
+                            switch (req.response.status) {
+                                .ok => {},
+                                else => |status| {
+                                    std.debug.print("\nStatus: {}\nHeaders:\n---\n{}\n---\n", .{ status, req.response.headers });
+                                    {
+                                        std.debug.getStderrMutex().lock();
+                                        defer std.debug.getStderrMutex().unlock();
+                                        util.pumpReaderToWriterThroughFifo(req.reader(), std.io.getStdErr().writer(), .static, 4096) catch {};
+                                    }
+                                    @panic("TODO: Handle other response statuses");
+                                },
+                            }
+
+                            requests.append(req) catch |err| switch (err) {
+                                error.OutOfMemory => @panic("TODO: actually handle this scenario in some way that isn't just panicking on this thread"),
+                            };
                         }
                     }
 

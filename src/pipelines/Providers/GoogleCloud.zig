@@ -1,8 +1,6 @@
 const eraser = @import("../../pipelines.zig");
 const digestBytesToString = eraser.digestBytesToString;
 
-const SensitiveBytes = @import("../../SensitiveBytes.zig");
-
 const std = @import("std");
 const assert = std.debug.assert;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -10,7 +8,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const util = @import("util");
 
 const GoogleCloud = @This();
-auth_token: ?SensitiveBytes.Bounded(max_auth_token_len),
+auth_token: ?AuthToken,
+
+pub const AuthToken = std.BoundedArray(u8, max_auth_token_len);
 
 pub const authorization_value_fmt = "Bearer {[auth_token]s}";
 pub const object_uri_fmt = "{[protocol]s}://storage.googleapis.com/{[bucket]}/{[object]}";
@@ -59,9 +59,7 @@ pub const Bucket = struct {
     };
 };
 
-pub inline fn authorizationValue(gc: *const GoogleCloud) ?std.BoundedArray(u8, max_authorization_value_len) {
-    var result: std.BoundedArray(u8, max_authorization_value_len) = .{};
-    const auth_token = if (gc.auth_token) |auth_token| auth_token.getSensitiveSlice() else return null;
-    result.writer().print(authorization_value_fmt, .{ .auth_token = auth_token }) catch unreachable;
-    return result;
+pub inline fn getAuthorizationValue(gc: GoogleCloud, buf: *[max_authorization_value_len]u8) ?[]const u8 {
+    const auth_tok = gc.auth_token orelse return null;
+    return std.fmt.bufPrint(buf, authorization_value_fmt, .{ .auth_token = auth_tok.constSlice() }) catch unreachable;
 }

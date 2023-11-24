@@ -18,13 +18,20 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var providers_mtx: std.Thread.Mutex = .{};
+    var providers_auth_mtx: std.Thread.Mutex = .{};
+    var gcloud_auth: Providers.GoogleCloud = .{
+        .auth_token = null,
+    };
+    var aws_auth: Providers.Aws = .{
+        .credentials = null,
+    };
+
     var providers = eraser.Providers{
-        .shards_required = 3,
+        .shards_required = 6,
         .shard_buckets = &.{
-            // .{ .gcloud = .{ .name = "ec1.blocktube.net" } },
-            // .{ .gcloud = .{ .name = "ec2.blocktube.net" } },
-            // .{ .gcloud = .{ .name = "ec3.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec1.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec2.blocktube.net" } },
+            .{ .gcloud = .{ .name = "ec3.blocktube.net" } },
             .{ .gcloud = .{ .name = "ec4.blocktube.net" } },
             .{ .gcloud = .{ .name = "ec5.blocktube.net" } },
             .{ .gcloud = .{ .name = "ec6.blocktube.net" } },
@@ -32,33 +39,13 @@ pub fn main() !void {
             .{ .aws = .{ .name = "ec7.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } } },
             .{ .aws = .{ .name = "ec8.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } } },
             .{ .aws = .{ .name = "ec9.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } } },
-            // .{ .aws = .{ .name = "ec10.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } } },
-            // .{ .aws = .{ .name = "ec11.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
-            // .{ .aws = .{ .name = "ec12.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
+            .{ .aws = .{ .name = "ec10.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } } },
+            .{ .aws = .{ .name = "ec11.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
+            .{ .aws = .{ .name = "ec12.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } } },
         },
-
-        .google_cloud = .{
-            .auth_token = null,
-            // .bucket_names = &.{
-            //     // .{ .name = "ec1.blocktube.net" },
-            //     // .{ .name = "ec2.blocktube.net" },
-            //     // .{ .name = "ec3.blocktube.net" },
-            //     .{ .name = "ec4.blocktube.net" },
-            //     .{ .name = "ec5.blocktube.net" },
-            //     .{ .name = "ec6.blocktube.net" },
-            // },
-        },
-
-        .aws = .{
-            .credentials = null,
-            // .buckets = &.{
-            //     .{ .name = "ec7.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } },
-            //     .{ .name = "ec8.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .east, .number = 2 } },
-            //     .{ .name = "ec9.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } },
-            //     // .{ .name = "ec10.blocktube.net", .region = .{ .geo = "us".*, .cardinal = .west, .number = 2 } },
-            //     // .{ .name = "ec11.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } },
-            //     // .{ .name = "ec12.blocktube.net", .region = .{ .geo = "eu".*, .cardinal = .west, .number = 1 } },
-            // },
+        .auth = .{
+            .gcloud = &gcloud_auth,
+            .aws = &aws_auth,
         },
     };
 
@@ -113,8 +100,8 @@ pub fn main() !void {
         .allocator = allocator,
         .random = random,
         .queue_capacity = 8,
-        .providers = &providers,
-        .providers_mtx = &providers_mtx,
+        .providers = providers,
+        .providers_auth_mtx = &providers_auth_mtx,
     });
     defer upload_pipeline.deinit(.finish_remaining_uploads);
     try upload_pipeline.start();
@@ -124,7 +111,7 @@ pub fn main() !void {
         .random = random,
         .queue_capacity = 8,
         .providers = &providers,
-        .providers_mtx = &providers_mtx,
+        .providers_auth_mtx = &providers_auth_mtx,
     });
     defer download_pipeline.deinit(.finish_remaining_downloads);
     try download_pipeline.start();
@@ -322,19 +309,17 @@ pub fn main() !void {
                     std.log.err("Missing auth token", .{});
                     continue;
                 };
-                const auth_tok_bounded = eraser.SensitiveBytes.Bounded(eraser.Providers.GoogleCloud.max_auth_token_len).init(auth_token) orelse {
+                const auth_tok_bounded = Providers.GoogleCloud.AuthToken.fromSlice(auth_token) catch {
                     std.log.err("Bad auth token", .{});
                     continue;
                 };
 
-                providers_mtx.lock();
-                defer providers_mtx.unlock();
-
-                const gcloud: *eraser.Providers.GoogleCloud = &providers.google_cloud;
-                gcloud.auth_token = auth_tok_bounded;
+                providers_auth_mtx.lock();
+                defer providers_auth_mtx.unlock();
+                gcloud_auth.auth_token = auth_tok_bounded;
             },
             .@"auth-aws" => {
-                const Aws = eraser.Providers.Aws;
+                const Aws = Providers.Aws;
 
                 const access_key_id: []const u8 = tokenizer.next() orelse {
                     std.log.err("Missing access key id", .{});
@@ -354,22 +339,28 @@ pub fn main() !void {
                     @memcpy(copied, session_token);
                     break :sess copied;
                 };
-                const new_creds = .{
-                    .access_key_id = eraser.SensitiveBytes.Fixed(Aws.auth.access_key_id_len).init(access_key_id) orelse {
-                        std.log.err("Bad access key id", .{});
-                        continue;
+
+                const new_creds: Providers.Aws.Credentials = .{
+                    .access_key_id = blk: {
+                        if (access_key_id.len != Aws.auth.access_key_id_len) {
+                            std.log.err("Bad access key id", .{});
+                            continue;
+                        }
+                        break :blk .{ .string = access_key_id[0..Aws.auth.access_key_id_len].* };
                     },
-                    .secret_access_key = eraser.SensitiveBytes.Fixed(Aws.auth.secret_access_key_len).init(secret_access_key) orelse {
-                        std.log.err("Bad access key id", .{});
-                        continue;
+                    .secret_access_key = blk: {
+                        if (secret_access_key.len != Aws.auth.secret_access_key_len) {
+                            std.log.err("Bad secret access key", .{});
+                            continue;
+                        }
+                        break :blk .{ .string = secret_access_key[0..Aws.auth.secret_access_key_len].* };
                     },
-                    .session_token = eraser.SensitiveBytes.init(session_token),
+                    .session_token = .{ .string = session_token },
                 };
 
-                providers_mtx.lock();
-                defer providers_mtx.unlock();
-                const aws: *Aws = &providers.aws;
-                aws.credentials = new_creds;
+                providers_auth_mtx.lock();
+                defer providers_auth_mtx.unlock();
+                aws_auth.credentials = new_creds;
             },
         }
     }

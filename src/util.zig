@@ -513,14 +513,14 @@ pub const empty_allocator = std.mem.Allocator{
     },
 };
 
-pub fn fixedLenFmt(
-    comptime fmt_str: []const u8,
-    args: anytype,
-    comptime reference_args: @TypeOf(args),
-) error{ Overflow, Underflow }![std.fmt.count(fmt_str, reference_args)]u8 {
-    const bounded = try boundedFmt(fmt_str, args, reference_args);
-    if (bounded.len != bounded.buffer.len) return error.Underflow;
-    return bounded.constSlice()[0..bounded.buffer.len].*;
+pub fn decimalIntStrMaxLen(comptime T: type) comptime_int {
+    return std.fmt.count("{d}", .{std.math.maxInt(T)});
+}
+pub inline fn decimalIntStr(
+    value: anytype,
+    buf: *[decimalIntStrMaxLen(@TypeOf(value))]u8,
+) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}", .{value}) catch unreachable;
 }
 
 pub fn boundedFmt(

@@ -5,8 +5,6 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 const util = @import("util");
 const pipelines = @import("../pipelines.zig");
-const digestBytesToString = pipelines.digestBytesToString;
-const digestStringToBytes = pipelines.digestStringToBytes;
 
 const chunk = @This();
 
@@ -201,10 +199,10 @@ pub const Encryption = struct {
 
 test Header {
     try testChunkHeader(.{
-        .current_chunk_digest = try comptime digestStringToBytes("Cd" ** Sha256.digest_length),
+        .current_chunk_digest = "\xCD".* ** Sha256.digest_length,
         .full_file_digest = .{0} ** Sha256.digest_length,
         .next = .{
-            .chunk_blob_digest = try comptime digestStringToBytes("aB" ** Sha256.digest_length),
+            .chunk_blob_digest = "\xAB".* ** Sha256.digest_length,
             .encryption = .{
                 .tag = .{7} ** Aes256Gcm.tag_length,
                 .npub = .{15} ** Aes256Gcm.nonce_length,
@@ -213,10 +211,10 @@ test Header {
         },
     });
     try testChunkHeader(.{
-        .current_chunk_digest = try comptime digestStringToBytes("cD" ** Sha256.digest_length),
+        .current_chunk_digest = "\xCD".* ** Sha256.digest_length,
         .full_file_digest = .{0} ** Sha256.digest_length,
         .next = .{
-            .chunk_blob_digest = try comptime digestStringToBytes("Ab" ** Sha256.digest_length),
+            .chunk_blob_digest = "\xAB".* ** Sha256.digest_length,
             .encryption = .{
                 .tag = .{7} ** Aes256Gcm.tag_length,
                 .npub = .{15} ** Aes256Gcm.nonce_length,
@@ -225,10 +223,10 @@ test Header {
         },
     });
     try testChunkHeader(.{
-        .current_chunk_digest = try comptime digestStringToBytes("Cd" ** Sha256.digest_length),
+        .current_chunk_digest = "\xCD".* ** Sha256.digest_length,
         .full_file_digest = .{31} ** Sha256.digest_length,
         .next = .{
-            .chunk_blob_digest = try comptime digestStringToBytes("Ab" ** Sha256.digest_length),
+            .chunk_blob_digest = "\xAB".* ** Sha256.digest_length,
             .encryption = .{
                 .tag = .{7} ** Aes256Gcm.tag_length,
                 .npub = .{15} ** Aes256Gcm.nonce_length,
