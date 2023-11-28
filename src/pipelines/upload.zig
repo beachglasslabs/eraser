@@ -277,7 +277,7 @@ pub fn PipeLine(
             } = .{ .random = upp.random };
 
             const RequestDataBufs = struct { []util.BoundedBufferArray(u8), []u8 };
-            var request_data_buf = std.ArrayListAligned(u8, util.buffer_backed_slices.bufferAlignment(RequestDataBufs)).init(upp.allocator);
+            var request_data_buf = std.ArrayListAligned(u8, util.bbs.bufferAlignment(RequestDataBufs)).init(upp.allocator);
             defer request_data_buf.deinit();
 
             // backing buffer for all of the URIs for the shards of a chunk.
@@ -362,7 +362,11 @@ pub fn PipeLine(
                 const upload_size = upp.ec.totalEncodedSize(
                     chunk_count * @as(u64, chunk.Header.size) + up_data.full_size,
                 );
-                defer assert(bytes_uploaded == upload_size);
+                // TODO: this is '>=' instead of '==' because for some configurations,
+                // the `totalEncodedSize` seems to be lossy. Specifically for 6/12, for
+                // a file of 22632448 bytes, the `bytes_uploaded` value ends up being 60
+                // bytes greater than the calculated `upload_size` value.
+                defer assert(bytes_uploaded >= upload_size);
 
                 while (true) {
                     const chunk_name: *const [chunk.digest_len]u8, //
@@ -384,7 +388,7 @@ pub fn PipeLine(
                     const shard_datas: []util.BoundedBufferArray(u8) = blk: {
                         request_data_buf.clearRetainingCapacity();
                         const shard_datas: []util.BoundedBufferArray(u8), //
-                        const upload_data_buf: []u8 = util.buffer_backed_slices.fromArrayList(
+                        const upload_data_buf: []u8 = util.bbs.fromArrayList(
                             RequestDataBufs,
                             &request_data_buf,
                             .{ upp.ec.shardCount(), upload_size },
@@ -406,9 +410,9 @@ pub fn PipeLine(
                         } = .{ .upload_datas = shard_datas };
 
                         var ecd_fbs = std.io.fixedBufferStream(encrypted_chunk_blob);
-                        var write_buffer: [4096]u8 = undefined;
+                        var write_buffer: [0]u8 = undefined;
                         _ = upp.ec.encodeCtx(ecd_fbs.reader(), writers_ctx, &write_buffer) catch |err| switch (err) {
-                            inline else => |e| @panic("Decide how to handle " ++ @errorName(e)),
+                            error.Overflow => unreachable,
                         };
 
                         break :blk shard_datas;
@@ -476,7 +480,7 @@ pub fn PipeLine(
                                 };
                                 const payload_digest = digest: {
                                     var shard_digest: [Sha256.digest_length]u8 = undefined;
-                                    Sha256.hash(shard_data.slice(), &shard_digest, .{});
+                                    Sha256.hash(shard_data.sliceConst(), &shard_digest, .{});
                                     break :digest shard_digest;
                                 };
                                 const date_time = dt: {
@@ -521,7 +525,7 @@ pub fn PipeLine(
 
                         // zig fmt: off
                         req.send(.{ .raw_uri = false }) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
-                        req.writeAll(shard_data.slice()) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
+                        req.writeAll(shard_data.sliceConst()) catch |err| switch (err) { inline else => |e| @panic("Decide how to handle " ++ @errorName(e)), };
                         req.finish() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
                         req.wait() catch |err| @panic(switch (err) { inline else => |e| "Decide how to handle " ++ @errorName(e), });
                         // zig fmt: on

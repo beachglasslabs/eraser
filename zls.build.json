@@ -1,8 +1,0 @@
-{
-	"build_options": [
-		{
-			"name": "called-from-zls",
-			"value": null
-		}
-	]
-}

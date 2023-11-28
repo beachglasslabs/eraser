@@ -68,7 +68,7 @@ pub fn Coder(comptime T: type) type {
             const encoder_bf_mat_bin = try bf_mat.toBinary(allocator);
             errdefer encoder_bf_mat_bin.deinit(allocator);
 
-            const decoder_bufs_result = try util.buffer_backed_slices.fromAlloc(DecoderBufs, allocator, .{
+            const decoder_bufs_result = try util.bbs.fromAlloc(DecoderBufs, allocator, .{
                 .sub_mat = bf_mat.matrix.getCellCount(),
                 .mat_inv = bf_mat.matrix.getCellCount(),
                 .mat_bin = bf_mat.toBinaryCellCount(),
@@ -120,10 +120,10 @@ pub fn Coder(comptime T: type) type {
             return calcDataBlockSize(self.chunkSize(), self.shardsRequired());
         }
 
-        pub inline fn totalEncodedSize(ec: Self, data_len: anytype) u64 {
-            const trail_len = data_len % ec.dataBlockSize();
+        pub inline fn totalEncodedSize(ec: Self, data_len: u64) u64 {
+            const trail_len: u8 = @intCast(data_len % ec.dataBlockSize());
             const padded_len: u64 = data_len - trail_len + ec.dataBlockSize();
-            return padded_len * ec.shardCount() / ec.shardsRequired();
+            return (padded_len * ec.shardCount()) / ec.shardsRequired();
         }
 
         pub inline fn encodedSizePerShard(self: Self, data_len: anytype) u64 {
