@@ -31,7 +31,7 @@ pub fn main() !void {
     }){};
 
     {
-        var allocator = gpa.allocator();
+        const allocator = gpa.allocator();
         const args = try std.process.argsAlloc(allocator);
         defer std.process.argsFree(allocator, args);
         return mainArgs(allocator, args[1..]);
@@ -91,15 +91,15 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // comptime var n = try std.fmt.parseInt(u8, args[1], 10);
     // comptime var k = try std.fmt.parseInt(u8, args[2], 10);
     // comptime var w = try std.fmt.parseInt(u8, args[3], 10);
-    comptime var n: u8 = 5;
-    comptime var k: u8 = 3;
-    comptime var w: type = u64;
+    const n: u8 = 5;
+    const k: u8 = 3;
+    const w: type = u64;
     var ec = try ErasureCoder(n, k, w).init(allocator);
     defer ec.deinit();
 
     const cmds = parseArgs(args);
-    var code_prefix: []const u8 = cmds.code;
-    var data_filename: []const u8 = cmds.data;
+    const code_prefix: []const u8 = cmds.code;
+    const data_filename: []const u8 = cmds.data;
 
     if (std.mem.eql(u8, cmds.cmd, "encode")) {
         var data_file = try std.fs.cwd().openFile(data_filename, .{});
@@ -107,7 +107,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
         var code_files: [n]std.fs.File = undefined;
         var code_writers: [n]std.fs.File.Writer = undefined;
         for (0..code_files.len) |i| {
-            var code_filename = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ code_prefix, i });
+            const code_filename = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ code_prefix, i });
             defer allocator.free(code_filename);
             code_files[i] = try std.fs.cwd().createFile(code_filename, .{});
             code_writers[i] = code_files[i].writer();
@@ -118,7 +118,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
         };
     } else if (std.mem.eql(u8, cmds.cmd, "decode")) {
         var prng = std.rand.DefaultPrng.init(@intCast(std.time.microTimestamp()));
-        var random = prng.random();
+        const random = prng.random();
         var excluded_shards = sample(random, n, n - k);
         std.debug.print("excluding {any}\n", .{excluded_shards});
 
@@ -130,7 +130,7 @@ fn mainArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
         var j: usize = 0;
         for (0..n) |i| {
             if (notIn(&excluded_shards, @intCast(i))) {
-                var code_filename = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ code_prefix, i });
+                const code_filename = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ code_prefix, i });
                 std.debug.print("opening {s}\n", .{code_filename});
                 defer allocator.free(code_filename);
                 code_files[j] = try std.fs.cwd().openFile(code_filename, .{});

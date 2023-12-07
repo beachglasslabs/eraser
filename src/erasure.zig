@@ -52,12 +52,12 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             var buffer: [word_size]u8 = std.mem.zeroes([word_size]u8);
 
             for (0..rs.block.len) |i| {
-                var read_size = try in_fifo.read(&buffer);
+                const read_size = try in_fifo.read(&buffer);
                 block_size += read_size;
                 if (read_size < buffer.len) {
                     buffer[buffer.len - 1] = @intCast(block_size);
                 }
-                rs.block[i] = std.mem.readIntBig(t, &buffer);
+                rs.block[i] = std.mem.readInt(t, &buffer, .big);
                 // std.debug.print("read int {d}\n", .{rs.block[i]});
             }
             rs.size = block_size;
@@ -75,12 +75,12 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             var buffer: [word_size]u8 = std.mem.zeroes([word_size]u8);
 
             for (0..rs.block.len) |i| {
-                var p = i / exp;
-                var read_size = try in_fifos[p].reader().read(&buffer);
+                const p = i / exp;
+                const read_size = try in_fifos[p].reader().read(&buffer);
                 std.debug.assert(read_size == buffer.len);
-                rs.block[i] = std.mem.readIntBig(t, &buffer);
+                rs.block[i] = std.mem.readInt(t, &buffer, .big);
             }
-            var p = (rs.block.len - 1) / exp;
+            const p = (rs.block.len - 1) / exp;
             rs.size = try in_fifos[p].reader().read(&buffer);
             rs.done = rs.size == 0;
             if (!rs.done) {
@@ -99,8 +99,8 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
                         code_block[i] ^= data_block[j];
                     }
                 }
-                std.mem.writeIntBig(t, &buffer, code_block[i]);
-                var p = i / exp;
+                std.mem.writeInt(t, &buffer, code_block[i], .big);
+                const p = i / exp;
                 _ = try out_fifos[p].write(&buffer);
             }
         }
@@ -116,7 +116,7 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
                         data_block[i] ^= code_block[j];
                     }
                 }
-                std.mem.writeIntBig(t, &buffer[i], data_block[i]);
+                std.mem.writeInt(t, &buffer[i], data_block[i], .big);
             }
             if (done) {
                 data_block_size = buffer[buffer.len - 1][buffer[0].len - 1];
@@ -144,14 +144,14 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             var size: usize = 0;
             var done = false;
             while (!done) {
-                var rs = try self.readDataBlock(in_fifo);
+                const rs = try self.readDataBlock(in_fifo);
                 done = rs.done;
                 _ = try self.writeCodeBlock(encoder_bin, rs.block, out_fifos);
                 if (!done) {
                     size += self.data_block_size;
                 } else {
                     var buffer = std.mem.zeroes([word_size]u8);
-                    std.mem.writeIntBig(t, &buffer, rs.block[rs.block.len - 1]);
+                    std.mem.writeInt(t, &buffer, rs.block[rs.block.len - 1], .big);
                     size += buffer[buffer.len - 1];
                 }
             }
@@ -176,9 +176,9 @@ pub fn ErasureCoder(comptime n: comptime_int, comptime k: comptime_int, comptime
             }
 
             while (!done) {
-                var rs = try self.readCodeBlock(&streams);
+                const rs = try self.readCodeBlock(&streams);
                 done = rs.done;
-                var write_size = try self.writeDataBlock(decoder_bin, rs.block, out_fifo, done);
+                const write_size = try self.writeDataBlock(decoder_bin, rs.block, out_fifo, done);
                 size += write_size;
             }
             return size;
@@ -190,7 +190,7 @@ pub fn sample(r: std.rand.Random, comptime max: u8, comptime num: u8) [num]u8 {
     var nums: [num]u8 = std.mem.zeroes([num]u8);
     var i: usize = 0;
     while (i < num) {
-        var new = r.uintLessThan(u8, max);
+        const new = r.uintLessThan(u8, max);
         var done = true;
         for (0..i) |j| {
             if (nums[j] == new) {
@@ -226,12 +226,12 @@ test "erasure coder" {
     defer tmp.cleanup();
 
     var prng = std.rand.DefaultPrng.init(1234);
-    var random = prng.random();
+    const random = prng.random();
 
     std.debug.print("\n", .{});
 
     for (test_data) |data| {
-        var data_filename = "temp_data_file";
+        const data_filename = "temp_data_file";
         var data_file = try tmp.dir.createFile(data_filename, .{});
         try data_file.writer().writeAll(data);
         data_file.close();
@@ -241,7 +241,7 @@ test "erasure coder" {
             var ec = try ErasureCoder(5, 3, t).init(std.testing.allocator);
             defer ec.deinit();
 
-            var code_filenames = [_][]const u8{ "temp_code_file_1", "temp_code_file_2", "temp_code_file_3", "temp_code_file_4", "temp_code_file_5" };
+            const code_filenames = [_][]const u8{ "temp_code_file_1", "temp_code_file_2", "temp_code_file_3", "temp_code_file_4", "temp_code_file_5" };
             var code_files: [5]std.fs.File = undefined;
             for (0..code_filenames.len) |i| {
                 code_files[i] = try tmp.dir.createFile(code_filenames[i], .{});
@@ -256,7 +256,7 @@ test "erasure coder" {
                 code_writers[i] = code_files[i].writer();
             }
             var data_in = try tmp.dir.openFile(data_filename, .{});
-            var data_size = try ec.encode(data_in.reader(), &code_writers);
+            const data_size = try ec.encode(data_in.reader(), &code_writers);
             try std.testing.expect(data_size > 0);
             for (code_files) |f| {
                 f.close();
@@ -281,7 +281,7 @@ test "erasure coder" {
             defer {
                 tmp.dir.deleteFile(decoded_filename) catch {};
             }
-            var decoded_size = try ec.decode(&excluded_shards, &code_readers, decoded_file.writer());
+            const decoded_size = try ec.decode(&excluded_shards, &code_readers, decoded_file.writer());
             for (code_in) |f| {
                 f.close();
             }
@@ -290,7 +290,7 @@ test "erasure coder" {
             var buffer = std.mem.zeroes([256]u8);
             var decoded_in = try tmp.dir.openFile(data_filename, .{});
             defer decoded_in.close();
-            var buffer_size = try decoded_in.reader().readAll(&buffer);
+            const buffer_size = try decoded_in.reader().readAll(&buffer);
             try std.testing.expectEqualSlices(u8, data, buffer[0..buffer_size]);
         }
     }

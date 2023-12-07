@@ -29,8 +29,8 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
         pub fn initCauchy(
             allocator: std.mem.Allocator,
         ) !Self {
-            var field = try bff.BinaryFiniteField(b).init();
-            var matrix = try toCauchy(allocator, field);
+            const field = try bff.BinaryFiniteField(b).init();
+            const matrix = try toCauchy(allocator, field);
 
             return .{
                 .allocator = allocator,
@@ -176,7 +176,7 @@ pub fn BinaryFieldMatrix(comptime m: comptime_int, comptime n: comptime_int, com
             var matrix = try mat.Matrix(m * b, n * b).init(self.allocator, mat.DataOrder.row);
             for (0..m) |r| {
                 for (0..n) |c| {
-                    var a = self.matrix.get(r, c);
+                    const a = self.matrix.get(r, c);
                     var bfm = try self.field.toMatrix(self.allocator, a);
                     defer bfm.deinit();
                     for (0..b) |i| {
@@ -208,6 +208,31 @@ test "matrix multiplication" {
     defer bfmc.deinit();
 }
 
+test "determinant" {
+    var bfma = try BinaryFieldMatrix(2, 2, 2).initCauchy(std.testing.allocator);
+    defer bfma.deinit();
+    const deta = try bfma.det();
+    try std.testing.expectEqual(deta, 1);
+    var bfmb = try BinaryFieldMatrix(3, 3, 3).initCauchy(std.testing.allocator);
+    defer bfmb.deinit();
+    const detb = try bfmb.det();
+    try std.testing.expectEqual(detb, 7);
+    var bfmc = try BinaryFieldMatrix(4, 4, 4).initCauchy(std.testing.allocator);
+    defer bfmc.deinit();
+    const detc = try bfmc.det();
+    try std.testing.expectEqual(detc, 7);
+}
+
+test "inverse" {
+    var bfm = try BinaryFieldMatrix(5, 3, 3).initCauchy(std.testing.allocator);
+    defer bfm.deinit();
+    var sub = try bfm.subMatrix(2, 0, &[_]u8{ 0, 1 }, &[0]u8{});
+    defer sub.deinit();
+    var inv = try sub.invert();
+    defer inv.deinit();
+    std.debug.print("inv: {}\n", .{inv});
+}
+
 test "invertible sub-matrices" {
     const m = 5;
     const n = 3;
@@ -217,17 +242,20 @@ test "invertible sub-matrices" {
     std.debug.print("\nex_rows.len = {d}:\n", .{ex_rows.len});
     inline for (0..ex_rows.len) |i| {
         std.debug.print("ex_rows[{d}] = {any}\n", .{ i, ex_rows[i] });
-        comptime var er = ex_rows[i][0..(m - n)];
+        const er = ex_rows[i][0..(m - n)];
         var submatrix = try bfm.subMatrix(2, 0, er, &[0]u8{});
         defer submatrix.deinit();
         try std.testing.expectEqual(bfm.numRows - ex_rows[i].len, submatrix.numRows);
         try std.testing.expectEqual(bfm.numCols, submatrix.numCols);
         var inverse = try submatrix.invert();
         defer inverse.deinit();
+        std.debug.print("inv: {}\n", .{inverse});
         var product1 = try inverse.multiply(submatrix.numCols, submatrix);
         defer product1.deinit();
+        std.debug.print("p1: {}\n", .{product1});
         var product2 = try submatrix.multiply(inverse.numCols, inverse);
         defer product2.deinit();
+        std.debug.print("p2: {}\n", .{product2});
         try std.testing.expectEqual(product1.numRows, product2.numRows);
         try std.testing.expectEqual(product1.numCols, product2.numCols);
         for (0..product1.numRows) |r| {
@@ -272,7 +300,7 @@ test "matrix binary representation" {
         for (0..bfma.field.order) |b| {
             var mat_b = try bfma.field.toMatrix(std.testing.allocator, b);
             defer mat_b.deinit();
-            var sum = try bfma.field.add(a, b);
+            const sum = try bfma.field.add(a, b);
             var mat_sum = try bfma.field.toMatrix(std.testing.allocator, sum);
             defer mat_sum.deinit();
             for (0..mat_a.numRows) |r| {

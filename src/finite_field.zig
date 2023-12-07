@@ -117,7 +117,7 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
 
         fn setCol(m: *mat.Matrix(n, n), c: usize, a: u8) void {
             for (0..n) |r| {
-                var v = (a >> @intCast(r)) & 1;
+                const v = (a >> @intCast(r)) & 1;
                 m.set(r, c, v);
             }
         }
@@ -125,7 +125,7 @@ pub fn BinaryFiniteField(comptime n: comptime_int) type {
         fn setAllCols(self: *const Self, m: *mat.Matrix(n, n), a: usize) !void {
             var basis: u8 = 1;
             for (0..n) |c| {
-                var p = try self.mul(a, basis);
+                const p = try self.mul(a, basis);
                 basis <<= 1;
                 setCol(m, c, p);
             }

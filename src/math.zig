@@ -13,7 +13,7 @@ pub fn numChosen(comptime m: u8, comptime n: u8) comptime_int {
 }
 
 pub fn ChosenType(comptime m: u8, comptime n: u8) type {
-    comptime var t = numChosen(m, n);
+    const t = numChosen(m, n);
     return [t][n]u8;
 }
 
@@ -29,8 +29,8 @@ pub fn choose(comptime l: []const u8, comptime k: u8) ChosenType(l.len, k) {
         }
         return ret;
     }
-    comptime var c = choose(l[1..], k - 1);
-    comptime var i = 0;
+    const c = choose(l[1..], k - 1);
+    var i: u8 = 0;
     inline for (0..(l.len - 1)) |m| {
         inline for (0..c.len) |n| {
             if (l[m] < c[n][0]) {
@@ -75,16 +75,16 @@ test "chosen return type" {
 }
 
 test "x choose 1" {
-    var list1 = choose(&[_]u8{9}, 1);
+    const list1 = choose(&[_]u8{9}, 1);
     try std.testing.expectEqual(list1.len, 1);
     try std.testing.expectEqual(list1[0], [1]u8{9});
 
-    var list2 = choose(&[_]u8{ 8, 9 }, 1);
+    const list2 = choose(&[_]u8{ 8, 9 }, 1);
     try std.testing.expectEqual(list2.len, 2);
     try std.testing.expectEqual(list2[0], [1]u8{8});
     try std.testing.expectEqual(list2[1], [1]u8{9});
 
-    var list3 = choose(&[_]u8{ 7, 8, 9 }, 1);
+    const list3 = choose(&[_]u8{ 7, 8, 9 }, 1);
     try std.testing.expectEqual(list3.len, 3);
     try std.testing.expectEqual(list3[0], [1]u8{7});
     try std.testing.expectEqual(list3[1], [1]u8{8});
@@ -92,17 +92,17 @@ test "x choose 1" {
 }
 
 test "x choose 2" {
-    var list4 = choose(&[_]u8{ 8, 9 }, 2);
+    const list4 = choose(&[_]u8{ 8, 9 }, 2);
     try std.testing.expectEqual(list4.len, 1);
     try std.testing.expectEqual(list4[0], [2]u8{ 8, 9 });
 
-    var list5 = choose(&[_]u8{ 7, 8, 9 }, 2);
+    const list5 = choose(&[_]u8{ 7, 8, 9 }, 2);
     try std.testing.expectEqual(list5.len, 3);
     try std.testing.expectEqual(list5[0], [2]u8{ 7, 8 });
     try std.testing.expectEqual(list5[1], [2]u8{ 7, 9 });
     try std.testing.expectEqual(list5[2], [2]u8{ 8, 9 });
 
-    var list6 = choose(&[_]u8{ 6, 7, 8, 9 }, 2);
+    const list6 = choose(&[_]u8{ 6, 7, 8, 9 }, 2);
     try std.testing.expectEqual(list6.len, 6);
     try std.testing.expectEqual(list6[0], [2]u8{ 6, 7 });
     try std.testing.expectEqual(list6[1], [2]u8{ 6, 8 });
@@ -113,11 +113,11 @@ test "x choose 2" {
 }
 
 test "x choose 3" {
-    var list7 = choose(&[_]u8{ 7, 8, 9 }, 3);
+    const list7 = choose(&[_]u8{ 7, 8, 9 }, 3);
     try std.testing.expectEqual(list7.len, 1);
     try std.testing.expectEqual(list7[0], [3]u8{ 7, 8, 9 });
 
-    var list8 = choose(&[_]u8{ 6, 7, 8, 9 }, 3);
+    const list8 = choose(&[_]u8{ 6, 7, 8, 9 }, 3);
     try std.testing.expectEqual(list8.len, 4);
     try std.testing.expectEqual(list8[0], [3]u8{ 6, 7, 8 });
     try std.testing.expectEqual(list8[1], [3]u8{ 6, 7, 9 });

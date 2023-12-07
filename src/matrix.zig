@@ -63,7 +63,7 @@ pub fn Matrix(comptime m: comptime_int, comptime n: comptime_int) type {
             for (0..m) |r| {
                 for (0..n) |c| {
                     if (r == c) break;
-                    var t = self.get(r, c);
+                    const t = self.get(r, c);
                     self.set(r, c, self.get(c, r));
                     self.set(c, r, t);
                 }
